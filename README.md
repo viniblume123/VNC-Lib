@@ -33,6 +33,7 @@ A modern, fully customizable Roblox UI library — built for developers who want
 - [Sounds](#sounds)
 - [Utilities](#utilities)
 - [Mobile Support](#mobile-support)
+- [For Library Users](#for-library-users)
 - [FAQ](#faq)
 - [License](#license)
 
@@ -61,7 +62,7 @@ A modern, fully customizable Roblox UI library — built for developers who want
 - **Profiles** — Save, load, delete, and switch configurations
 - **Macros** — Record and replay action sequences
 - **Import / Export** — Share configs via Base64 strings
-- **Discord Webhook Logger** — Log events to any Discord channel
+- **Discord Webhook Logger** — Optional logging to any Discord channel
 
 ### UX
 - **Notifications** — Full-size with images and 4 types (info, success, warning, error)
@@ -70,7 +71,6 @@ A modern, fully customizable Roblox UI library — built for developers who want
 - **Confirm Dialog** — Yes/No confirmation modal
 - **Prompt Dialog** — Text input modal
 - **Global Search** — Search across all tabs and elements
-- **Command Palette** — (Coming soon)
 - **Widgets** — FPS, Ping, Memory, Clock, or custom
 - **Streamer Mode** — Larger UI, hidden sensitive info
 
@@ -92,7 +92,9 @@ Over 20 UI elements available out of the box — see [Components](#components).
 local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/USER/REPO/main/library.lua"))()
 ```
 
-### Recommended File Structure
+> Replace the URL with the raw link to this repository's `library.lua` file.
+
+### Recommended Repository Structure
 
 ```
 your-repo/
@@ -408,29 +410,39 @@ Built-in icons: `home`, `settings`, `user`, `star`, `play`, `pause`, `search`, `
 
 ## Key System
 
+The library ships with an optional key system. **You configure it** — the library just provides the infrastructure.
+
 ```lua
 local Window = Library:CreateWindow({
     Key = {
         Enabled = true,
         Title = "Key System",
         Description = "Get your key at the link below",
-        Link = "https://your-site.com/key",
+        Link = "https://your-own-site.com/key",        -- your link
         LinkLabel = "Get Key",
         KeyFile = "library_key.json",
         UseHubKey = false,
-        Validate = function(key, hwid)              -- local validation
-            return key == "VALID_KEY"
+
+        -- Option A: local validation (pure Lua)
+        Validate = function(key, hwid)
+            return key == "YOUR_KEY_HERE"
         end,
-        RemoteValidate = "https://api.yoursite.com/validate",  -- remote validation
+
+        -- Option B: remote validation (your own API)
+        RemoteValidate = "https://your-own-api.com/validate",
+
+        -- Option C: log attempts to your Discord webhook
         Webhook = {
             Enabled = true,
-            Url = "https://discord.com/api/webhooks/..."
+            Url = "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE"
         }
     }
 })
 ```
 
-Remote API should respond with:
+**You can use any combination** of the three options above. If you don't want a key system at all, just omit the `Key` table.
+
+If you use `RemoteValidate`, your API should respond with:
 
 ```json
 { "valid": true, "plan": "pro", "expires": "2026-12-31" }
@@ -470,9 +482,11 @@ local cfg = Library.Crypto.LoadEncrypted("config.json", "password")
 
 ## Blocklist
 
+**You provide the blocklist source** — either a remote URL (pastebin, GitHub raw, your own API) or manage it locally.
+
 ```lua
 Library:SetBlocklist({
-    RemoteUrl = "https://raw.githubusercontent.com/USER/REPO/main/blocklist.json",
+    RemoteUrl = "https://raw.githubusercontent.com/YOUR-USER/YOUR-REPO/main/blocklist.json",
     LocalFile = "library_blocklist.json",
     ByHwid = true,
     ByUserId = true,
@@ -486,7 +500,7 @@ Library:SetBlocklist({
 if not Library.Blocklist:RunCheck() then return end
 ```
 
-Remote JSON format:
+Your remote JSON should be formatted like:
 
 ```json
 {
@@ -657,13 +671,16 @@ Library:RegisterTransition("MyTransition", { dur=0.5, style=Enum.EasingStyle.Qua
 
 ## Sounds
 
+Bind sound asset IDs to library events. **You provide the IDs** — the library ships with sensible defaults.
+
 ```lua
 Library:SetSounds({
     click = "rbxassetid://6895079853",
     hover = "",
     success = "rbxassetid://6895082385",
     error = "rbxassetid://6895079853",
-    open = "", close = "",
+    open = "",
+    close = "",
     enabled = true,
     volume = 0.5,
     silent = false
@@ -719,6 +736,65 @@ No additional configuration required.
 
 ---
 
+## For Library Users
+
+This is a **library**, not a hub. It provides UI, systems, and components — but no ready-made scripts.
+
+### What you configure
+
+Everything that connects to *your* infrastructure is up to you:
+
+| Feature | What you provide |
+|---|---|
+| **Key System** | Your own key site link, validation logic or API, and/or your Discord webhook |
+| **Remote Validation** | Your own API endpoint |
+| **Blocklist** | Your own remote JSON URL (or manage locally) |
+| **Webhook Logging** | Your own Discord webhook URL |
+| **Sounds** | Your own asset IDs (or leave the defaults) |
+| **Themes / Fonts** | Your own preferences |
+| **Icons** | Your own image asset IDs |
+
+### What the library provides
+
+- All UI rendering and animations
+- Component logic (toggles, sliders, dropdowns, etc.)
+- Crypto utilities (SHA-256, XOR, Base64)
+- HWID detection and hashing
+- Local storage helpers (JSON read/write)
+- Platform detection
+- Everything else that doesn't depend on your infrastructure
+
+### Example — building a hub
+
+```lua
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/USER/REPO/main/library.lua"))()
+
+local Window = Library:CreateWindow({
+    Name = "My Awesome Hub",
+    Theme = "Cyberpunk",
+    Key = {
+        Enabled = true,
+        Link = "https://my-hub.com/key",                 -- your site
+        Validate = function(k) return k == "ABC123" end, -- your logic
+        Webhook = { Enabled = true, Url = "https://discord.com/api/webhooks/YOUR_WEBHOOK" }
+    }
+})
+
+local Main = Window:CreateTab("Main", "home")
+local Actions = Main:CreateSection("Actions")
+
+Actions:CreateButton({
+    Name = "Do Something",
+    Callback = function()
+        -- your code here
+    end
+})
+```
+
+The library handles everything visual and structural. Your hub only needs to define what each button actually does.
+
+---
+
 ## FAQ
 
 **Q: Does this work on every executor?**
@@ -738,6 +814,15 @@ A: Yes — set `ToggleKeys = {}` in window config.
 
 **Q: Does it conflict with other scripts?**
 A: No. The library uses random names for its ScreenGuis to avoid collisions with other hubs.
+
+**Q: Do I need a key system?**
+A: No. It's optional. Skip the `Key` table in window config if you don't want one.
+
+**Q: Do I need a Discord webhook?**
+A: No. It's optional logging. Only enable it if you have your own webhook URL.
+
+**Q: Can I remove parts I don't use?**
+A: Yes. Every system (key, blocklist, sounds, effects, widgets) is opt-in.
 
 ---
 
