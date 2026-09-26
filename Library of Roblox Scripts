@@ -182,11 +182,11 @@ function L:GetReducedMotion() return self.Config and self.Config.ReducedMotion==
 
 L.Palettes = {
     Dark = {
-        Bg=Color3.fromRGB(27,31,42), Surface=Color3.fromRGB(34,39,52),
-        Card=Color3.fromRGB(45,51,66), CardHover=Color3.fromRGB(57,64,82),
-        CardActive=Color3.fromRGB(52,60,78), Stroke=Color3.fromRGB(78,87,108),
-        StrokeHot=Color3.fromRGB(142,150,255), Text=Color3.fromRGB(250,251,255),
-        TextDim=Color3.fromRGB(218,222,235), TextFaint=Color3.fromRGB(160,169,190),
+        Bg=Color3.fromRGB(38,43,56), Surface=Color3.fromRGB(48,55,70),
+        Card=Color3.fromRGB(60,68,86), CardHover=Color3.fromRGB(73,82,103),
+        CardActive=Color3.fromRGB(69,79,101), Stroke=Color3.fromRGB(103,114,138),
+        StrokeHot=Color3.fromRGB(151,160,255), Text=Color3.fromRGB(255,255,255),
+        TextDim=Color3.fromRGB(232,236,246), TextFaint=Color3.fromRGB(185,194,214),
         Accent=Color3.fromRGB(126,135,255), AccentSoft=Color3.fromRGB(77,86,180),
         Success=Color3.fromRGB(88,218,140), SuccessBg=Color3.fromRGB(35,91,64),
         Danger=Color3.fromRGB(232,110,120), DangerBg=Color3.fromRGB(100,39,52),
@@ -1801,8 +1801,9 @@ function L:CreateWindow(cfg)
     local Mc = Instance.new("UICorner"); Mc.CornerRadius = UDim.new(0,20); Mc.Parent = Main
     local Ms = Instance.new("UIStroke"); Ms.Color = C.Stroke; Ms.Thickness = 1.25; Ms.Transparency = 0.15; Ms.Parent = Main
     local Grad = Instance.new("UIGradient")
-    Grad.Color = ColorSequence.new(C.Bg, C.Surface)
-    Grad.Rotation = 45
+    Grad.Color = ColorSequence.new(C.Bg, C.Bg)
+    Grad.Transparency = NumberSequence.new(0)
+    Grad.Rotation = 0
     Grad.Parent = Main
     local Header = Instance.new("Frame")
     Header.Size = UDim2.new(1,0,0,54)
@@ -1922,8 +1923,9 @@ function L:CreateWindow(cfg)
     Tp.PaddingRight = UDim.new(0,6)
     Tp.Parent = TabsHolder
     local Content = Instance.new("Frame")
-    Content.Size = UDim2.new(1,-(cfg.TabWidth or 170)-20,1,-88)
-    Content.Position = UDim2.new(0,(cfg.TabWidth or 170)+16,0,58)
+    local sidebarWidth = cfg.TabWidth or 170
+    Content.Size = UDim2.new(1,-(sidebarWidth+184),1,-88)
+    Content.Position = UDim2.new(0,sidebarWidth+178,0,58)
     Content.BackgroundTransparency = 1
     Content.Parent = Main
     local StatusBar = Instance.new("Frame")
@@ -2066,6 +2068,10 @@ function L:CreateWindow(cfg)
             end
         end
         self._active = t
+        if t and t._frame then
+            t._frame.Visible = true
+            t._frame.CanvasPosition = Vector2.new(0,0)
+        end
         self._lib:PlaySound("click")
     end
     local toggleKeys = cfg.ToggleKeys or {Enum.KeyCode.RightControl}
@@ -2366,10 +2372,18 @@ function L:CreateSection(name)
     return Sec
 end
 
-function L:_AddElement(Sec, frame)
-    frame.LayoutOrder = #Sec._elements + 1
-    frame.Parent = Sec._inner or Sec._holder
-    table.insert(Sec._elements, frame)
+function L:CreateSectionLegacy(name)
+    return self:CreateSection(name)
+end
+
+function L:_AddElement(frame)
+    if not frame then return nil end
+    local elements = self._elements
+    if type(elements) ~= "table" then elements = {}; self._elements = elements end
+    frame.LayoutOrder = #elements + 1
+    local parent = self._inner or self._holder
+    if parent and frame.Parent ~= parent then frame.Parent = parent end
+    table.insert(elements, frame)
     return frame
 end
 
@@ -3688,6 +3702,18 @@ function L:PlayMacro(name)
         end
     end
     return false
+end
+
+function L:GetVersion()
+    return self.Version
+end
+
+function L:GetTheme()
+    return self.Theme, self.C
+end
+
+function L:GetWindows()
+    return self._allWindows or {}
 end
 
 return L
