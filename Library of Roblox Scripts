@@ -356,11 +356,14 @@ function L:SetCustomTheme(t)
 end
 
 function L:SetAnimatedTheme(baseName)
+    baseName = baseName or "Dark"
+    if type(baseName) ~= "string" or not self.Palettes[baseName] then baseName = "Dark" end
     self.Theme = "Animated"
     self.ThemeAnimated = true
-    self.ThemeBase = baseName or "Dark"
+    self.ThemeBase = baseName
     self.C = {}
-    for k, v in pairs(self.Palettes[self.ThemeBase]) do self.C[k] = v end
+    for k, v in pairs(self.Palettes[baseName]) do self.C[k] = v end
+    self:_EnsurePalette()
 end
 
 task.spawn(function()
@@ -1378,7 +1381,15 @@ function L:_DetectPlatform()
     self.Platform.device = isMobile and "mobile" or (isPc and "pc" or "console")
 end
 
+function L:_EnsurePalette()
+    if type(self.C) ~= "table" then self.C = {} end
+    for k, v in pairs(self.Palettes.Dark) do
+        if self.C[k] == nil then self.C[k] = v end
+    end
+end
+
 function L:_AskPlatform()
+    self:_EnsurePalette()
     local C = self.C
     local result = self.Platform.device or "pc"
     local done = false
@@ -1456,6 +1467,7 @@ function L:_AskPlatform()
 end
 
 function L:_SetupPlatform()
+    self:_EnsurePalette()
     self:_DetectPlatform()
     local saved = JsonRead("library_platform.json", {mode=""}).mode or ""
     if saved == "" then
@@ -1469,6 +1481,9 @@ end
 
 function L:_RunKeyFlow()
     local cfg = self.KeySystem
+    if not cfg or not cfg.Enabled then return true end
+    self:_EnsurePalette()
+    local C = self.C
     if not cfg or not cfg.Enabled then return true end
     local C = self.C
     local file = cfg.KeyFile or "library_key.json"
@@ -1677,6 +1692,7 @@ end
 
 function L:CreateWindow(cfg)
     cfg = cfg or {}
+    self:_EnsurePalette()
     if cfg.Splash then
         self:ShowSplash(cfg.Splash)
         task.wait(cfg.Splash.Duration or 2)
