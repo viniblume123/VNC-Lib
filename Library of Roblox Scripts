@@ -1,6 +1,6 @@
 local L = {}
 L.__index = L
-L.Version = "4.0.0"
+L.Version = "5.0.0"
 
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
@@ -182,17 +182,17 @@ function L:GetReducedMotion() return self.Config and self.Config.ReducedMotion==
 
 L.Palettes = {
     Dark = {
-        Bg=Color3.fromRGB(38,43,56), Surface=Color3.fromRGB(48,55,70),
-        Card=Color3.fromRGB(60,68,86), CardHover=Color3.fromRGB(73,82,103),
-        CardActive=Color3.fromRGB(69,79,101), Stroke=Color3.fromRGB(103,114,138),
-        StrokeHot=Color3.fromRGB(151,160,255), Text=Color3.fromRGB(255,255,255),
-        TextDim=Color3.fromRGB(232,236,246), TextFaint=Color3.fromRGB(185,194,214),
-        Accent=Color3.fromRGB(126,135,255), AccentSoft=Color3.fromRGB(77,86,180),
-        Success=Color3.fromRGB(88,218,140), SuccessBg=Color3.fromRGB(35,91,64),
-        Danger=Color3.fromRGB(232,110,120), DangerBg=Color3.fromRGB(100,39,52),
-        Warning=Color3.fromRGB(240,172,96), WarningBg=Color3.fromRGB(104,73,35),
-        Info=Color3.fromRGB(112,172,240), InfoBg=Color3.fromRGB(35,76,112),
-        Overlay=Color3.fromRGB(5,8,14), White=Color3.fromRGB(255,255,255)
+        Bg=Color3.fromRGB(30,34,45), Surface=Color3.fromRGB(39,44,57),
+        Card=Color3.fromRGB(51,58,73), CardHover=Color3.fromRGB(64,72,90),
+        CardActive=Color3.fromRGB(58,67,85), Stroke=Color3.fromRGB(86,96,118),
+        StrokeHot=Color3.fromRGB(142,155,255), Text=Color3.fromRGB(255,255,255),
+        TextDim=Color3.fromRGB(222,226,239), TextFaint=Color3.fromRGB(169,178,199),
+        Accent=Color3.fromRGB(128,140,255), AccentSoft=Color3.fromRGB(79,90,185),
+        Success=Color3.fromRGB(91,224,148), SuccessBg=Color3.fromRGB(39,94,66),
+        Danger=Color3.fromRGB(242,105,120), DangerBg=Color3.fromRGB(103,42,54),
+        Warning=Color3.fromRGB(244,181,91), WarningBg=Color3.fromRGB(105,76,36),
+        Info=Color3.fromRGB(106,178,246), InfoBg=Color3.fromRGB(39,79,116),
+        Overlay=Color3.fromRGB(8,10,16), White=Color3.fromRGB(255,255,255)
     },
     Neon = {
         Bg=Color3.fromRGB(10,10,18), Surface=Color3.fromRGB(18,18,28),
@@ -263,6 +263,8 @@ L.Palettes = {
 
 L.Palettes.Aurora = { Bg=Color3.fromRGB(20,27,38), Surface=Color3.fromRGB(27,36,49), Card=Color3.fromRGB(37,48,64), CardHover=Color3.fromRGB(48,62,82), CardActive=Color3.fromRGB(44,58,78), Stroke=Color3.fromRGB(69,88,112), StrokeHot=Color3.fromRGB(94,220,255), Text=Color3.fromRGB(246,252,255), TextDim=Color3.fromRGB(200,218,232), TextFaint=Color3.fromRGB(137,161,180), Accent=Color3.fromRGB(76,211,255), AccentSoft=Color3.fromRGB(39,117,150), Success=Color3.fromRGB(84,231,164), SuccessBg=Color3.fromRGB(29,87,63), Danger=Color3.fromRGB(255,102,128), DangerBg=Color3.fromRGB(101,39,54), Warning=Color3.fromRGB(255,190,91), WarningBg=Color3.fromRGB(100,72,35), Info=Color3.fromRGB(105,164,255), InfoBg=Color3.fromRGB(38,68,112), Overlay=Color3.fromRGB(2,7,13), White=Color3.fromRGB(255,255,255) }
 L.Palettes.Slate = { Bg=Color3.fromRGB(31,35,43), Surface=Color3.fromRGB(39,44,54), Card=Color3.fromRGB(51,57,69), CardHover=Color3.fromRGB(63,70,84), CardActive=Color3.fromRGB(59,67,82), Stroke=Color3.fromRGB(82,91,108), StrokeHot=Color3.fromRGB(168,184,255), Text=Color3.fromRGB(249,250,253), TextDim=Color3.fromRGB(217,221,231), TextFaint=Color3.fromRGB(157,165,181), Accent=Color3.fromRGB(140,155,255), AccentSoft=Color3.fromRGB(84,95,173), Success=Color3.fromRGB(91,220,151), SuccessBg=Color3.fromRGB(39,86,64), Danger=Color3.fromRGB(255,111,130), DangerBg=Color3.fromRGB(99,42,53), Warning=Color3.fromRGB(255,191,99), WarningBg=Color3.fromRGB(102,75,39), Info=Color3.fromRGB(105,181,255), InfoBg=Color3.fromRGB(39,73,111), Overlay=Color3.fromRGB(8,10,14), White=Color3.fromRGB(255,255,255) }
+L.Palettes.Light = { Bg=Color3.fromRGB(242,245,250), Surface=Color3.fromRGB(250,251,253), Card=Color3.fromRGB(255,255,255), CardHover=Color3.fromRGB(244,247,252), CardActive=Color3.fromRGB(235,240,250), Stroke=Color3.fromRGB(211,218,231), StrokeHot=Color3.fromRGB(102,116,255), Text=Color3.fromRGB(25,29,38), TextDim=Color3.fromRGB(73,80,96), TextFaint=Color3.fromRGB(118,127,146), Accent=Color3.fromRGB(91,105,240), AccentSoft=Color3.fromRGB(70,82,180), Success=Color3.fromRGB(35,155,91), SuccessBg=Color3.fromRGB(224,246,234), Danger=Color3.fromRGB(214,68,86), DangerBg=Color3.fromRGB(252,230,233), Warning=Color3.fromRGB(194,126,27), WarningBg=Color3.fromRGB(252,242,220), Info=Color3.fromRGB(48,125,205), InfoBg=Color3.fromRGB(225,239,253), Overlay=Color3.fromRGB(30,35,45), White=Color3.fromRGB(255,255,255) }
+L.Palettes.Graphite = { Bg=Color3.fromRGB(36,38,43), Surface=Color3.fromRGB(45,48,54), Card=Color3.fromRGB(56,60,68), CardHover=Color3.fromRGB(70,75,84), CardActive=Color3.fromRGB(64,69,79), Stroke=Color3.fromRGB(92,98,110), StrokeHot=Color3.fromRGB(155,168,255), Text=Color3.fromRGB(250,251,253), TextDim=Color3.fromRGB(216,220,228), TextFaint=Color3.fromRGB(161,167,180), Accent=Color3.fromRGB(135,148,255), AccentSoft=Color3.fromRGB(82,94,180), Success=Color3.fromRGB(91,220,151), SuccessBg=Color3.fromRGB(39,86,64), Danger=Color3.fromRGB(246,104,124), DangerBg=Color3.fromRGB(99,41,54), Warning=Color3.fromRGB(247,184,94), WarningBg=Color3.fromRGB(101,74,38), Info=Color3.fromRGB(106,179,246), InfoBg=Color3.fromRGB(39,75,112), Overlay=Color3.fromRGB(9,10,13), White=Color3.fromRGB(255,255,255) }
 
 L.Fonts = {
     "Gotham","GothamMedium","GothamBold","GothamBlack","GothamSemibold",
@@ -344,70 +346,20 @@ L.C = L.Palettes.Dark
 L.ThemeAnimated = false
 L.ThemeHue = 0
 
-function L:_RefreshThemeTree(root, old, new)
-    if not root or not old or not new then return end
-    local map = {
-        Bg="Bg", Surface="Surface", Card="Card", CardHover="CardHover", CardActive="CardActive", Stroke="Stroke", StrokeHot="StrokeHot",
-        Text="Text", TextDim="TextDim", TextFaint="TextFaint", Accent="Accent", AccentSoft="AccentSoft", Success="Success", SuccessBg="SuccessBg",
-        Danger="Danger", DangerBg="DangerBg", Warning="Warning", WarningBg="WarningBg", Info="Info", InfoBg="InfoBg", Overlay="Overlay", White="White"
-    }
-    for _, obj in ipairs(root:GetDescendants()) do
-        if obj:IsA("GuiObject") then
-            pcall(function()
-                local bg = obj.BackgroundColor3
-                for key in pairs(map) do
-                    if old[key] and bg == old[key] then obj.BackgroundColor3 = new[key] break end
-                end
-            end)
-            if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
-                pcall(function()
-                    local tc = obj.TextColor3
-                    for key in {"Text","TextDim","TextFaint","Accent","Success","Danger","Warning","Info","White"} do
-                        if old[key] and tc == old[key] then obj.TextColor3 = new[key] break end
-                    end
-                end)
-            elseif obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
-                pcall(function()
-                    local ic = obj.ImageColor3
-                    for key in {"TextDim","Accent","Success","Danger","Warning","Info","White"} do
-                        if old[key] and ic == old[key] then obj.ImageColor3 = new[key] break end
-                    end
-                end)
-            end
-            pcall(function()
-                local stroke = obj:FindFirstChildOfClass("UIStroke")
-                if stroke then
-                    for key in {"Stroke","StrokeHot","Accent","Danger","Success","Warning","Info"} do
-                        if old[key] and stroke.Color == old[key] then stroke.Color = new[key] break end
-                    end
-                end
-            end)
-        end
-    end
-end
-
 function L:SetTheme(name)
     if self.Palettes[name] then
-        local old = self.C
         self.Theme = name
         self.C = self.Palettes[name]
         self.ThemeAnimated = false
-        if self._window then
-            self:_RefreshThemeTree(self._window._main, old, self.C)
-            self._window:_ApplyTheme()
-        end
+        if self._window then self._window:_ApplyTheme() end
     end
 end
 
 function L:SetCustomTheme(t)
     if type(t) ~= "table" then return false end
-    local old = self.C
     local merged={}; for k,v in pairs(self.Palettes.Dark) do merged[k]=v end; for k,v in pairs(t) do merged[k]=v end
     self.C=merged; self.Theme="Custom"; self.ThemeAnimated=false
-    if self._window then
-        self:_RefreshThemeTree(self._window._main, old, self.C)
-        self._window:_ApplyTheme()
-    end
+    if self._window then self._window:_ApplyTheme() end
     return true
 end
 
@@ -1757,9 +1709,9 @@ function L:CreateWindow(cfg)
     local modeFile = "library_mode.json"
     local savedMode = JsonRead(modeFile, {mode="normal"}).mode or "normal"
     local sizes = {
-        compact = {w = cfg.CompactWidth or 480, h = cfg.CompactHeight or 320},
-        normal = {w = cfg.Width or 620, h = cfg.Height or 420},
-        wide = {w = cfg.WideWidth or 840, h = cfg.WideHeight or 480}
+        compact = {w = cfg.CompactWidth or 560, h = cfg.CompactHeight or 380},
+        normal = {w = cfg.Width or 720, h = cfg.Height or 500},
+        wide = {w = cfg.WideWidth or 980, h = cfg.WideHeight or 580}
     }
     local function GetSize(m)
         local s = sizes[m] or sizes.normal
@@ -1801,9 +1753,8 @@ function L:CreateWindow(cfg)
     local Mc = Instance.new("UICorner"); Mc.CornerRadius = UDim.new(0,20); Mc.Parent = Main
     local Ms = Instance.new("UIStroke"); Ms.Color = C.Stroke; Ms.Thickness = 1.25; Ms.Transparency = 0.15; Ms.Parent = Main
     local Grad = Instance.new("UIGradient")
-    Grad.Color = ColorSequence.new(C.Bg, C.Bg)
-    Grad.Transparency = NumberSequence.new(0)
-    Grad.Rotation = 0
+    Grad.Color = ColorSequence.new(C.Bg, C.Surface)
+    Grad.Rotation = 45
     Grad.Parent = Main
     local Header = Instance.new("Frame")
     Header.Size = UDim2.new(1,0,0,54)
@@ -1923,9 +1874,8 @@ function L:CreateWindow(cfg)
     Tp.PaddingRight = UDim.new(0,6)
     Tp.Parent = TabsHolder
     local Content = Instance.new("Frame")
-    local sidebarWidth = cfg.TabWidth or 170
-    Content.Size = UDim2.new(1,-(sidebarWidth+184),1,-88)
-    Content.Position = UDim2.new(0,sidebarWidth+178,0,58)
+    Content.Size = UDim2.new(1,-(cfg.TabWidth or 170)-20,1,-88)
+    Content.Position = UDim2.new(0,(cfg.TabWidth or 170)+16,0,58)
     Content.BackgroundTransparency = 1
     Content.Parent = Main
     local StatusBar = Instance.new("Frame")
@@ -2068,10 +2018,6 @@ function L:CreateWindow(cfg)
             end
         end
         self._active = t
-        if t and t._frame then
-            t._frame.Visible = true
-            t._frame.CanvasPosition = Vector2.new(0,0)
-        end
         self._lib:PlaySound("click")
     end
     local toggleKeys = cfg.ToggleKeys or {Enum.KeyCode.RightControl}
@@ -2372,18 +2318,20 @@ function L:CreateSection(name)
     return Sec
 end
 
-function L:CreateSectionLegacy(name)
-    return self:CreateSection(name)
-end
-
-function L:_AddElement(frame)
-    if not frame then return nil end
-    local elements = self._elements
-    if type(elements) ~= "table" then elements = {}; self._elements = elements end
-    frame.LayoutOrder = #elements + 1
-    local parent = self._inner or self._holder
-    if parent and frame.Parent ~= parent then frame.Parent = parent end
-    table.insert(elements, frame)
+function L:_AddElement(a, b)
+    local Sec, frame
+    if b ~= nil then
+        Sec, frame = a, b
+    else
+        Sec, frame = self, a
+    end
+    if type(Sec) ~= "table" or not frame then return nil end
+    if type(Sec._elements) ~= "table" then Sec._elements = {} end
+    local parent = Sec._inner or Sec._holder
+    if not parent then return nil end
+    frame.LayoutOrder = #Sec._elements + 1
+    if frame.Parent ~= parent then frame.Parent = parent end
+    table.insert(Sec._elements, frame)
     return frame
 end
 
@@ -3702,18 +3650,6 @@ function L:PlayMacro(name)
         end
     end
     return false
-end
-
-function L:GetVersion()
-    return self.Version
-end
-
-function L:GetTheme()
-    return self.Theme, self.C
-end
-
-function L:GetWindows()
-    return self._allWindows or {}
 end
 
 return L
