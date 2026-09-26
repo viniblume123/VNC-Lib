@@ -4,7 +4,8 @@ L.Version = "2.0.0"
 
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
-local TS = game:GetService("TweenService")
+local TweenService = game:GetService("TweenService")
+local TS = TweenService
 local UIS = game:GetService("UserInputService")
 local HS = game:GetService("HttpService")
 local CG = game:GetService("CoreGui")
