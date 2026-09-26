@@ -1,6 +1,6 @@
 local L = {}
 L.__index = L
-L.Version = "5.0.0"
+L.Version = "6.0.0"
 
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
@@ -88,6 +88,27 @@ local function ColorToHex(c)
     return string.format("#%02X%02X%02X", math.floor(c.R*255+0.5), math.floor(c.G*255+0.5), math.floor(c.B*255+0.5))
 end
 
+local function FormatControlNumber(value, maxDigits)
+    maxDigits = maxDigits or 3
+    local n = tonumber(value) or 0
+    if n ~= n then n = 0 end
+    local sign = n < 0 and "-" or ""
+    local a = math.abs(n)
+    if a < 1 then
+        local t = string.format("%.2f", a):gsub("0+$", ""):gsub("%.$", "")
+        return sign .. (t == "" and "0" or t)
+    end
+    local whole = tostring(math.floor(a))
+    if #whole > maxDigits then
+        return sign .. whole:sub(1, maxDigits)
+    end
+    return sign .. whole
+end
+
+local function SafeColor(value, fallback)
+    return typeof(value) == "Color3" and value or fallback
+end
+
 local function GetHui()
     if HUI then
         local ok, h = pcall(HUI)
@@ -104,7 +125,7 @@ L._connections = {}
 L._destroyed = false
 L._state = {}
 L._stateFile = "library_state.json"
-L.Config = {AutoSave = true, SaveDelay = 0.75}
+L.Config = {AutoSave = true, SaveDelay = 0.75, AutoSaveConfig = false, AutoSaveConfigName = nil, AutoSaveConfigDelay = 0.75, Transparency = 0, ReducedMotion = false}
 
 local function SafeFont(name, fallback)
     name = name or fallback or "Gotham"
@@ -126,9 +147,20 @@ function L:_DisconnectAll()
     end
 end
 
+function L:_ScheduleConfigAutoSave()
+    if self._loadingConfig or not self.Config.AutoSaveConfig or not self.Config.AutoSaveConfigName then return end
+    self._configSaveToken = (self._configSaveToken or 0) + 1
+    local token = self._configSaveToken
+    task.delay(self.Config.AutoSaveConfigDelay or 0.75, function()
+        if self._destroyed or token ~= self._configSaveToken then return end
+        pcall(function() self:OverwriteConfig(self.Config.AutoSaveConfigName) end)
+    end)
+end
+
 function L:RegisterState(flag, getter, setter)
     if type(flag) ~= "string" or flag == "" or type(getter) ~= "function" then return false end
-    self._state[flag] = {Get=getter, Set=setter}
+    local entry = {Get=getter, Set=setter}
+    self._state[flag] = entry
     return true
 end
 function L:UnregisterState(flag) self._state[flag] = nil end
@@ -176,17 +208,17 @@ function L:SetAccent(color)
     return true
 end
 function L:GetThemeSnapshot() local out={}; for k,v in pairs(self.C) do out[k]=v end; return out end
-function L:SetTransparency(value) value=math.clamp(tonumber(value) or 0,0,0.45); self.Config=self.Config or {}; self.Config.Transparency=value; if self._window then self._window:_ApplyTheme() end; return value end
+function L:SetTransparency(value) value=math.clamp(tonumber(value) or 0,0,0.45); self.Config=self.Config or {}; self.Config.Transparency=value; if self._window then self._window:_ApplyTheme(nil, self.C) end; return value end
 function L:SetReducedMotion(enabled) self.Config=self.Config or {}; self.Config.ReducedMotion=enabled==true; return self.Config.ReducedMotion end
 function L:GetReducedMotion() return self.Config and self.Config.ReducedMotion==true or false end
 
 L.Palettes = {
     Dark = {
-        Bg=Color3.fromRGB(30,34,45), Surface=Color3.fromRGB(39,44,57),
-        Card=Color3.fromRGB(51,58,73), CardHover=Color3.fromRGB(64,72,90),
-        CardActive=Color3.fromRGB(58,67,85), Stroke=Color3.fromRGB(86,96,118),
+        Bg=Color3.fromRGB(36,42,56), Surface=Color3.fromRGB(48,56,72),
+        Card=Color3.fromRGB(62,72,92), CardHover=Color3.fromRGB(78,90,114),
+        CardActive=Color3.fromRGB(70,82,104), Stroke=Color3.fromRGB(104,116,140),
         StrokeHot=Color3.fromRGB(142,155,255), Text=Color3.fromRGB(255,255,255),
-        TextDim=Color3.fromRGB(222,226,239), TextFaint=Color3.fromRGB(169,178,199),
+        TextDim=Color3.fromRGB(232,236,247), TextFaint=Color3.fromRGB(190,199,220),
         Accent=Color3.fromRGB(128,140,255), AccentSoft=Color3.fromRGB(79,90,185),
         Success=Color3.fromRGB(91,224,148), SuccessBg=Color3.fromRGB(39,94,66),
         Danger=Color3.fromRGB(242,105,120), DangerBg=Color3.fromRGB(103,42,54),
@@ -346,43 +378,77 @@ L.C = L.Palettes.Dark
 L.ThemeAnimated = false
 L.ThemeHue = 0
 
-function L:SetTheme(name)
-    if self.Palettes[name] then
-        self.Theme = name
-        self.C = self.Palettes[name]
-        self.ThemeAnimated = false
-        if self._window then self._window:_ApplyTheme() end
+local function ClonePalette(source)
+    local out = {}
+    for k, v in pairs(source or {}) do out[k] = v end
+    return out
+end
+
+local function NormalizePalette(p)
+    local out = ClonePalette(p)
+    local function lift(c, minimum)
+        if typeof(c) ~= "Color3" then return c end
+        local h, sat, val = c:ToHSV()
+        if val < minimum then val = minimum end
+        return Color3.fromHSV(h, sat, val)
     end
+    out.Bg = lift(out.Bg, 0.14)
+    out.Surface = lift(out.Surface, 0.19)
+    out.Card = lift(out.Card, 0.24)
+    out.CardHover = lift(out.CardHover, 0.30)
+    out.CardActive = lift(out.CardActive, 0.27)
+    out.Text = lift(out.Text, 0.92)
+    out.TextDim = lift(out.TextDim, 0.72)
+    out.TextFaint = lift(out.TextFaint, 0.52)
+    out.Stroke = lift(out.Stroke, 0.28)
+    return out
+end
+
+function L:SetTheme(name)
+    local palette = self.Palettes[name]
+    if not palette then return false end
+    local old = self.C
+    self.Theme = name
+    self.C = NormalizePalette(palette)
+    self.ThemeAnimated = false
+    if self._window then self._window:_ApplyTheme(old, self.C) end
+    return true
 end
 
 function L:SetCustomTheme(t)
     if type(t) ~= "table" then return false end
-    local merged={}; for k,v in pairs(self.Palettes.Dark) do merged[k]=v end; for k,v in pairs(t) do merged[k]=v end
-    self.C=merged; self.Theme="Custom"; self.ThemeAnimated=false
-    if self._window then self._window:_ApplyTheme() end
+    local merged = ClonePalette(self.Palettes.Dark)
+    for k, v in pairs(t) do merged[k] = v end
+    local old = self.C
+    self.C = NormalizePalette(merged)
+    self.Theme = "Custom"
+    self.ThemeAnimated = false
+    if self._window then self._window:_ApplyTheme(old, self.C) end
     return true
 end
 
 function L:SetAnimatedTheme(baseName)
+    baseName = self.Palettes[baseName] and baseName or "Dark"
     self.Theme = "Animated"
     self.ThemeAnimated = true
-    self.ThemeBase = baseName or "Dark"
-    self.C = {}
-    for k, v in pairs(self.Palettes[self.ThemeBase]) do self.C[k] = v end
+    self.ThemeBase = baseName
+    self.C = NormalizePalette(self.Palettes[baseName])
+    if self._window then self._window:_ApplyTheme(nil, self.C) end
+    return true
 end
 
 task.spawn(function()
     while true do
-        task.wait(0.05)
-        if L.ThemeAnimated and L._window then
-            L.ThemeHue = (L.ThemeHue + 0.005) % 1
-            local na = Color3.fromHSV(L.ThemeHue, 0.7, 1)
-            local ns = Color3.fromHSV(L.ThemeHue, 0.6, 0.6)
-            for k, v in pairs(L.Palettes[L.ThemeBase]) do L.C[k] = v end
+        task.wait(0.08)
+        if L.ThemeAnimated and L._window and not L._destroyed then
+            L.ThemeHue = (L.ThemeHue + 0.006) % 1
+            local na = Color3.fromHSV(L.ThemeHue, 0.68, 1)
+            local ns = Color3.fromHSV(L.ThemeHue, 0.62, 0.62)
+            local oldAccent = L.C.Accent
             L.C.Accent = na
             L.C.AccentSoft = ns
             L.C.StrokeHot = na
-            pcall(function() L._window:_ApplyAccent() end)
+            pcall(function() L._window:_ApplyAccent(oldAccent, na, ns) end)
         end
     end
 end)
@@ -1204,7 +1270,7 @@ end
 
 function L:AddMemoryWidget()
     return self:AddWidget({
-        Id="memory", Name="Memoria", Icon="M", Color=self.C.Warning, Interval=2,
+        Id="memory", Name="Memory", Icon="M", Color=self.C.Warning, Interval=2,
         OnUpdate=function()
             local ok, mem = pcall(function() return game:GetService("Stats"):GetTotalMemoryUsageMb() end)
             return ok and (math.floor(mem).." MB") or "?"
@@ -1214,7 +1280,7 @@ end
 
 function L:AddClockWidget()
     return self:AddWidget({
-        Id="clock", Name="Horario", Icon="C", Color=self.C.Accent, Interval=1,
+        Id="clock", Name="Clock", Icon="C", Color=self.C.Accent, Interval=1,
         OnUpdate=function() return os.date("%H:%M:%S") end
     })
 end
@@ -1363,7 +1429,7 @@ function L:SetStreamerMode(on)
     self.StreamerMode = on
     if self._window then
         if on then
-            self._window._statusL.Text = "Modo Streamer"
+            self._window._statusL.Text = "Streamer Mode"
             self._window._main.Size = UDim2.new(0, 820, 0, 500)
         else
             self._window._statusL.Text = "User: "..LP.Name.." - "..self.Executor
@@ -1415,7 +1481,7 @@ function L:_AskPlatform()
     Title.Size = UDim2.new(1,-20,0,26)
     Title.Position = UDim2.new(0,20,0,24)
     Title.BackgroundTransparency = 1
-    Title.Text = "Plataforma"
+    Title.Text = "Platform"
     Title.Font = Enum.Font[self.CurrentFontBold]
     Title.TextSize = 18
     Title.TextColor3 = C.Text
@@ -1425,7 +1491,7 @@ function L:_AskPlatform()
     Desc.Size = UDim2.new(1,-40,0,40)
     Desc.Position = UDim2.new(0,20,0,56)
     Desc.BackgroundTransparency = 1
-    Desc.Text = "Detectamos: "..(self.Platform.device or "?")..". Esta correto?"
+    Desc.Text = "Detected: "..(self.Platform.device or "?")..". Is this correct?"
     Desc.Font = Enum.Font[self.CurrentFont]
     Desc.TextSize = 12
     Desc.TextColor3 = C.TextDim
@@ -1528,7 +1594,7 @@ function L:_RunKeyFlow()
     DL.AutomaticSize = Enum.AutomaticSize.Y
     DL.Position = UDim2.new(0,20,0,54)
     DL.BackgroundTransparency = 1
-    DL.Text = cfg.Description or "Digite a key para continuar"
+    DL.Text = cfg.Description or "Enter the key to continue"
     DL.Font = Enum.Font[self.CurrentFont]
     DL.TextSize = 12
     DL.TextColor3 = C.TextDim
@@ -1617,7 +1683,7 @@ function L:_RunKeyFlow()
         self:PlaySound("click")
         local key = InputB.Text
         if key == "" then
-            SL.Text = "Digite uma key"
+            SL.Text = "Enter a key"
             SL.TextColor3 = C.Danger
             return
         end
@@ -1699,10 +1765,11 @@ function L:CreateWindow(cfg)
         self:SetBlocklist(cfg.Blocklist)
         if not self.Blocklist:RunCheck() then return end
     end
-    if cfg.AskPlatform ~= false then self:_SetupPlatform() end
+    if cfg.AskPlatform == true then self:_SetupPlatform() end
     if cfg.Key and cfg.Key.Enabled then
         if not self:_RunKeyFlow() then return end
     end
+    self.C = NormalizePalette(self.C)
     local C = self.C
     local WinFile = "library_window.json"
     local savedPos = JsonRead(WinFile, nil)
@@ -1737,7 +1804,7 @@ function L:CreateWindow(cfg)
         Main.Position = UDim2.new(0.5, -sizes[savedMode].w/2, 0.5, -sizes[savedMode].h/2)
     end
     Main.BackgroundColor3 = C.Bg
-    Main.GroupTransparency = 1
+    Main.GroupTransparency = 0
     Main.BorderSizePixel = 0
     Main.Parent = sg
     local Shadow = Instance.new("Frame")
@@ -1745,13 +1812,13 @@ function L:CreateWindow(cfg)
     Shadow.Size = UDim2.new(1,18,1,18)
     Shadow.Position = UDim2.new(0,-9,0,10)
     Shadow.BackgroundColor3 = C.Overlay
-    Shadow.BackgroundTransparency = 0.58
+    Shadow.BackgroundTransparency = 0.72
     Shadow.BorderSizePixel = 0
     Shadow.ZIndex = 0
     Shadow.Parent = sg
     local Shc = Instance.new("UICorner"); Shc.CornerRadius = UDim.new(0,22); Shc.Parent = Shadow
     local Mc = Instance.new("UICorner"); Mc.CornerRadius = UDim.new(0,20); Mc.Parent = Main
-    local Ms = Instance.new("UIStroke"); Ms.Color = C.Stroke; Ms.Thickness = 1.25; Ms.Transparency = 0.15; Ms.Parent = Main
+    local Ms = Instance.new("UIStroke"); Ms.Color = C.Stroke; Ms.Thickness = 1.25; Ms.Transparency = 0.05; Ms.Parent = Main
     local Grad = Instance.new("UIGradient")
     Grad.Color = ColorSequence.new(C.Bg, C.Surface)
     Grad.Rotation = 45
@@ -1854,7 +1921,7 @@ function L:CreateWindow(cfg)
     Sidebar.BorderSizePixel = 0
     Sidebar.Parent = Main
     local Sc = Instance.new("UICorner"); Sc.CornerRadius = UDim.new(0,12); Sc.Parent = Sidebar
-    local Ss = Instance.new("UIStroke"); Ss.Color = C.Stroke; Ss.Thickness = 1; Ss.Transparency = 0.4; Ss.Parent = Sidebar
+    local Ss = Instance.new("UIStroke"); Ss.Color = C.Stroke; Ss.Thickness = 1; Ss.Transparency = 0.15; Ss.Parent = Sidebar
     local TabsHolder = Instance.new("ScrollingFrame")
     TabsHolder.Size = UDim2.new(1,-8,1,-8)
     TabsHolder.Position = UDim2.new(0,4,0,4)
@@ -1878,6 +1945,13 @@ function L:CreateWindow(cfg)
     Content.Position = UDim2.new(0,(cfg.TabWidth or 170)+16,0,58)
     Content.BackgroundTransparency = 1
     Content.Parent = Main
+    local OverlayLayer = Instance.new("Frame")
+    OverlayLayer.Name = "OverlayLayer"
+    OverlayLayer.Size = UDim2.new(1,0,1,0)
+    OverlayLayer.BackgroundTransparency = 1
+    OverlayLayer.BorderSizePixel = 0
+    OverlayLayer.ZIndex = 1000
+    OverlayLayer.Parent = Main
     local StatusBar = Instance.new("Frame")
     StatusBar.Size = UDim2.new(1,-24,0,20)
     StatusBar.Position = UDim2.new(0,12,1,-28)
@@ -1904,7 +1978,7 @@ function L:CreateWindow(cfg)
     StatusR.Parent = StatusBar
     local Win = setmetatable({
         _lib=self, _gui=sg, _main=Main, _sidebar=Sidebar, _tabsHolder=TabsHolder,
-        _content=Content, _tabs={}, _active=nil, _cfg=cfg, _mode=savedMode,
+        _content=Content, _overlay=OverlayLayer, _tabs={}, _active=nil, _cfg=cfg, _mode=savedMode,
         _sizes=sizes, _uiscale=UIScaleObj, _gradient=Grad,
         _header=Header, _logo=Logo, _title=Title, _sub=Sub, _mainStroke=Ms, _shadow=Shadow,
         _statusBar=StatusBar, _statusL=StatusL, _statusR=StatusR,
@@ -1912,10 +1986,12 @@ function L:CreateWindow(cfg)
         _allElements={}
     }, {__index=L})
     Win.C = C
-    function Win:_ApplyTheme()
-        local c = self._lib.C
+    function Win:_ApplyTheme(old, new)
+        local c = new or self._lib.C
         self._main.BackgroundColor3 = c.Bg
+        self._main.BackgroundTransparency = self._lib.Config.Transparency or 0
         self._gradient.Color = ColorSequence.new(c.Bg, c.Surface)
+        self._gradient.Transparency = NumberSequence.new(0.05)
         self._sidebar.BackgroundColor3 = c.Surface
         self._mainStroke.Color = c.Stroke
         self._shadow.BackgroundColor3 = c.Overlay
@@ -1925,11 +2001,52 @@ function L:CreateWindow(cfg)
         self._logo.BackgroundColor3 = c.Accent
         self._statusL.TextColor3 = c.TextFaint
         self._statusR.TextColor3 = c.TextFaint
+        local root = self._main
+        if old then
+            for _, obj in ipairs(root:GetDescendants()) do
+                if obj:IsA("GuiObject") then
+                    local bg = obj.BackgroundColor3
+                    local mapped = nil
+                    for key, value in pairs(old) do
+                        if typeof(value) == "Color3" and bg == value and c[key] then mapped = c[key]; break end
+                    end
+                    if mapped then obj.BackgroundColor3 = mapped end
+                end
+                if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
+                    local tc = obj.TextColor3
+                    for key, value in pairs(old) do
+                        if typeof(value) == "Color3" and tc == value and c[key] then obj.TextColor3 = c[key]; break end
+                    end
+                end
+                if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+                    local ic = obj.ImageColor3
+                    for key, value in pairs(old) do
+                        if typeof(value) == "Color3" and ic == value and c[key] then obj.ImageColor3 = c[key]; break end
+                    end
+                end
+                if obj:IsA("UIStroke") then
+                    local sc = obj.Color
+                    for key, value in pairs(old) do
+                        if typeof(value) == "Color3" and sc == value and c[key] then obj.Color = c[key]; break end
+                    end
+                end
+            end
+        end
     end
-    function Win:_ApplyAccent()
+    function Win:_ApplyAccent(oldAccent, newAccent, newSoft)
         local c = self._lib.C
-        self._accentStrip.BackgroundColor3 = c.Accent
-        self._logo.BackgroundColor3 = c.Accent
+        oldAccent = oldAccent or c.Accent
+        newAccent = newAccent or c.Accent
+        newSoft = newSoft or c.AccentSoft
+        self._accentStrip.BackgroundColor3 = newAccent
+        self._logo.BackgroundColor3 = newAccent
+        for _, obj in ipairs(self._main:GetDescendants()) do
+            if obj:IsA("GuiObject") and obj.BackgroundColor3 == oldAccent then obj.BackgroundColor3 = newAccent end
+            if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.TextColor3 == oldAccent then obj.TextColor3 = newAccent end
+            if (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) and obj.ImageColor3 == oldAccent then obj.ImageColor3 = newAccent end
+            if obj:IsA("UIStroke") and obj.Color == oldAccent then obj.Color = newAccent end
+            if obj:IsA("GuiObject") and obj.BackgroundColor3 == (self._lib.Palettes[self._lib.ThemeBase or "Dark"] and self._lib.Palettes[self._lib.ThemeBase or "Dark"].AccentSoft) then obj.BackgroundColor3 = newSoft end
+        end
     end
     function Win:_ApplyFont()
         local f, fb, fm = self._lib.CurrentFont, self._lib.CurrentFontBold, self._lib.CurrentFontMedium
@@ -2034,7 +2151,7 @@ function L:CreateWindow(cfg)
         if self._main and self._main.Parent then self._main.Parent:Destroy() end
         if self._lib._window==self then self._lib._window=nil end
     end
-    TweenService:Create(Main,T_INFO,{GroupTransparency=0}):Play()
+    Main.GroupTransparency = 0
     self._window=Win
     self._destroyed=false
     self._allWindows = self._allWindows or {}
@@ -2434,7 +2551,7 @@ function L:CreateToggle(cfg)
     local Sec = self
     local C = Sec._window.C
     cfg = cfg or {}
-    local state = cfg.Default or false
+    local state = cfg.Default == true
     if cfg.Flag then
         local savedData=JsonRead(Sec._lib._stateFile,nil)
         local savedValue=savedData and savedData.values and savedData.values[cfg.Flag]
@@ -2480,6 +2597,7 @@ function L:CreateToggle(cfg)
         if cfg.Flag then
             Sec._lib._state[cfg.Flag]={Get=function() return state end,Set=function(v) Set(v,true) end}
             if Sec._lib.Config.AutoSave and not silent then task.delay(Sec._lib.Config.SaveDelay,function() if not Sec._lib._destroyed then pcall(function() Sec._lib:SaveState() end) end end) end
+            if not silent then Sec._lib:_ScheduleConfigAutoSave() end
         end
         if not silent and cfg.Callback then pcall(cfg.Callback, state) end
     end
@@ -2503,8 +2621,9 @@ function L:CreateSlider(cfg)
     local Sec = self
     local C = Sec._window.C
     cfg = cfg or {}
-    local min, max = cfg.Min or 0, cfg.Max or 100
-    local val = cfg.Default or min
+    local min, max = tonumber(cfg.Min) or 0, tonumber(cfg.Max) or 100
+    if max <= min then max = min + 1 end
+    local val = math.clamp(tonumber(cfg.Default) or min, min, max)
     local fillColor = cfg.FillColor or C.Accent
     local barColor = cfg.BarColor or C.Surface
     local Wrapped = Instance.new("Frame")
@@ -2528,7 +2647,7 @@ function L:CreateSlider(cfg)
     ValL.Size = UDim2.new(0,70,0,20)
     ValL.Position = UDim2.new(1,-86,0,8)
     ValL.BackgroundTransparency = 1
-    ValL.Text = tostring(val)..(cfg.Suffix or "")
+    ValL.Text = FormatControlNumber(val)..(cfg.Suffix or "")
     ValL.Font = Enum.Font[Sec._lib.CurrentFontBold]
     ValL.TextSize = 12
     ValL.TextColor3 = fillColor
@@ -2566,10 +2685,11 @@ function L:CreateSlider(cfg)
         local t = math.clamp((x - abs) / sz, 0, 1)
         val = min + (max - min) * t
         if cfg.Round then val = math.floor(val + 0.5) end
-        ValL.Text = tostring(val)..(cfg.Suffix or "")
+        ValL.Text = FormatControlNumber(val)..(cfg.Suffix or "")
         TweenService:Create(Fill, T_FAST, {Size=UDim2.new(t,0,1,0)}):Play()
         TweenService:Create(Thumb, T_FAST, {Position=UDim2.new(t,-7,0.5,-7)}):Play()
         if cfg.Callback then pcall(cfg.Callback, val) end
+        if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
     end
     Btn.InputBegan:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
@@ -2583,13 +2703,25 @@ function L:CreateSlider(cfg)
             SetFromClick(i.Position.X)
         end
     end)
+    if cfg.Flag then
+        Sec._lib:RegisterState(cfg.Flag, function() return val end, function(v, silent)
+            val = math.clamp(tonumber(v) or min, min, max)
+            local t = (val-min)/(max-min)
+            ValL.Text = FormatControlNumber(val)..(cfg.Suffix or "")
+            Fill.Size = UDim2.new(t,0,1,0)
+            Thumb.Position = UDim2.new(t,-7,0.5,-7)
+            if not silent and cfg.Callback then pcall(cfg.Callback, val) end
+        end)
+    end
     local Element = {Instance=Wrapped, Value=val, _label=Lb}
     function Element:Set(v)
         val = math.clamp(v, min, max)
         local t = (val-min)/(max-min)
-        ValL.Text = tostring(val)..(cfg.Suffix or "")
+        ValL.Text = FormatControlNumber(val)..(cfg.Suffix or "")
         TweenService:Create(Fill, T_FAST, {Size=UDim2.new(t,0,1,0)}):Play()
         TweenService:Create(Thumb, T_FAST, {Position=UDim2.new(t,-7,0.5,-7)}):Play()
+        if cfg.Callback then pcall(cfg.Callback, val) end
+        if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
     end
     function Element:SetColor(c)
         fillColor = c
@@ -2608,9 +2740,14 @@ function L:CreateRangeSlider(cfg)
     local Sec = self
     local C = Sec._window.C
     cfg = cfg or {}
-    local min, max = cfg.Min or 0, cfg.Max or 100
-    local v1 = cfg.DefaultMin or min
-    local v2 = cfg.DefaultMax or max
+    local min, max = tonumber(cfg.Min) or 0, tonumber(cfg.Max) or 100
+    if max <= min then max = min + 1 end
+    local rangeDefault = type(cfg.Default)=="table" and cfg.Default or {}
+    local v1 = tonumber(cfg.DefaultMin or rangeDefault.Min or rangeDefault[1] or min) or min
+    local v2 = tonumber(cfg.DefaultMax or rangeDefault.Max or rangeDefault[2] or max) or max
+    v1 = math.clamp(v1,min,max)
+    v2 = math.clamp(v2,min,max)
+    if v2 < v1 then v1,v2=v2,v1 end
     local fillColor = cfg.FillColor or C.Accent
     local Wrapped = Instance.new("Frame")
     Wrapped.Size = UDim2.new(1,0,0,64)
@@ -2633,7 +2770,7 @@ function L:CreateRangeSlider(cfg)
     ValL.Size = UDim2.new(0,130,0,20)
     ValL.Position = UDim2.new(1,-146,0,8)
     ValL.BackgroundTransparency = 1
-    ValL.Text = tostring(v1).." - "..tostring(v2)
+    ValL.Text = FormatControlNumber(v1).." - "..FormatControlNumber(v2)
     ValL.Font = Enum.Font[Sec._lib.CurrentFontBold]
     ValL.TextSize = 12
     ValL.TextColor3 = fillColor
@@ -2691,7 +2828,7 @@ function L:CreateRangeSlider(cfg)
             if d1 < d2 then v1 = math.min(v, v2 - 1); dragging = 1
             else v2 = math.max(v, v1 + 1); dragging = 2 end
         end
-        ValL.Text = tostring(v1).." - "..tostring(v2)
+        ValL.Text = FormatControlNumber(v1).." - "..FormatControlNumber(v2)
         local p1 = (v1-min)/(max-min)
         local p2 = (v2-min)/(max-min)
         Fill.Position = UDim2.new(p1, 0, 0, 0)
@@ -2699,6 +2836,7 @@ function L:CreateRangeSlider(cfg)
         Thumb1.Position = UDim2.new(p1, -7, 0.5, -7)
         Thumb2.Position = UDim2.new(p2, -7, 0.5, -7)
         if cfg.Callback then pcall(cfg.Callback, v1, v2) end
+        if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
     end
     Btn.InputBegan:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
@@ -2717,9 +2855,24 @@ function L:CreateRangeSlider(cfg)
             dragging = nil
         end
     end)
+    if cfg.Flag then
+        Sec._lib:RegisterState(cfg.Flag, function() return {Min=v1, Max=v2} end, function(v, silent)
+            if type(v) == "table" then v1 = tonumber(v.Min or v[1]) or min; v2 = tonumber(v.Max or v[2]) or max end
+            v1 = math.clamp(v1, min, max); v2 = math.clamp(v2, min, max); if v2 < v1 then v1, v2 = v2, v1 end
+            local p1=(v1-min)/(max-min); local p2=(v2-min)/(max-min)
+            ValL.Text=FormatControlNumber(v1).." - "..FormatControlNumber(v2); Fill.Position=UDim2.new(p1,0,0,0); Fill.Size=UDim2.new(p2-p1,0,1,0); Thumb1.Position=UDim2.new(p1,-7,0.5,-7); Thumb2.Position=UDim2.new(p2,-7,0.5,-7)
+            if not silent and cfg.Callback then pcall(cfg.Callback,v1,v2) end
+        end)
+    end
     local Element = {Instance=Wrapped}
     function Element:Get() return v1, v2 end
-    function Element:Set(a, b) v1 = a; v2 = b end
+    function Element:Set(a, b)
+        v1 = math.clamp(tonumber(a) or v1, min, max); v2 = math.clamp(tonumber(b) or v2, min, max); if v2 < v1 then v1, v2 = v2, v1 end
+        local p1=(v1-min)/(max-min); local p2=(v2-min)/(max-min)
+        ValL.Text=FormatControlNumber(v1).." - "..FormatControlNumber(v2); Fill.Position=UDim2.new(p1,0,0,0); Fill.Size=UDim2.new(p2-p1,0,1,0); Thumb1.Position=UDim2.new(p1,-7,0.5,-7); Thumb2.Position=UDim2.new(p2,-7,0.5,-7)
+        if cfg.Callback then pcall(cfg.Callback,v1,v2) end
+        if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
+    end
     function Element:Destroy() Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
     if cfg.Callback then pcall(cfg.Callback, v1, v2) end
@@ -2752,7 +2905,7 @@ function L:CreateInput(cfg)
     Box.Position = UDim2.new(0,16,0,30)
     Box.BackgroundColor3 = C.Surface
     Box.Text = cfg.Default or ""
-    Box.PlaceholderText = cfg.Placeholder or "Digite..."
+    Box.PlaceholderText = cfg.Placeholder or "Type here..."
     Box.Font = Enum.Font[Sec._lib.CurrentFont]
     Box.TextSize = 12
     Box.TextColor3 = C.Text
@@ -2767,9 +2920,11 @@ function L:CreateInput(cfg)
     Box.FocusLost:Connect(function(enter)
         TweenService:Create(Bs, T_OUT, {Color=C.Stroke, Transparency=0.4}):Play()
         if cfg.Callback then pcall(cfg.Callback, Box.Text, enter) end
+        if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
     end)
+    if cfg.Flag then Sec._lib:RegisterState(cfg.Flag, function() return Box.Text end, function(v, silent) Box.Text=tostring(v or ""); if not silent and cfg.Callback then pcall(cfg.Callback,Box.Text,false) end end) end
     local Element = {Instance=Wrapped, Box=Box, _label=Lb}
-    function Element:Set(t) Box.Text = t end
+    function Element:Set(t) Box.Text = tostring(t or ""); if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end end
     function Element:Get() return Box.Text end
     function Element:Destroy() Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
@@ -2873,9 +3028,11 @@ function L:CreateDropdown(cfg)
     local Sec = self
     local C = Sec._window.C
     cfg = cfg or {}
-    local opts = cfg.Options or {}
+    local opts = cfg.Options or cfg.Values or cfg.Items or {}
     local multi = cfg.Multi or false
-    local selected = multi and {} or (cfg.Default or opts[1])
+    local defaultValue = cfg.Default
+    if not multi and type(defaultValue) == "number" then defaultValue = opts[defaultValue] end
+    local selected = multi and (type(defaultValue)=="table" and defaultValue or {}) or (defaultValue ~= nil and defaultValue or opts[1])
     local Wrapped = Instance.new("Frame")
     Wrapped.Size = UDim2.new(1,0,0,46)
     Wrapped.BackgroundColor3 = C.Card
@@ -2928,7 +3085,7 @@ function L:CreateDropdown(cfg)
     List.Visible = false
     List.ZIndex = 500
     List.ClipsDescendants = true
-    List.Parent = Wrapped
+    List.Parent = Sec._window._overlay
     local Lc = Instance.new("UICorner"); Lc.CornerRadius = UDim.new(0,10); Lc.Parent = List
     local Ls = Instance.new("UIStroke"); Ls.Color = C.Stroke; Ls.Thickness = 1; Ls.Transparency = 0.4; Ls.Parent = List
     local Lp = Instance.new("UIPadding")
@@ -2975,25 +3132,71 @@ function L:CreateDropdown(cfg)
                     if not found then table.insert(selected, o) end
                     ValL.Text = #selected .. " sel."
                     if cfg.Callback then pcall(cfg.Callback, selected) end
+                    if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
                 else
                     selected = o
                     ValL.Text = tostring(o)
                     List.Visible = false
+                    if followConn then followConn:Disconnect(); followConn=nil end
                     if cfg.Callback then pcall(cfg.Callback, o) end
+                    if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
                 end
                 Refresh()
             end)
         end
     end
     Refresh()
+    local followConn
+    local function PositionList()
+        if not List.Visible or not Wrapped.Parent then return end
+        local wp = Wrapped.AbsolutePosition
+        local mp = Sec._window._main.AbsolutePosition
+        List.Position = UDim2.fromOffset(wp.X - mp.X, wp.Y - mp.Y + Wrapped.AbsoluteSize.Y + 6)
+        List.Size = UDim2.fromOffset(math.max(Wrapped.AbsoluteSize.X, 180), 0)
+    end
     Btn.MouseButton1Click:Connect(function()
         List.Visible = not List.Visible
         TweenService:Create(Arrow, T_OUT, {Rotation=List.Visible and 180 or 0}):Play()
+        if List.Visible then
+            PositionList()
+            if followConn then followConn:Disconnect() end
+            followConn = RS.RenderStepped:Connect(PositionList)
+        elseif followConn then
+            followConn:Disconnect(); followConn=nil
+        end
     end)
+    if cfg.Flag then
+        Sec._lib:RegisterState(cfg.Flag, function() return selected end, function(v, silent)
+            if multi then selected = type(v)=="table" and v or {} else selected = v end
+            ValL.Text = multi and (#selected .. " selected") or tostring(selected)
+            Refresh()
+            if not silent and cfg.Callback then pcall(cfg.Callback, selected) end
+        end)
+    end
     local Element = {Instance=Wrapped}
-    function Element:Set(v) selected = v; ValL.Text = tostring(v); Refresh() end
+    function Element:Set(v)
+        if multi then
+            selected = type(v) == "table" and v or {}
+            ValL.Text = #selected .. " selected"
+        else
+            selected = v
+            ValL.Text = tostring(v)
+        end
+        Refresh()
+        if cfg.Callback then pcall(cfg.Callback, selected) end
+        if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
+    end
     function Element:Get() return selected end
-    function Element:Destroy() Wrapped:Destroy() end
+    function Element:SetOptions(values)
+        opts = type(values) == "table" and values or {}
+        if multi then selected = {} elseif not IsSelected(selected) then selected = opts[1] end
+        ValL.Text = multi and (#selected .. " selected") or tostring(selected or "Select...")
+        Refresh()
+    end
+    function Element:GetOptions() return opts end
+    function Element:Open() List.Visible = true; PositionList(); if followConn then followConn:Disconnect() end; followConn = RS.RenderStepped:Connect(PositionList) end
+    function Element:Close() List.Visible = false; if followConn then followConn:Disconnect(); followConn=nil end end
+    function Element:Destroy() if followConn then followConn:Disconnect() end; List:Destroy(); Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
     return Element
 end
@@ -3011,58 +3214,70 @@ function L:CreateColorPicker(cfg)
     local Sec = self
     local C = Sec._window.C
     cfg = cfg or {}
-    local color = cfg.Default or Color3.fromRGB(255,255,255)
+    local color = SafeColor(cfg.Default, Color3.fromRGB(128,140,255))
+    local h, sat, val = color:ToHSV()
     local Wrapped = Instance.new("Frame")
-    Wrapped.Size = UDim2.new(1,0,0,80)
+    Wrapped.Size = UDim2.new(1,0,0,52)
     Wrapped.BackgroundColor3 = C.Card
     Wrapped.BorderSizePixel = 0
     Wrapped.Parent = Sec._inner or Sec._holder
     local Wc = Instance.new("UICorner"); Wc.CornerRadius = UDim.new(0,10); Wc.Parent = Wrapped
     local Ws = Instance.new("UIStroke"); Ws.Color = C.Stroke; Ws.Thickness = 1; Ws.Transparency = 0.4; Ws.Parent = Wrapped
     local Lb = Instance.new("TextLabel")
-    Lb.Size = UDim2.new(1,-32,0,20)
-    Lb.Position = UDim2.new(0,16,0,8)
-    Lb.BackgroundTransparency = 1
-    Lb.Text = cfg.Name or "Color"
-    Lb.Font = Enum.Font[Sec._lib.CurrentFontMedium]
-    Lb.TextSize = 13
-    Lb.TextColor3 = C.Text
-    Lb.TextXAlignment = Enum.TextXAlignment.Left
-    Lb.Parent = Wrapped
-    local Preview = Instance.new("Frame")
-    Preview.Size = UDim2.new(0,50,0,26)
-    Preview.Position = UDim2.new(1,-66,0,6)
-    Preview.BackgroundColor3 = color
-    Preview.BorderSizePixel = 0
-    Preview.Parent = Wrapped
-    local Pc = Instance.new("UICorner"); Pc.CornerRadius = UDim.new(0,6); Pc.Parent = Preview
-    local HexBox = Instance.new("TextBox")
-    HexBox.Size = UDim2.new(1,-32,0,30)
-    HexBox.Position = UDim2.new(0,16,0,40)
-    HexBox.BackgroundColor3 = C.Surface
-    HexBox.Text = ColorToHex(color)
-    HexBox.Font = Enum.Font[Sec._lib.CurrentFontBold]
-    HexBox.TextSize = 12
-    HexBox.TextColor3 = C.Text
-    HexBox.ClearTextOnFocus = false
-    HexBox.Parent = Wrapped
-    local Hc = Instance.new("UICorner"); Hc.CornerRadius = UDim.new(0,8); Hc.Parent = HexBox
-    local Hp = Instance.new("UIPadding"); Hp.PaddingLeft = UDim.new(0,10); Hp.Parent = HexBox
-    local function Update()
-        Preview.BackgroundColor3 = color
-        HexBox.Text = ColorToHex(color)
-        if cfg.Callback then pcall(cfg.Callback, color) end
+    Lb.Size = UDim2.new(1,-190,1,0); Lb.Position=UDim2.new(0,16,0,0); Lb.BackgroundTransparency=1
+    Lb.Text=cfg.Name or "Color"; Lb.Font=Enum.Font[Sec._lib.CurrentFontMedium]; Lb.TextSize=13; Lb.TextColor3=C.Text; Lb.TextXAlignment=Enum.TextXAlignment.Left; Lb.Parent=Wrapped
+    local Preview = Instance.new("TextButton")
+    Preview.Size=UDim2.new(0,52,0,30); Preview.Position=UDim2.new(1,-68,0.5,-15); Preview.BackgroundColor3=color; Preview.Text=""; Preview.AutoButtonColor=false; Preview.BorderSizePixel=0; Preview.Parent=Wrapped
+    local Pc=Instance.new("UICorner"); Pc.CornerRadius=UDim.new(0,8); Pc.Parent=Preview
+    local Pop = Instance.new("Frame")
+    Pop.Size=UDim2.new(0,280,0,285); Pop.BackgroundColor3=C.Surface; Pop.BorderSizePixel=0; Pop.Visible=false; Pop.ZIndex=1200; Pop.Parent=Sec._window._overlay
+    local PopC=Instance.new("UICorner"); PopC.CornerRadius=UDim.new(0,14); PopC.Parent=Pop
+    local PopS=Instance.new("UIStroke"); PopS.Color=C.Stroke; PopS.Thickness=1; PopS.Transparency=0.15; PopS.Parent=Pop
+    local Title=Instance.new("TextLabel"); Title.Size=UDim2.new(1,-32,0,22); Title.Position=UDim2.new(0,16,0,12); Title.BackgroundTransparency=1; Title.Text=cfg.Name or "Color Picker"; Title.Font=Enum.Font[Sec._lib.CurrentFontBold]; Title.TextSize=13; Title.TextColor3=C.Text; Title.TextXAlignment=Enum.TextXAlignment.Left; Title.Parent=Pop
+    local SV=Instance.new("Frame"); SV.Size=UDim2.new(1,-32,0,150); SV.Position=UDim2.new(0,16,0,42); SV.BackgroundColor3=Color3.fromHSV(h,1,1); SV.BorderSizePixel=0; SV.ClipsDescendants=true; SV.ZIndex=1201; SV.Parent=Pop
+    local SVC=Instance.new("UICorner"); SVC.CornerRadius=UDim.new(0,10); SVC.Parent=SV
+    local SG1=Instance.new("UIGradient"); SG1.Color=ColorSequence.new(Color3.new(1,1,1),Color3.fromHSV(h,1,1)); SG1.Rotation=0; SG1.Parent=SV
+    local Black=Instance.new("Frame"); Black.Size=UDim2.new(1,0,1,0); Black.BackgroundColor3=Color3.new(0,0,0); Black.BackgroundTransparency=1; Black.ZIndex=1202; Black.Parent=SV
+    local BG=Instance.new("UIGradient"); BG.Color=ColorSequence.new(Color3.new(0,0,0),Color3.new(0,0,0)); BG.Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,1),NumberSequenceKeypoint.new(1,0)}); BG.Rotation=90; BG.Parent=Black
+    local SVButton=Instance.new("TextButton"); SVButton.Size=UDim2.new(1,0,1,0); SVButton.BackgroundTransparency=1; SVButton.Text=""; SVButton.AutoButtonColor=false; SVButton.ZIndex=1205; SVButton.Parent=SV
+    local SVThumb=Instance.new("Frame"); SVThumb.Size=UDim2.new(0,12,0,12); SVThumb.AnchorPoint=Vector2.new(.5,.5); SVThumb.BackgroundColor3=Color3.new(1,1,1); SVThumb.BorderSizePixel=0; SVThumb.ZIndex=1206; SVThumb.Parent=SV; local STC=Instance.new("UICorner"); STC.CornerRadius=UDim.new(1,0); STC.Parent=SVThumb; local STS=Instance.new("UIStroke"); STS.Color=C.Stroke; STS.Thickness=2; STS.Parent=SVThumb
+    local Hue=Instance.new("Frame"); Hue.Size=UDim2.new(1,-32,0,14); Hue.Position=UDim2.new(0,16,0,202); Hue.BackgroundColor3=Color3.new(1,1,1); Hue.BorderSizePixel=0; Hue.ZIndex=1201; Hue.Parent=Pop; local HC=Instance.new("UICorner"); HC.CornerRadius=UDim.new(1,0); HC.Parent=Hue
+    local HG=Instance.new("UIGradient"); HG.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromHSV(0,1,1)),ColorSequenceKeypoint.new(1/6,Color3.fromHSV(1/6,1,1)),ColorSequenceKeypoint.new(2/6,Color3.fromHSV(2/6,1,1)),ColorSequenceKeypoint.new(3/6,Color3.fromHSV(3/6,1,1)),ColorSequenceKeypoint.new(4/6,Color3.fromHSV(4/6,1,1)),ColorSequenceKeypoint.new(5/6,Color3.fromHSV(5/6,1,1)),ColorSequenceKeypoint.new(1,Color3.fromHSV(1,1,1))}); HG.Parent=Hue
+    local HueButton=Instance.new("TextButton"); HueButton.Size=UDim2.new(1,0,1,0); HueButton.BackgroundTransparency=1; HueButton.Text=""; HueButton.ZIndex=1205; HueButton.Parent=Hue
+    local HueThumb=Instance.new("Frame"); HueThumb.Size=UDim2.new(0,6,1,6); HueThumb.AnchorPoint=Vector2.new(.5,.5); HueThumb.Position=UDim2.new(h,0,.5,0); HueThumb.BackgroundColor3=Color3.new(1,1,1); HueThumb.BorderSizePixel=0; HueThumb.ZIndex=1206; HueThumb.Parent=Hue; local Htc=Instance.new("UICorner"); Htc.CornerRadius=UDim.new(1,0); Htc.Parent=HueThumb
+    local Hex=Instance.new("TextBox"); Hex.Size=UDim2.new(0,130,0,32); Hex.Position=UDim2.new(0,16,0,232); Hex.BackgroundColor3=C.Card; Hex.Text=ColorToHex(color); Hex.ClearTextOnFocus=false; Hex.Font=Enum.Font[Sec._lib.CurrentFontBold]; Hex.TextSize=12; Hex.TextColor3=C.Text; Hex.PlaceholderText="#RRGGBB"; Hex.ZIndex=1205; Hex.Parent=Pop; local Hxc=Instance.new("UICorner"); Hxc.CornerRadius=UDim.new(0,8); Hxc.Parent=Hex; local Hxp=Instance.new("UIPadding"); Hxp.PaddingLeft=UDim.new(0,10); Hxp.Parent=Hex
+    local Copy=Instance.new("TextButton"); Copy.Size=UDim2.new(0,90,0,32); Copy.Position=UDim2.new(1,-106,0,232); Copy.BackgroundColor3=C.Card; Copy.Text="Copy"; Copy.Font=Enum.Font[Sec._lib.CurrentFontBold]; Copy.TextSize=11; Copy.TextColor3=C.Text; Copy.AutoButtonColor=false; Copy.BorderSizePixel=0; Copy.ZIndex=1205; Copy.Parent=Pop; local Cpc=Instance.new("UICorner"); Cpc.CornerRadius=UDim.new(0,8); Cpc.Parent=Copy
+    local function RefreshPicker(callCallback)
+        color=Color3.fromHSV(h,sat,val); Preview.BackgroundColor3=color; Hex.Text=ColorToHex(color); SV.BackgroundColor3=Color3.fromHSV(h,1,1); SG1.Color=ColorSequence.new(Color3.new(1,1,1),Color3.fromHSV(h,1,1)); SVThumb.Position=UDim2.new(sat,0,1-val,0); HueThumb.Position=UDim2.new(h,0,.5,0)
+        if callCallback and cfg.Callback then pcall(cfg.Callback,color) end
+        if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
     end
-    HexBox.FocusLost:Connect(function()
-        local c = HexToColor(HexBox.Text)
-        if c then color = c; Update() end
-    end)
-    local Element = {Instance=Wrapped}
-    function Element:Set(c) color = c; Update() end
+    local function setSV(x,y)
+        sat=math.clamp((x-SV.AbsolutePosition.X)/SV.AbsoluteSize.X,0,1); val=math.clamp(1-(y-SV.AbsolutePosition.Y)/SV.AbsoluteSize.Y,0,1); RefreshPicker(true)
+    end
+    local function setHue(x)
+        h=math.clamp((x-Hue.AbsolutePosition.X)/Hue.AbsoluteSize.X,0,1); RefreshPicker(true)
+    end
+    SVButton.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then setSV(i.Position.X,i.Position.Y) end end)
+    HueButton.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then setHue(i.Position.X) end end)
+    SVButton.InputChanged:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseMovement and UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then setSV(i.Position.X,i.Position.Y) end end)
+    HueButton.InputChanged:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseMovement and UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then setHue(i.Position.X) end end)
+    Hex.FocusLost:Connect(function() local c2=HexToColor(Hex.Text); if c2 then h,sat,val=c2:ToHSV(); RefreshPicker(true) else Hex.Text=ColorToHex(color) end end)
+    Copy.MouseButton1Click:Connect(function() if CLIP then pcall(CLIP,ColorToHex(color)) end end)
+    local function placePop()
+        local wp=Wrapped.AbsolutePosition; local mp=Sec._window._main.AbsolutePosition; local y=wp.Y-mp.Y+Wrapped.AbsoluteSize.Y+6; local x=wp.X-mp.X; local mw=Sec._window._main.AbsoluteSize.X; if x+280>mw then x=mw-290 end; Pop.Position=UDim2.fromOffset(math.max(8,x),math.max(8,y))
+    end
+    local follow
+    Preview.MouseButton1Click:Connect(function() Pop.Visible=not Pop.Visible; if Pop.Visible then placePop(); if follow then follow:Disconnect() end; follow=RS.RenderStepped:Connect(placePop) elseif follow then follow:Disconnect(); follow=nil end end)
+    if cfg.Flag then Sec._lib:RegisterState(cfg.Flag,function() return ColorToHex(color) end,function(v,silent) local c2=HexToColor(v); if c2 then h,sat,val=c2:ToHSV(); RefreshPicker(not silent) end end) end
+    local Element={Instance=Wrapped}
+    function Element:Set(c2) if typeof(c2)=="Color3" then h,sat,val=c2:ToHSV(); RefreshPicker(true) end end
     function Element:Get() return color end
-    function Element:Destroy() Wrapped:Destroy() end
+    function Element:Open() Pop.Visible=true; placePop() end
+    function Element:Close() Pop.Visible=false; if follow then follow:Disconnect(); follow=nil end end
+    function Element:Destroy() if follow then follow:Disconnect() end; Pop:Destroy(); Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
-    if cfg.Callback then pcall(cfg.Callback, color) end
+    RefreshPicker(false)
     return Element
 end
 
@@ -3113,6 +3328,7 @@ function L:CreateKeybind(cfg)
             key=i.KeyCode; KBtn.Text=key.Name; listening=false
             TweenService:Create(Ks,T_OUT,{Color=C.Stroke,Transparency=0.4}):Play()
             if cfg.Callback then pcall(cfg.Callback,key) end
+            if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
         end
     end)
     table.insert(Sec._lib._connections,keyConnection)
@@ -3176,15 +3392,18 @@ function L:CreateProgress(cfg)
     Fill.BorderSizePixel = 0
     Fill.Parent = Bar
     local Fc = Instance.new("UICorner"); Fc.CornerRadius = UDim.new(1,0); Fc.Parent = Fill
+    local initialProgress = tonumber(cfg.Default or 0) or 0
     local Element = {Instance=Wrapped}
     function Element:Set(v)
-        v = math.clamp(v, 0, 1)
+        v = math.clamp(v, 0, 100)
+        if v > 1 then v = v / 100 end
         TweenService:Create(Fill, T_OUT, {Size=UDim2.new(v,0,1,0)}):Play()
         ValL.Text = math.floor(v*100).."%"
         if cfg.Callback then pcall(cfg.Callback, v) end
     end
     function Element:Destroy() Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
+    if initialProgress > 0 then Element:Set(initialProgress) end
     return Element
 end
 
@@ -3229,7 +3448,7 @@ function L:CreateSearch(cfg)
     Box.Position = UDim2.new(0,10,0,0)
     Box.BackgroundTransparency = 1
     Box.Text = ""
-    Box.PlaceholderText = cfg.Placeholder or "Pesquisar..."
+    Box.PlaceholderText = cfg.Placeholder or "Search..."
     Box.Font = Enum.Font[Tab._lib.CurrentFont]
     Box.TextSize = 12
     Box.TextColor3 = C.Text
@@ -3338,7 +3557,7 @@ function L:CreateGlobalSearch(cfg)
     Input.Position = UDim2.new(0,10,0,0)
     Input.BackgroundTransparency = 1
     Input.Text = ""
-    Input.PlaceholderText = cfg.Placeholder or "Pesquisar em todas as abas..."
+    Input.PlaceholderText = cfg.Placeholder or "Search all tabs......"
     Input.Font = Enum.Font[L.CurrentFont]
     Input.TextSize = 14
     Input.TextColor3 = C.Text
@@ -3411,148 +3630,67 @@ function L:CreateGlobalSearch(cfg)
     return gui
 end
 
-function L:Confirm(cfg)
-    cfg = cfg or {}
-    local C = self.C
-    local result = false
-    local done = false
+local function MakeModalBase(lib, name, width, height)
+    local C = lib.C
     local gui = Instance.new("ScreenGui")
-    gui.Name = "LibraryConfirm_"..tostring(math.random(1,999999))
+    gui.Name = name.."_"..tostring(math.random(1,999999))
     gui.ResetOnSpawn = false
     gui.DisplayOrder = 999999
     gui.IgnoreGuiInset = true
     if PROT then pcall(PROT, gui) end
     gui.Parent = GetHui()
-    local Bg = Instance.new("Frame")
-    Bg.Size = UDim2.new(1,0,1,0)
-    Bg.BackgroundColor3 = C.Overlay
-    Bg.BackgroundTransparency = 0.5
-    Bg.BorderSizePixel = 0
-    Bg.Parent = gui
+    local Back = Instance.new("TextButton")
+    Back.Size=UDim2.new(1,0,1,0); Back.BackgroundColor3=C.Overlay; Back.BackgroundTransparency=0.26; Back.BorderSizePixel=0; Back.Text=""; Back.AutoButtonColor=false; Back.Parent=gui
     local Card = Instance.new("Frame")
-    Card.Size = UDim2.new(0,360,0,180)
-    Card.Position = UDim2.new(0.5,-180,0.5,-90)
-    Card.BackgroundColor3 = C.Bg
-    Card.BorderSizePixel = 0
-    Card.Parent = gui
-    local Cc = Instance.new("UICorner"); Cc.CornerRadius = UDim.new(0,16); Cc.Parent = Card
-    local Cs = Instance.new("UIStroke"); Cs.Color = C.Stroke; Cs.Thickness = 1; Cs.Transparency = 0.4; Cs.Parent = Card
-    local T = Instance.new("TextLabel")
-    T.Size = UDim2.new(1,-32,0,22)
-    T.Position = UDim2.new(0,16,0,18)
-    T.BackgroundTransparency = 1
-    T.Text = cfg.Title or "Confirmar?"
-    T.Font = Enum.Font[self.CurrentFontBold]
-    T.TextSize = 16
-    T.TextColor3 = C.Text
-    T.TextXAlignment = Enum.TextXAlignment.Left
-    T.Parent = Card
-    local D2 = Instance.new("TextLabel")
-    D2.Size = UDim2.new(1,-32,0,60)
-    D2.Position = UDim2.new(0,16,0,46)
-    D2.BackgroundTransparency = 1
-    D2.Text = cfg.Description or ""
-    D2.Font = Enum.Font[self.CurrentFont]
-    D2.TextSize = 12
-    D2.TextColor3 = C.TextDim
-    D2.TextXAlignment = Enum.TextXAlignment.Left
-    D2.TextWrapped = true
-    D2.Parent = Card
-    local function MakeBtn(txt, xPos, bg, callback)
-        local B = Instance.new("TextButton")
-        B.Size = UDim2.new(0.5,-24,0,38)
-        B.Position = UDim2.new(xPos,16,1,-54)
-        B.BackgroundColor3 = bg
-        B.Text = txt
-        B.TextColor3 = C.Text
-        B.Font = Enum.Font[self.CurrentFontBold]
-        B.TextSize = 12
-        B.BorderSizePixel = 0
-        B.AutoButtonColor = false
-        B.Parent = Card
-        local Bc = Instance.new("UICorner"); Bc.CornerRadius = UDim.new(0,10); Bc.Parent = B
-        B.MouseButton1Click:Connect(function()
-            callback()
-            done = true
-            gui:Destroy()
-        end)
-        return B
-    end
-    MakeBtn(cfg.CancelText or "Cancelar", 0, C.Card, function() result = false end)
-    MakeBtn(cfg.ConfirmText or "Confirmar", 0.5, C.DangerBg, function() result = true end)
-    while not done do task.wait(0.1) end
+    Card.Size=UDim2.new(0,width,0,height); Card.Position=UDim2.new(.5,-width/2,.5,-height/2); Card.BackgroundColor3=C.Surface; Card.BorderSizePixel=0; Card.Parent=gui
+    local Cc=Instance.new("UICorner"); Cc.CornerRadius=UDim.new(0,18); Cc.Parent=Card
+    local Cs=Instance.new("UIStroke"); Cs.Color=C.Stroke; Cs.Thickness=1; Cs.Transparency=.05; Cs.Parent=Card
+    local Top=Instance.new("Frame"); Top.Size=UDim2.new(1,-28,0,3); Top.Position=UDim2.new(0,14,0,0); Top.BackgroundColor3=C.Accent; Top.BorderSizePixel=0; Top.Parent=Card; local Tc=Instance.new("UICorner"); Tc.CornerRadius=UDim.new(1,0); Tc.Parent=Top
+    local Icon=Instance.new("Frame"); Icon.Size=UDim2.new(0,42,0,42); Icon.Position=UDim2.new(0,20,0,20); Icon.BackgroundColor3=C.Card; Icon.BorderSizePixel=0; Icon.Parent=Card; local Ic=Instance.new("UICorner"); Ic.CornerRadius=UDim.new(0,12); Ic.Parent=Icon
+    local It=Instance.new("TextLabel"); It.Size=UDim2.new(1,0,1,0); It.BackgroundTransparency=1; It.Text="?"; It.Font=Enum.Font.GothamBold; It.TextSize=18; It.TextColor3=C.Accent; It.Parent=Icon
+    local Title=Instance.new("TextLabel"); Title.Size=UDim2.new(1,-90,0,24); Title.Position=UDim2.new(0,78,0,22); Title.BackgroundTransparency=1; Title.Font=Enum.Font[lib.CurrentFontBold]; Title.TextSize=16; Title.TextColor3=C.Text; Title.TextXAlignment=Enum.TextXAlignment.Left; Title.Parent=Card
+    local Desc=Instance.new("TextLabel"); Desc.Size=UDim2.new(1,-40,0,54); Desc.Position=UDim2.new(0,20,0,68); Desc.BackgroundTransparency=1; Desc.Font=Enum.Font[lib.CurrentFont]; Desc.TextSize=12; Desc.TextColor3=C.TextDim; Desc.TextWrapped=true; Desc.TextXAlignment=Enum.TextXAlignment.Left; Desc.TextYAlignment=Enum.TextYAlignment.Top; Desc.Parent=Card
+    return gui, Card, Back, Title, Desc, C
+end
+
+function L:Confirm(cfg)
+    cfg=cfg or {}
+    local gui,Card,Back,Title,Desc,C=MakeModalBase(self,"LibraryConfirm",420,218)
+    Title.Text=cfg.Title or "Confirm action"
+    Desc.Text=cfg.Description or cfg.Content or "Are you sure you want to continue?"
+    local result=false; local done=false
+    local Cancel=Instance.new("TextButton"); Cancel.Size=UDim2.new(.5,-26,0,40); Cancel.Position=UDim2.new(0,18,1,-58); Cancel.BackgroundColor3=C.Card; Cancel.Text=cfg.CancelText or "Cancel"; Cancel.Font=Enum.Font[self.CurrentFontBold]; Cancel.TextSize=12; Cancel.TextColor3=C.Text; Cancel.AutoButtonColor=false; Cancel.BorderSizePixel=0; Cancel.Parent=Card
+    local Confirm=Instance.new("TextButton"); Confirm.Size=UDim2.new(.5,-26,0,40); Confirm.Position=UDim2.new(.5,8,1,-58); Confirm.BackgroundColor3=cfg.ConfirmColor or C.AccentSoft; Confirm.Text=cfg.ConfirmText or "Confirm"; Confirm.Font=Enum.Font[self.CurrentFontBold]; Confirm.TextSize=12; Confirm.TextColor3=C.White; Confirm.AutoButtonColor=false; Confirm.BorderSizePixel=0; Confirm.Parent=Card
+    for _,b in ipairs({Cancel,Confirm}) do local bc=Instance.new("UICorner"); bc.CornerRadius=UDim.new(0,10); bc.Parent=b end
+    Cancel.MouseEnter:Connect(function() TweenService:Create(Cancel,T_OUT,{BackgroundColor3=C.CardHover}):Play() end)
+    Cancel.MouseLeave:Connect(function() TweenService:Create(Cancel,T_OUT,{BackgroundColor3=C.Card}):Play() end)
+    Confirm.MouseEnter:Connect(function() TweenService:Create(Confirm,T_OUT,{BackgroundColor3=C.Accent}):Play() end)
+    Confirm.MouseLeave:Connect(function() TweenService:Create(Confirm,T_OUT,{BackgroundColor3=cfg.ConfirmColor or C.AccentSoft}):Play() end)
+    local function finish(value) result=value; done=true; if cfg.Callback then pcall(cfg.Callback,value) end; gui:Destroy() end
+    Cancel.MouseButton1Click:Connect(function() finish(false) end)
+    Confirm.MouseButton1Click:Connect(function() finish(true) end)
+    Back.MouseButton1Click:Connect(function() if cfg.CloseOnBackdrop ~= false then finish(false) end end)
+    while not done do task.wait() end
     return result
 end
 
 function L:Prompt(cfg)
-    cfg = cfg or {}
-    local C = self.C
-    local result = nil
-    local done = false
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "LibraryPrompt_"..tostring(math.random(1,999999))
-    gui.ResetOnSpawn = false
-    gui.DisplayOrder = 999999
-    gui.IgnoreGuiInset = true
-    if PROT then pcall(PROT, gui) end
-    gui.Parent = GetHui()
-    local Bg = Instance.new("Frame")
-    Bg.Size = UDim2.new(1,0,1,0)
-    Bg.BackgroundColor3 = C.Overlay
-    Bg.BackgroundTransparency = 0.5
-    Bg.BorderSizePixel = 0
-    Bg.Parent = gui
-    local Card = Instance.new("Frame")
-    Card.Size = UDim2.new(0,360,0,200)
-    Card.Position = UDim2.new(0.5,-180,0.5,-100)
-    Card.BackgroundColor3 = C.Bg
-    Card.BorderSizePixel = 0
-    Card.Parent = gui
-    local Cc = Instance.new("UICorner"); Cc.CornerRadius = UDim.new(0,16); Cc.Parent = Card
-    local Cs = Instance.new("UIStroke"); Cs.Color = C.Stroke; Cs.Thickness = 1; Cs.Transparency = 0.4; Cs.Parent = Card
-    local T = Instance.new("TextLabel")
-    T.Size = UDim2.new(1,-32,0,22)
-    T.Position = UDim2.new(0,16,0,18)
-    T.BackgroundTransparency = 1
-    T.Text = cfg.Title or "Digite algo"
-    T.Font = Enum.Font[self.CurrentFontBold]
-    T.TextSize = 16
-    T.TextColor3 = C.Text
-    T.TextXAlignment = Enum.TextXAlignment.Left
-    T.Parent = Card
-    local Input = Instance.new("TextBox")
-    Input.Size = UDim2.new(1,-32,0,40)
-    Input.Position = UDim2.new(0,16,0,54)
-    Input.BackgroundColor3 = C.Card
-    Input.Text = cfg.Default or ""
-    Input.PlaceholderText = cfg.Placeholder or "..."
-    Input.Font = Enum.Font[self.CurrentFont]
-    Input.TextSize = 13
-    Input.TextColor3 = C.Text
-    Input.PlaceholderColor3 = C.TextFaint
-    Input.ClearTextOnFocus = false
-    Input.Parent = Card
-    local Ic = Instance.new("UICorner"); Ic.CornerRadius = UDim.new(0,10); Ic.Parent = Input
-    local Ip = Instance.new("UIPadding"); Ip.PaddingLeft = UDim.new(0,10); Ip.Parent = Input
-    local function MakeBtn(txt, xPos, bg, cb)
-        local B = Instance.new("TextButton")
-        B.Size = UDim2.new(0.5,-24,0,38)
-        B.Position = UDim2.new(xPos,16,1,-54)
-        B.BackgroundColor3 = bg
-        B.Text = txt
-        B.TextColor3 = C.Text
-        B.Font = Enum.Font[self.CurrentFontBold]
-        B.TextSize = 12
-        B.BorderSizePixel = 0
-        B.AutoButtonColor = false
-        B.Parent = Card
-        local Bc = Instance.new("UICorner"); Bc.CornerRadius = UDim.new(0,10); Bc.Parent = B
-        B.MouseButton1Click:Connect(function() cb(); done = true; gui:Destroy() end)
-        return B
-    end
-    MakeBtn(cfg.CancelText or "Cancelar", 0, C.Card, function() result = nil end)
-    MakeBtn(cfg.ConfirmText or "OK", 0.5, C.SuccessBg, function() result = Input.Text end)
-    while not done do task.wait(0.1) end
+    cfg=cfg or {}
+    local gui,Card,Back,Title,Desc,C=MakeModalBase(self,"LibraryPrompt",440,250)
+    Title.Text=cfg.Title or "Enter value"
+    Desc.Text=cfg.Description or cfg.Content or "Enter a value below."
+    local Input=Instance.new("TextBox"); Input.Size=UDim2.new(1,-40,0,42); Input.Position=UDim2.new(0,20,0,126); Input.BackgroundColor3=C.Card; Input.Text=cfg.Default or ""; Input.PlaceholderText=cfg.Placeholder or "Type here..."; Input.Font=Enum.Font[self.CurrentFont]; Input.TextSize=13; Input.TextColor3=C.Text; Input.PlaceholderColor3=C.TextFaint; Input.ClearTextOnFocus=false; Input.TextXAlignment=Enum.TextXAlignment.Left; Input.BorderSizePixel=0; Input.Parent=Card
+    local Ic=Instance.new("UICorner"); Ic.CornerRadius=UDim.new(0,10); Ic.Parent=Input; local Ip=Instance.new("UIPadding"); Ip.PaddingLeft=UDim.new(0,12); Ip.Parent=Input
+    local Cancel=Instance.new("TextButton"); Cancel.Size=UDim2.new(.5,-26,0,38); Cancel.Position=UDim2.new(0,18,1,-52); Cancel.BackgroundColor3=C.Card; Cancel.Text=cfg.CancelText or "Cancel"; Cancel.Font=Enum.Font[self.CurrentFontBold]; Cancel.TextSize=12; Cancel.TextColor3=C.Text; Cancel.AutoButtonColor=false; Cancel.BorderSizePixel=0; Cancel.Parent=Card
+    local Confirm=Instance.new("TextButton"); Confirm.Size=UDim2.new(.5,-26,0,38); Confirm.Position=UDim2.new(.5,8,1,-52); Confirm.BackgroundColor3=C.AccentSoft; Confirm.Text=cfg.ConfirmText or "Continue"; Confirm.Font=Enum.Font[self.CurrentFontBold]; Confirm.TextSize=12; Confirm.TextColor3=C.White; Confirm.AutoButtonColor=false; Confirm.BorderSizePixel=0; Confirm.Parent=Card
+    for _,b in ipairs({Cancel,Confirm}) do local bc=Instance.new("UICorner"); bc.CornerRadius=UDim.new(0,10); bc.Parent=b end
+    local result=nil; local done=false
+    local function finish(value) result=value; done=true; if cfg.Callback then pcall(cfg.Callback,value) end; gui:Destroy() end
+    Cancel.MouseButton1Click:Connect(function() finish(nil) end)
+    Confirm.MouseButton1Click:Connect(function() finish(Input.Text) end)
+    Back.MouseButton1Click:Connect(function() if cfg.CloseOnBackdrop ~= false then finish(nil) end end)
+    task.defer(function() pcall(function() Input:CaptureFocus() end) end)
+    while not done do task.wait() end
     return result
 end
 
@@ -3567,7 +3705,7 @@ end
 function L:SaveProfile(name,data)
     name=SafeProfileName(name); if not name then return false end
     local file="library_profile_"..name..".json"
-    JsonWrite(file, data or {})
+    JsonWrite(file, data or self:CaptureConfig())
     local idx = JsonRead("library_profiles_index.json", {names={}})
     local found = false
     for _, n in ipairs(idx.names or {}) do if n == name then found = true; break end end
@@ -3581,7 +3719,17 @@ end
 
 function L:LoadProfile(name)
     name=SafeProfileName(name); if not name then return nil end
-    local data=JsonRead("library_profile_"..name..".json",nil); if data~=nil then self.Profiles._current=name end; return data
+    local data=JsonRead("library_profile_"..name..".json",nil)
+    if type(data)=="table" then
+        self._loadingConfig=true
+        for flag,value in pairs(data.values or data) do
+            local entry=self._state[flag]
+            if entry and entry.Set then pcall(entry.Set,value,true) end
+        end
+        self._loadingConfig=false
+        self.Profiles._current=name
+    end
+    return data
 end
 
 function L:DeleteProfile(name)
@@ -3598,18 +3746,119 @@ function L:DeleteProfile(name)
 end
 
 function L:ExportConfig(data)
+    data = data or self:CaptureConfig()
     local json = HS:JSONEncode(data)
     local enc = self.Crypto.Base64Encode(json)
     if CLIP then pcall(CLIP, enc) end
     return enc
 end
 
-function L:ImportConfig(encoded)
+function L:ImportConfig(encoded, apply)
     local ok, dec = pcall(self.Crypto.Base64Decode, encoded)
     if not ok or not dec then return nil end
     local ok2, parsed = pcall(HS.JSONDecode, HS, dec)
-    if ok2 and type(parsed) == "table" then return parsed end
+    if ok2 and type(parsed) == "table" then
+        if apply then
+            self._loadingConfig=true
+            for flag,value in pairs(parsed.values or parsed) do
+                local entry=self._state[flag]
+                if entry and entry.Set then pcall(entry.Set,value,true) end
+            end
+            self._loadingConfig=false
+        end
+        return parsed
+    end
     return nil
+end
+
+function L:CaptureConfig()
+    local data = {version=2, values={}}
+    for flag, entry in pairs(self._state) do
+        if entry and entry.Get then
+            local ok, value = pcall(entry.Get)
+            if ok and (type(value)=="boolean" or type(value)=="number" or type(value)=="string" or type(value)=="table") then
+                data.values[flag] = value
+            end
+        end
+    end
+    return data
+end
+
+function L:SaveConfiguration(name, data) return self:SaveConfig(name, data) end
+
+function L:LoadConfiguration(name, silent) return self:LoadConfig(name, silent) end
+
+function L:SaveConfig(name, data)
+    name = SafeProfileName(name)
+    if not name then return false end
+    data = data or self:CaptureConfig()
+    JsonWrite("library_config_"..name..".json", data)
+    self.Config.LastConfig = name
+    return true
+end
+
+function L:LoadConfig(name, silent)
+    name = SafeProfileName(name)
+    if not name then return false end
+    local data = JsonRead("library_config_"..name..".json", nil)
+    if type(data) ~= "table" then return false end
+    self._loadingConfig = true
+    for flag, value in pairs(data.values or data) do
+        local entry = self._state[flag]
+        if entry and entry.Set then pcall(entry.Set, value, silent ~= false) end
+    end
+    self._loadingConfig = false
+    self.Config.LastConfig = name
+    return true
+end
+
+function L:OverwriteConfig(name)
+    return self:SaveConfig(name, self:CaptureConfig())
+end
+
+function L:SetAutoSaveConfig(name, enabled, delay)
+    if type(name) ~= "string" or name == "" then return false end
+    name = SafeProfileName(name)
+    if not name then return false end
+    self.Config.AutoSaveConfigName = name
+    self.Config.AutoSaveConfig = enabled ~= false
+    if delay then self.Config.AutoSaveConfigDelay = math.max(0.1, tonumber(delay) or 0.75) end
+    if self.Config.AutoSaveConfig then self:OverwriteConfig(name) end
+    return true
+end
+
+function L:EnableAutoSaveConfig(name, delay) return self:SetAutoSaveConfig(name, true, delay) end
+
+function L:DisableAutoSaveConfig()
+    self.Config.AutoSaveConfig = false
+    self.Config.AutoSaveConfigName = nil
+    return true
+end
+
+function L:ListConfigs()
+    local names = {}
+    if not ISF then return names end
+    local listfilesFn = listfiles
+    if type(listfilesFn) == "function" then
+        local ok, files = pcall(listfilesFn, ".")
+        if ok and type(files) == "table" then
+            for _, file in ipairs(files) do
+                local name = tostring(file):match("library_config_(.+)%.json$")
+                if name then table.insert(names, name) end
+            end
+        end
+    end
+    table.sort(names, function(a,b) return a:lower() < b:lower() end)
+    return names
+end
+
+function L:DeleteConfig(name)
+    name = SafeProfileName(name)
+    if not name then return false end
+    local file = "library_config_"..name..".json"
+    if DF and ISF and ISF(file) then pcall(DF, file) end
+    if self.Config.AutoSaveConfigName == name then self:DisableAutoSaveConfig() end
+    return true
 end
 
 L.Macros = {_list = {}, _recording = false, _steps = {}}
