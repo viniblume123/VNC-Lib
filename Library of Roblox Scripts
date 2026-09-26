@@ -1,6 +1,6 @@
 local L = {}
 L.__index = L
-L.Version = "6.0.0"
+L.Version = "6.1.0"
 
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
@@ -99,10 +99,9 @@ local function FormatControlNumber(value, maxDigits)
         return sign .. (t == "" and "0" or t)
     end
     local whole = tostring(math.floor(a))
-    if #whole > maxDigits then
-        return sign .. whole:sub(1, maxDigits)
-    end
-    return sign .. whole
+    if a == math.floor(a) then return sign .. whole end
+    local formatted=string.format("%.2f",a):gsub("0+$",""):gsub("%.$","")
+    return sign .. formatted
 end
 
 local function SafeColor(value, fallback)
@@ -124,14 +123,16 @@ L.Mobile = IS_MOBILE
 L._connections = {}
 L._destroyed = false
 L._state = {}
+L._events = {}
+L._debounce = {}
+L._requestCache = {}
+L._activeWatchers = {}
+L.Favorites = JsonRead("library_favorites.json", {})
+L._favoriteItems = {}
+L.NotificationHistory = {}
 L._stateFile = "library_state.json"
 L.Config = {AutoSave = true, SaveDelay = 0.75, AutoSaveConfig = false, AutoSaveConfigName = nil, AutoSaveConfigDelay = 0.75, Transparency = 0, ReducedMotion = false}
-
-local function SafeFont(name, fallback)
-    name = name or fallback or "Gotham"
-    local ok, font = pcall(function() return Enum.Font[name] end)
-    return ok and font or Enum.Font[fallback or "Gotham"]
-end
+L.ConfigHistory = {Undo={},Redo={},Limit=50}
 
 function L:_Connect(signal, callback)
     if not signal or not callback then return nil end
@@ -148,7 +149,9 @@ function L:_DisconnectAll()
 end
 
 function L:_ScheduleConfigAutoSave()
-    if self._loadingConfig or not self.Config.AutoSaveConfig or not self.Config.AutoSaveConfigName then return end
+    if self._loadingConfig then return end
+    self:_TrackConfigChange()
+    if not self.Config.AutoSaveConfig or not self.Config.AutoSaveConfigName then return end
     self._configSaveToken = (self._configSaveToken or 0) + 1
     local token = self._configSaveToken
     task.delay(self.Config.AutoSaveConfigDelay or 0.75, function()
@@ -161,9 +164,143 @@ function L:RegisterState(flag, getter, setter)
     if type(flag) ~= "string" or flag == "" or type(getter) ~= "function" then return false end
     local entry = {Get=getter, Set=setter}
     self._state[flag] = entry
+    self._lastHistorySnapshot=self:CaptureConfig()
     return true
 end
 function L:UnregisterState(flag) self._state[flag] = nil end
+function L:On(eventName, callback)
+    if type(eventName) ~= "string" or type(callback) ~= "function" then return nil end
+    self._events[eventName] = self._events[eventName] or {}
+    local event = self._events[eventName]
+    local record = {Callback=callback, Connected=true}
+    table.insert(event, record)
+    return {Disconnect=function()
+        if not record.Connected then return end
+        record.Connected=false
+        local index=table.find(event,record)
+        if index then table.remove(event,index) end
+    end}
+end
+function L:Emit(eventName, ...)
+    local event=self._events[eventName] or {}
+    local args=table.pack(...)
+    for _, record in ipairs(event) do if record.Connected then pcall(record.Callback,table.unpack(args,1,args.n)) end end
+    return #event
+end
+function L:Debounce(key, interval, callback, ...)
+    if type(callback) ~= "function" then return false end
+    local now=os.clock()
+    self._debounce=self._debounce or {}
+    if (self._debounce[key] or 0)>now then return false end
+    self._debounce[key]=now+math.max(0,tonumber(interval) or 0.25)
+    local ok,err=pcall(callback,...)
+    if not ok then warn("[VNC-Lib] Debounced callback failed: "..tostring(err)); return false end
+    return true
+end
+function L:CachedRequest(url, ttl)
+    self._requestCache=self._requestCache or {}
+    local now=os.clock()
+    local cached=self._requestCache[url]
+    if cached and cached.Expires>now then return cached.Body,true end
+    local body=HttpGet(url)
+    if body then self._requestCache[url]={Body=body,Expires=now+math.max(0,tonumber(ttl) or 30)} end
+    return body,false
+end
+function L:SetFavorite(id, enabled)
+    id=tostring(id or "")
+    if id=="" then return false end
+    local wasFavorite=self.Favorites[id]==true
+    if enabled==false then self.Favorites[id]=nil else self.Favorites[id]=true end
+    if wasFavorite~=(self.Favorites[id]==true) then JsonWrite("library_favorites.json",self.Favorites) end
+    return self.Favorites[id]==true
+end
+function L:IsFavorite(id) return self.Favorites[tostring(id or "")] == true end
+function L:GetFavorites()
+    local out={}; for id,enabled in pairs(self.Favorites) do if enabled then table.insert(out,id) end end; table.sort(out); return out
+end
+function L:RegisterSound(name, id, category)
+    if type(name)~="string" or name=="" or not id then return false end
+    self.Sounds.library=self.Sounds.library or {}
+    local soundId=tostring(id)
+    if soundId:match("^%d+$") then soundId="rbxassetid://"..soundId end
+    self.Sounds.library[name]={Name=name,Id=soundId,Category=category or "General"}
+    return true
+end
+function L:SearchSounds(query, category, favoritesOnly)
+    local out={}; local q=tostring(query or ""):lower()
+    for name,sound in pairs(self.Sounds.library or {}) do
+        local match=(q=="" or name:lower():find(q,1,true) or tostring(sound.Id):lower():find(q,1,true) or tostring(sound.Category):lower():find(q,1,true))
+        local categoryMatch=not category or category=="All" or sound.Category==category
+        local favoriteMatch=not favoritesOnly or self:IsFavorite(sound.Id)
+        if match and categoryMatch and favoriteMatch then table.insert(out,sound) end
+    end
+    table.sort(out,function(a,b) return a.Name:lower()<b.Name:lower() end)
+    return out
+end
+function L:CheckForUpdate(url)
+    if type(url)~="string" or url=="" then return nil,"update manifest URL required" end
+    local body=self:CachedRequest(url,300)
+    if not body then return nil,"unable to fetch update manifest" end
+    local ok,manifest=pcall(HS.JSONDecode,HS,body)
+    if not ok or type(manifest)~="table" or type(manifest.version)~="string" then return nil,"invalid update manifest" end
+    local function newer(a,b)
+        local aa,bb={},{}
+        for n in tostring(a):gmatch("%d+") do table.insert(aa,tonumber(n)) end
+        for n in tostring(b):gmatch("%d+") do table.insert(bb,tonumber(n)) end
+        for i=1,math.max(#aa,#bb) do local x,y=aa[i] or 0,bb[i] or 0; if x~=y then return x>y end end
+        return false
+    end
+    return {current=self.Version,latest=manifest.version,updateAvailable=newer(manifest.version,self.Version),downloadUrl=manifest.url,notes=manifest.notes}
+end
+function L:_TrackConfigChange()
+    local history=self.ConfigHistory
+    local current=self:CaptureConfig()
+    local previous=self._lastHistorySnapshot
+    local changed = previous ~= nil
+    if changed then
+        local okPrevious, encodedPrevious = pcall(HS.JSONEncode, HS, previous)
+        local okCurrent, encodedCurrent = pcall(HS.JSONEncode, HS, current)
+        changed = not okPrevious or not okCurrent or encodedPrevious ~= encodedCurrent
+    end
+    if changed then
+        table.insert(history.Undo,previous)
+        while #history.Undo>history.Limit do table.remove(history.Undo,1) end
+        table.clear(history.Redo)
+    end
+    self._lastHistorySnapshot=current
+end
+function L:PushConfigUndoPoint()
+    local snapshot=self:CaptureConfig()
+    table.insert(self.ConfigHistory.Undo,snapshot)
+    while #self.ConfigHistory.Undo>self.ConfigHistory.Limit do table.remove(self.ConfigHistory.Undo,1) end
+    table.clear(self.ConfigHistory.Redo)
+    self._lastHistorySnapshot=snapshot
+    return true
+end
+local function ApplyConfigSnapshot(lib,snapshot)
+    local wasLoading=lib._loadingConfig; lib._loadingConfig=true
+    local ok,err=pcall(function()
+        for flag,value in pairs(snapshot.values or snapshot) do local entry=lib._state[flag]; if entry and entry.Set then entry.Set(value,true) end end
+    end)
+    lib._loadingConfig=wasLoading
+    if not ok then warn("[VNC-Lib] History restore failed: "..tostring(err)); return false end
+    lib._lastHistorySnapshot=lib:CaptureConfig()
+    return true
+end
+function L:UndoConfig()
+    local history=self.ConfigHistory
+    local previous=table.remove(history.Undo)
+    if not previous then return false end
+    table.insert(history.Redo,self:CaptureConfig())
+    return ApplyConfigSnapshot(self,previous)
+end
+function L:RedoConfig()
+    local history=self.ConfigHistory
+    local nextState=table.remove(history.Redo)
+    if not nextState then return false end
+    table.insert(history.Undo,self:CaptureConfig())
+    return ApplyConfigSnapshot(self,nextState)
+end
 function L:SaveState(file)
     file = file or self._stateFile
     local data = {version=1, values={}}
@@ -195,20 +332,34 @@ function L:Destroy()
     pcall(function() self:SaveState() end)
     self:SetAutoSave(false)
     self:_DisconnectAll()
+    pcall(function() self:StopSound(0) end)
+    table.clear(self._activeWatchers or {})
     if self.WidgetGui then pcall(function() self.WidgetGui:Destroy() end); self.WidgetGui=nil end
-    pcall(function() for _, child in ipairs(GetHui():GetChildren()) do if child:IsA("ScreenGui") and child.Name:match("^Library") then child:Destroy() end end end)
-    for _, w in ipairs(self._allWindows or {}) do if w and w._main and w._main.Parent then pcall(function() w._main.Parent:Destroy() end) end end
+    for _, gui in ipairs(self._auxGuis or {}) do if gui and gui.Parent then pcall(function() gui:Destroy() end) end end
+    self._auxGuis = {}
+    local windows=table.clone(self._allWindows or {})
+    for _, w in ipairs(windows) do
+        if w and not w._destroyed then pcall(function() w:Destroy() end) end
+    end
     self._allWindows = {}
     self._window = nil
 end
 function L:SetAccent(color)
     if typeof(color) ~= "Color3" then return false end
-    self.C.Accent=color; self.C.StrokeHot=color
-    if self._window then pcall(function() self._window:_ApplyAccent() end) end
+    local oldAccent, oldSoft = self.C.Accent, self.C.AccentSoft
+    local newSoft=color:Lerp(Color3.new(0,0,0),0.35)
+    self.C.Accent=color; self.C.StrokeHot=color; self.C.AccentSoft=newSoft
+    for _, win in ipairs(self._allWindows or {}) do
+        if win and not win._destroyed then pcall(function() win:_ApplyAccent(oldAccent, color, newSoft, oldSoft) end) end
+    end
     return true
 end
 function L:GetThemeSnapshot() local out={}; for k,v in pairs(self.C) do out[k]=v end; return out end
-function L:SetTransparency(value) value=math.clamp(tonumber(value) or 0,0,0.45); self.Config=self.Config or {}; self.Config.Transparency=value; if self._window then self._window:_ApplyTheme(nil, self.C) end; return value end
+function L:SetTransparency(value)
+    value=math.clamp(tonumber(value) or 0,0,0.45); self.Config=self.Config or {}; self.Config.Transparency=value
+    for _, win in ipairs(self._allWindows or {}) do if win and not win._destroyed then win:_ApplyTheme(nil, self.C) end end
+    return value
+end
 function L:SetReducedMotion(enabled) self.Config=self.Config or {}; self.Config.ReducedMotion=enabled==true; return self.Config.ReducedMotion end
 function L:GetReducedMotion() return self.Config and self.Config.ReducedMotion==true or false end
 
@@ -321,7 +472,7 @@ function L:SetFont(font, bold, medium)
     bold = valid(bold) and bold or (valid(font.."Bold") and font.."Bold" or font)
     medium = valid(medium) and medium or (valid(font.."Medium") and font.."Medium" or font)
     self.CurrentFont=font; self.CurrentFontBold=bold; self.CurrentFontMedium=medium
-    if self._window then self._window:_ApplyFont() end
+    for _, win in ipairs(self._allWindows or {}) do if win and not win._destroyed then win:_ApplyFont() end end
 end
 
 L.Icons = {
@@ -345,32 +496,230 @@ L.Icons = {
 
 function L:RegisterIcon(name, id)
     self.Icons[name] = id
-    if self._window then self._window:_RefreshIcons() end
+    for _, win in ipairs(self._allWindows or {}) do if win and not win._destroyed then win:_RefreshIcons() end end
 end
 
 L.Sounds = {
     click="rbxassetid://6895079853", hover="",
     success="rbxassetid://6895082385", error="rbxassetid://6895079853",
     open="", close="", key="", notify="",
-    enabled=true, volume=0.5, silent=false
+    enabled=true, volume=0.5, silent=false,
+    channels={UI=1,Effects=1,Transitions=1,Music=1,Ambient=1},
+    favorites={}, history={}, playlists={}, transitionHooks={}
 }
 
 function L:SetSounds(cfg)
-    for k, v in pairs(cfg) do self.Sounds[k] = v end
+    for k, v in pairs(cfg or {}) do self.Sounds[k] = v end
+    self.Sounds.channels = self.Sounds.channels or {UI=1,Effects=1,Transitions=1,Music=1,Ambient=1}
+    self.Sounds.favorites = self.Sounds.favorites or {}
+    self.Sounds.history = self.Sounds.history or {}
+    self.Sounds.playlists = self.Sounds.playlists or {}
+    self.Sounds.transitionHooks = self.Sounds.transitionHooks or {}
 end
 
-function L:PlaySound(slot)
+function L:SetSoundChannelVolume(channel, volume)
+    self.Sounds.channels = self.Sounds.channels or {}
+    self.Sounds.channels[channel] = math.clamp(tonumber(volume) or 1, 0, 1)
+    return self.Sounds.channels[channel]
+end
+
+function L:SetSoundSilent(silent)
+    self.Sounds.silent = silent == true
+    if self.Sounds.silent then self:StopSound(0.15) end
+    return self.Sounds.silent
+end
+
+function L:SetSoundFavorite(id, enabled)
+    local key = tostring(id)
+    self.Sounds.favorites = self.Sounds.favorites or {}
+    self.Sounds.favorites[key] = enabled ~= false and key or nil
+    return self.Sounds.favorites[key] ~= nil
+end
+
+function L:ImportSoundPlaylist(name, ids, category)
+    name = tostring(name or "Playlist")
+    local list = {}
+    if type(ids) == "string" then
+        for id in ids:gmatch("%d+") do table.insert(list, "rbxassetid://"..id) end
+    elseif type(ids) == "table" then
+        for _, id in ipairs(ids) do
+            local text = tostring(id)
+            if text:match("%d+") then table.insert(list, text:find("rbxassetid://",1,true) and text or ("rbxassetid://"..text)) end
+        end
+    end
+    self.Sounds.playlists = self.Sounds.playlists or {}
+    self.Sounds.playlists[name] = {category=category or "Custom", sounds=list}
+    return list
+end
+function L:PlaySoundPlaylist(name,index)
+    local playlist=(self.Sounds.playlists or {})[name]
+    if not playlist or #playlist.sounds==0 then return false end
+    index=math.clamp(tonumber(index) or 1,1,#playlist.sounds)
+    return self:PlaySoundAsset(playlist.sounds[index],"Music")
+end
+
+function L:StopSound(fadeDuration)
+    local sound = self._activeSound
+    if not sound then return false end
+    local duration = math.max(0, tonumber(fadeDuration) or 0)
+    if duration == 0 then sound:Stop(); sound:Destroy(); self._activeSound=nil; return true end
+    local startVolume = sound.Volume
+    local started = os.clock()
+    task.spawn(function()
+        while sound.Parent and sound.IsPlaying do
+            local alpha = math.clamp((os.clock()-started)/duration, 0, 1)
+            sound.Volume = startVolume * (1-alpha)
+            if alpha >= 1 then break end
+            task.wait(0.03)
+        end
+        pcall(function() sound:Stop(); sound:Destroy() end)
+        if self._activeSound == sound then self._activeSound=nil end
+    end)
+    return true
+end
+
+function L:PlaySound(slot, channel, options)
     if self.Sounds.silent or not self.Sounds.enabled then return end
     local id = self.Sounds[slot]
     if not id or id == "" then return end
+    channel = channel or ((slot == "click" or slot == "hover" or slot == "open" or slot == "close") and "UI") or "Effects"
     pcall(function()
         local s = Instance.new("Sound")
         s.SoundId = id
-        s.Volume = self.Sounds.volume
+        local targetVolume = math.clamp((tonumber(self.Sounds.volume) or 0.5) * ((self.Sounds.channels or {})[channel] or 1), 0, 1)
+        s.Volume = options and tonumber(options.FadeIn) and tonumber(options.FadeIn)>0 and 0 or targetVolume
+        if options and options.Pitch then s.PlaybackSpeed = math.clamp(tonumber(options.Pitch) or 1, 0.5, 2) end
         s.Parent = SS
+        self.Sounds.history = self.Sounds.history or {}
+        table.insert(self.Sounds.history, 1, {id=id, slot=slot, channel=channel, time=os.time()})
+        while #self.Sounds.history > 50 do table.remove(self.Sounds.history) end
+        if channel == "Music" or channel == "Ambient" then
+            self:StopSound(0.15)
+            self._activeSound = s
+        end
         s:Play()
-        task.delay(3, function() if s then s:Destroy() end end)
+        if options and tonumber(options.FadeIn) and tonumber(options.FadeIn)>0 then TweenService:Create(s,TweenInfo.new(math.clamp(tonumber(options.FadeIn),0.05,10)),{Volume=targetVolume}):Play() end
+        s.Ended:Connect(function() if self._activeSound == s then self._activeSound=nil end; s:Destroy() end)
+        task.delay(120, function() if s and s.Parent then s:Destroy() end end)
     end)
+end
+
+function L:PlaySoundAsset(id, channel, options)
+    if not id then return false end
+    options = options or {}
+    local soundId = tostring(id)
+    if soundId:match("^%d+$") then soundId = "rbxassetid://"..soundId end
+    local slot = "__customSound"
+    self.Sounds[slot] = soundId
+    self:PlaySound(slot, channel or "Music", options)
+    return true
+end
+
+function L:SetTransitionSound(name, soundId)
+    self.Sounds.transitionHooks = self.Sounds.transitionHooks or {}
+    self.Sounds.transitionHooks[tostring(name)] = soundId
+    return true
+end
+
+function L:CreateSoundBox(cfg)
+    cfg = cfg or {}
+    local theme = self.C
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "VNCLibSoundBox_"..tostring(math.random(10000,99999))
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 999990
+    gui.Parent = GetHui()
+    self._auxGuis = self._auxGuis or {}
+    table.insert(self._auxGuis, gui)
+    if self._window then self._window._auxGuis=self._window._auxGuis or {}; table.insert(self._window._auxGuis,gui) end
+    local panel = Instance.new("Frame")
+    panel.Name = "SoundBox"
+    panel.Size = UDim2.fromOffset(360, 390)
+    panel.Position = cfg.Position or UDim2.new(0.5,-180,0.5,-195)
+    panel.BackgroundColor3 = theme.Surface
+    panel.BorderSizePixel = 0
+    panel.Parent = gui
+    local corner = Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,12); corner.Parent=panel
+    local stroke = Instance.new("UIStroke"); stroke.Color=theme.Stroke; stroke.Parent=panel
+    local function makeText(className, parent, size, pos, text, bg)
+        local obj=Instance.new(className); obj.Size=size; obj.Position=pos; obj.Text=text or ""; obj.BackgroundColor3=bg or theme.Card; obj.TextColor3=theme.Text; obj.Font=Enum.Font[self.CurrentFont]; obj.TextSize=12; obj.BorderSizePixel=0; obj.Parent=parent
+        local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,7); c.Parent=obj
+        return obj
+    end
+    local title=makeText("TextLabel",panel,UDim2.new(1,-24,0,26),UDim2.new(0,12,0,8),cfg.Title or "Sound Box",theme.Surface)
+    title.TextXAlignment=Enum.TextXAlignment.Left; title.Font=Enum.Font[self.CurrentFontBold]
+    local asset=makeText("TextBox",panel,UDim2.new(1,-24,0,34),UDim2.new(0,12,0,42),"",theme.Card)
+    asset.PlaceholderText="Asset ID or rbxassetid://..."; asset.ClearTextOnFocus=false
+    local pitch=makeText("TextBox",panel,UDim2.new(0,72,0,32),UDim2.new(0,12,0,84),"1",theme.Card); pitch.PlaceholderText="Pitch"
+    local play=makeText("TextButton",panel,UDim2.new(0,72,0,32),UDim2.new(0,92,0,84),"Play",theme.AccentSoft)
+    local stop=makeText("TextButton",panel,UDim2.new(0,72,0,32),UDim2.new(0,172,0,84),"Fade stop",theme.Card)
+    local silent=makeText("TextButton",panel,UDim2.new(0,92,0,32),UDim2.new(0,252,0,84),"Silent: "..(self.Sounds.silent and "on" or "off"),theme.Card)
+    local channel=makeText("TextButton",panel,UDim2.new(0,180,0,30),UDim2.new(0,12,0,124),"Channel: Music",theme.Card)
+    local channelVolume=makeText("TextBox",panel,UDim2.new(0,72,0,30),UDim2.new(1,-84,0,124),tostring((self.Sounds.channels or {}).Music or 1),theme.Card)
+    channelVolume.PlaceholderText="Mix"; channelVolume.ClearTextOnFocus=false
+    local channels={"Music","UI","Effects","Transitions","Ambient"}; local channelIndex=1
+    channel.MouseButton1Click:Connect(function() channelIndex=channelIndex%#channels+1; channel.Text="Channel: "..channels[channelIndex]; channelVolume.Text=tostring((self.Sounds.channels or {})[channels[channelIndex]] or 1) end)
+    channelVolume.FocusLost:Connect(function() channelVolume.Text=tostring(self:SetSoundChannelVolume(channels[channelIndex],channelVolume.Text)) end)
+    play.MouseButton1Click:Connect(function()
+        local n=tonumber(pitch.Text) or 1
+        self:PlaySoundAsset(asset.Text,channels[channelIndex],{Pitch=n,FadeIn=cfg.FadeIn or 0})
+    end)
+    stop.MouseButton1Click:Connect(function() self:StopSound(cfg.FadeOut or 0.35) end)
+    silent.MouseButton1Click:Connect(function() local state=self:SetSoundSilent(not self.Sounds.silent); silent.Text="Silent: "..(state and "on" or "off") end)
+    local close=makeText("TextButton",panel,UDim2.new(0,28,0,26),UDim2.new(1,-38,0,8),"×",theme.Card)
+    close.MouseButton1Click:Connect(function() gui:Destroy() end)
+    for name,entry in pairs(cfg.Library or {}) do self:RegisterSound(name,entry.Id or entry.id or entry,entry.Category or entry.category) end
+    local query=makeText("TextBox",panel,UDim2.new(1,-104,0,30),UDim2.new(0,12,0,164),"",theme.Card)
+    query.PlaceholderText="Search sound library..."; query.ClearTextOnFocus=false
+    local favoritesOnly=false
+    local favorites=makeText("TextButton",panel,UDim2.new(0,84,0,30),UDim2.new(1,-96,0,164),"All sounds",theme.Card)
+    local results=Instance.new("ScrollingFrame")
+    results.Size=UDim2.new(1,-24,0,174); results.Position=UDim2.new(0,12,0,202); results.BackgroundTransparency=1; results.BorderSizePixel=0
+    results.ScrollBarThickness=4; results.ScrollBarImageColor3=theme.Accent; results.CanvasSize=UDim2.new(0,0,0,0); results.AutomaticCanvasSize=Enum.AutomaticSize.Y; results.Parent=panel
+    local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,4); layout.Parent=results
+    local function refresh()
+        for _,child in ipairs(results:GetChildren()) do if child:IsA("GuiObject") and child~=layout then child:Destroy() end end
+        for _,sound in ipairs(self:SearchSounds(query.Text,nil,favoritesOnly)) do
+            local row=Instance.new("Frame"); row.Size=UDim2.new(1,-4,0,30); row.BackgroundColor3=theme.Card; row.BorderSizePixel=0; row.Parent=results
+            local name=makeText("TextButton",row,UDim2.new(1,-38,1,0),UDim2.new(0,0,0,0),sound.Name.."  ·  "..sound.Category,theme.Card)
+            name.TextXAlignment=Enum.TextXAlignment.Left; name.MouseButton1Click:Connect(function() asset.Text=sound.Id end)
+            local star=makeText("TextButton",row,UDim2.new(0,32,1,0),UDim2.new(1,-32,0,0),self:IsFavorite(sound.Id) and "★" or "☆",theme.Card)
+            star.MouseButton1Click:Connect(function() self:SetFavorite(sound.Id,not self:IsFavorite(sound.Id)); star.Text=self:IsFavorite(sound.Id) and "★" or "☆" end)
+        end
+    end
+    query:GetPropertyChangedSignal("Text"):Connect(refresh)
+    favorites.MouseButton1Click:Connect(function() favoritesOnly=not favoritesOnly; favorites.Text=favoritesOnly and "Favorites" or "All sounds"; refresh() end)
+    refresh()
+    return {Gui=gui, Panel=panel, Search=query, Results=results, Close=function() gui:Destroy() end, Play=function(id, ch, opts) return self:PlaySoundAsset(id,ch,opts) end, Stop=function(fade) return self:StopSound(fade) end, Seek=function(seconds) if self._activeSound then self._activeSound.TimePosition=math.max(0,tonumber(seconds) or 0); return true end return false end, GetPlayback=function() local sound=self._activeSound; return sound and {Position=sound.TimePosition,Length=sound.TimeLength,Playing=sound.IsPlaying} or nil end}
+end
+
+function L:CreateSoundLibrary(cfg) return self:CreateSoundBox(cfg) end
+
+function L:CreateWatermark(cfg)
+    cfg=cfg or {}; local lib=self._lib or self
+    if lib._watermark then lib._watermark:Destroy() end
+    local gui=Instance.new("ScreenGui"); gui.Name="VNCLibWatermark"; gui.ResetOnSpawn=false; gui.DisplayOrder=999998; gui.IgnoreGuiInset=true; gui.Parent=GetHui()
+    lib._auxGuis=lib._auxGuis or {}; table.insert(lib._auxGuis,gui)
+    if lib._window then lib._window._auxGuis=lib._window._auxGuis or {}; table.insert(lib._window._auxGuis,gui) end
+    local label=Instance.new("TextLabel"); label.Name="Watermark"; label.AutomaticSize=Enum.AutomaticSize.XY
+    label.Position=cfg.Position or UDim2.fromOffset(14,14); label.BackgroundColor3=cfg.BackgroundColor or lib.C.Surface
+    label.BackgroundTransparency=math.clamp(tonumber(cfg.Transparency) or 0.2,0,1); label.TextColor3=cfg.Color or lib.C.Text
+    label.TextTransparency=math.clamp(tonumber(cfg.TextTransparency) or 0,0,1); label.Text=cfg.Text or "VNC-Lib"
+    label.Font=Enum.Font[lib.CurrentFontMedium]; label.TextSize=cfg.TextSize or 12; label.BorderSizePixel=0; label.Parent=gui
+    local pad=Instance.new("UIPadding"); pad.PaddingLeft=UDim.new(0,9); pad.PaddingRight=UDim.new(0,9); pad.PaddingTop=UDim.new(0,5); pad.PaddingBottom=UDim.new(0,5); pad.Parent=label
+    local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,7); corner.Parent=label
+    local connections={}; local dragging=false; local dragStart,startPos
+    if cfg.Draggable~=false then
+        table.insert(connections,label.InputBegan:Connect(function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=true; dragStart=input.Position; startPos=label.Position end end))
+        table.insert(connections,lib:_Connect(UIS.InputChanged,function(input) if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then local d=input.Position-dragStart; label.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y) end end))
+        table.insert(connections,lib:_Connect(UIS.InputEnded,function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=false end end))
+    end
+    local handle={Gui=gui,Instance=label}
+    function handle:SetText(value) label.Text=tostring(value or "") end
+    function handle:SetColor(value) if typeof(value)=="Color3" then label.TextColor3=value end end
+    function handle:Destroy() for _,conn in ipairs(connections) do if conn then pcall(function() conn:Disconnect() end) end end; if gui.Parent then gui:Destroy() end; if lib._watermark==self then lib._watermark=nil end end
+    lib._watermark=handle
+    return handle
 end
 
 L.Theme = "Dark"
@@ -410,9 +759,41 @@ function L:SetTheme(name)
     local old = self.C
     self.Theme = name
     self.C = NormalizePalette(palette)
+    self._themeNormalized = true
     self.ThemeAnimated = false
-    if self._window then self._window:_ApplyTheme(old, self.C) end
+    self.ThemeBase = name
+    self.ThemeHue = 0
+    for _, win in ipairs(self._allWindows or {}) do if win and not win._destroyed then win:_ApplyTheme(old, self.C) end end
     return true
+end
+
+function L:SetTimeBasedTheme(enabled,cfg)
+    if enabled==false then self._timeTheme=nil; return false end
+    cfg=cfg or {}
+    local day=cfg.DayTheme or "Light"; local night=cfg.NightTheme or "Dark"
+    if not self.Palettes[day] or not self.Palettes[night] then return false end
+    self._timeTheme={DayTheme=day,NightTheme=night,DayStart=math.clamp(tonumber(cfg.DayStart) or 7,0,23),NightStart=math.clamp(tonumber(cfg.NightStart) or 19,0,23)}
+    local hour=tonumber(os.date("%H")) or 12
+    local target=(hour>=self._timeTheme.DayStart and hour<self._timeTheme.NightStart) and day or night
+    if self.Theme~=target then self:SetTheme(target) end
+    return true
+end
+
+function L:SetFocusMode(enabled,window)
+    local win=window or self._window
+    if not win or type(win.SetFocusMode)~="function" then return false end
+    return win:SetFocusMode(enabled)
+end
+function L:SetReadingMode(enabled,window)
+    local win=window or self._window
+    if not win or type(win.SetFocusMode)~="function" then return false end
+    win:SetFocusMode(enabled)
+    if enabled then
+        for _,obj in ipairs(win._main:GetDescendants()) do if obj:IsA("TextLabel") then if not obj:GetAttribute("__VNCReadingSize") then obj:SetAttribute("__VNCReadingSize",obj.TextSize) end; obj.TextSize=math.max(obj.TextSize,14) end end
+    else
+        for _,obj in ipairs(win._main:GetDescendants()) do if obj:IsA("TextLabel") then local size=obj:GetAttribute("__VNCReadingSize"); if size then obj.TextSize=size; obj:SetAttribute("__VNCReadingSize",nil) end end end
+    end
+    return enabled==true
 end
 
 function L:SetCustomTheme(t)
@@ -421,34 +802,54 @@ function L:SetCustomTheme(t)
     for k, v in pairs(t) do merged[k] = v end
     local old = self.C
     self.C = NormalizePalette(merged)
+    self._themeNormalized = true
     self.Theme = "Custom"
     self.ThemeAnimated = false
-    if self._window then self._window:_ApplyTheme(old, self.C) end
+    self.ThemeBase = "Custom"
+    self.ThemeHue = 0
+    for _, win in ipairs(self._allWindows or {}) do if win and not win._destroyed then win:_ApplyTheme(old, self.C) end end
     return true
 end
 
 function L:SetAnimatedTheme(baseName)
     baseName = self.Palettes[baseName] and baseName or "Dark"
+    local old = self.C
     self.Theme = "Animated"
     self.ThemeAnimated = true
     self.ThemeBase = baseName
     self.C = NormalizePalette(self.Palettes[baseName])
-    if self._window then self._window:_ApplyTheme(nil, self.C) end
+    self._themeNormalized = true
+    for _, win in ipairs(self._allWindows or {}) do if win and not win._destroyed then win:_ApplyTheme(old, self.C) end end
     return true
 end
 
 task.spawn(function()
+    local nextActivePoll=0
+    local nextTimeThemeCheck=0
     while true do
         task.wait(0.08)
-        if L.ThemeAnimated and L._window and not L._destroyed then
+        if os.clock()>=nextActivePoll then
+            nextActivePoll=os.clock()+0.3
+            for object,update in pairs(L._activeWatchers or {}) do
+                if not object.Parent then L._activeWatchers[object]=nil else pcall(update) end
+            end
+        end
+        if L._timeTheme and os.clock()>=nextTimeThemeCheck then
+            nextTimeThemeCheck=os.clock()+60
+            local cfg=L._timeTheme
+            local hour=tonumber(os.date("%H")) or 12
+            local name=(hour>=cfg.DayStart and hour<cfg.NightStart) and cfg.DayTheme or cfg.NightTheme
+            if name and L.Palettes[name] and L.Theme~=name then L:SetTheme(name) end
+        end
+        if L.ThemeAnimated and L._allWindows and not L._destroyed then
             L.ThemeHue = (L.ThemeHue + 0.006) % 1
             local na = Color3.fromHSV(L.ThemeHue, 0.68, 1)
             local ns = Color3.fromHSV(L.ThemeHue, 0.62, 0.62)
-            local oldAccent = L.C.Accent
+            local oldAccent, oldSoft = L.C.Accent, L.C.AccentSoft
             L.C.Accent = na
             L.C.AccentSoft = ns
             L.C.StrokeHot = na
-            pcall(function() L._window:_ApplyAccent(oldAccent, na, ns) end)
+            for _, win in ipairs(L._allWindows) do if win and not win._destroyed then pcall(function() win:_ApplyAccent(oldAccent, na, ns, oldSoft) end) end end
         end
     end
 end)
@@ -810,6 +1211,8 @@ function L:ShowSplash(cfg)
     SplashGui.IgnoreGuiInset = true
     if PROT then pcall(PROT, SplashGui) end
     SplashGui.Parent = GetHui()
+    self._auxGuis = self._auxGuis or {}
+    table.insert(self._auxGuis, SplashGui)
     local Bg = Instance.new("Frame")
     Bg.Size = UDim2.new(1,0,1,0)
     Bg.BackgroundColor3 = C.Bg
@@ -900,7 +1303,7 @@ function L:ShowSplash(cfg)
 end
 
 local NotifyGui, NotifyContainer
-local function EnsureNotify()
+local function EnsureNotify(lib)
     if NotifyGui and NotifyGui.Parent then return end
     NotifyGui = Instance.new("ScreenGui")
     NotifyGui.Name = "LibraryNotify_"..tostring(math.random(1,999999))
@@ -910,6 +1313,7 @@ local function EnsureNotify()
     NotifyGui.IgnoreGuiInset = true
     if PROT then pcall(PROT, NotifyGui) end
     NotifyGui.Parent = GetHui()
+    lib._auxGuis=lib._auxGuis or {}; table.insert(lib._auxGuis,NotifyGui)
     NotifyContainer = Instance.new("Frame")
     NotifyContainer.Size = UDim2.new(0,320,0,500)
     NotifyContainer.Position = UDim2.new(1,-340,0,20)
@@ -924,11 +1328,15 @@ end
 
 function L:Notify(cfg)
     cfg = cfg or {}
-    EnsureNotify()
+    EnsureNotify(self)
+    local lib=self._lib or self
     local title = cfg.Title or "Notificacao"
     local text = cfg.Text or cfg.Content or ""
     local dur = cfg.Duration or 4
     local kind = cfg.Type or "info"
+    lib.NotificationHistory=lib.NotificationHistory or {}
+    table.insert(lib.NotificationHistory,1,{Title=title,Text=text,Type=kind,Time=os.time()})
+    while #lib.NotificationHistory>100 do table.remove(lib.NotificationHistory) end
     local img = cfg.Image
     local C = self.C
     local col
@@ -936,12 +1344,13 @@ function L:Notify(cfg)
     elseif kind == "error" then col = C.Danger
     elseif kind == "warning" then col = C.Warning
     else col = C.Info end
-    local Card = Instance.new("Frame")
+    local Card = Instance.new("CanvasGroup")
     Card.Size = UDim2.new(1,0,0,0)
     Card.AutomaticSize = Enum.AutomaticSize.Y
     Card.BackgroundColor3 = C.Surface
     Card.BorderSizePixel = 0
     Card.BackgroundTransparency = 0.05
+    Card.GroupTransparency = 1
     Card.Parent = NotifyContainer
     local Cc = Instance.new("UICorner"); Cc.CornerRadius = UDim.new(0,12); Cc.Parent = Card
     local Cs = Instance.new("UIStroke"); Cs.Color = col; Cs.Thickness = 1.2; Cs.Transparency = 0.3; Cs.Parent = Card
@@ -999,19 +1408,30 @@ function L:Notify(cfg)
     Cb.Parent = Card
     local function Remove()
         if not Card.Parent then return end
-        TweenService:Create(Card, T_INFO, {BackgroundTransparency=1}):Play()
+        TweenService:Create(Card, T_INFO, {GroupTransparency=1}):Play()
         TweenService:Create(Card, T_INFO, {Size=UDim2.new(0,0,0,0)}):Play()
         task.delay(0.3, function() if Card.Parent then Card:Destroy() end end)
     end
     Cb.MouseButton1Click:Connect(Remove)
-    Card.Position = UDim2.new(1,50,0,0)
-    TweenService:Create(Card, T_OUT, {Position=UDim2.new(0,0,0,0)}):Play()
+    TweenService:Create(Card, T_OUT, {GroupTransparency=0}):Play()
     task.delay(dur, Remove)
     return Card
 end
 
+function L:GetNotificationHistory() local lib=self._lib or self; return table.clone(lib.NotificationHistory or {}) end
+function L:ClearNotificationHistory() local lib=self._lib or self; table.clear(lib.NotificationHistory or {}); return true end
+function L:ShowNotificationHistory()
+    local lib=self._lib or self
+    local items={}
+    for _,entry in ipairs(lib.NotificationHistory or {}) do
+        table.insert(items,{Name=entry.Title.." — "..entry.Text,Tab=os.date("%H:%M:%S",entry.Time),Callback=function() lib:Notify({Title=entry.Title,Text=entry.Text,Type=entry.Type,Duration=3}) end})
+    end
+    if #items==0 then items={{Name="No notifications recorded",Tab="History",Callback=function() end}} end
+    return lib:CreateGlobalSearch({Items=items,Placeholder="Search notification history..."})
+end
+
 local SnackGui, SnackContainer
-local function EnsureSnack()
+local function EnsureSnack(lib)
     if SnackGui and SnackGui.Parent then return end
     SnackGui = Instance.new("ScreenGui")
     SnackGui.Name = "LibrarySnack_"..tostring(math.random(1,999999))
@@ -1020,6 +1440,7 @@ local function EnsureSnack()
     SnackGui.IgnoreGuiInset = true
     if PROT then pcall(PROT, SnackGui) end
     SnackGui.Parent = GetHui()
+    lib._auxGuis=lib._auxGuis or {}; table.insert(lib._auxGuis,SnackGui)
     SnackContainer = Instance.new("Frame")
     SnackContainer.Size = UDim2.new(0,400,0,60)
     SnackContainer.Position = UDim2.new(0.5,-200,1,-80)
@@ -1034,7 +1455,7 @@ end
 
 function L:Snackbar(cfg)
     cfg = cfg or {}
-    EnsureSnack()
+    EnsureSnack(self)
     local text = cfg.Text or ""
     local kind = cfg.Type or "info"
     local dur = cfg.Duration or 3
@@ -1045,12 +1466,12 @@ function L:Snackbar(cfg)
     elseif kind == "error" then col = C.Danger
     elseif kind == "warning" then col = C.Warning
     else col = C.Info end
-    local Card = Instance.new("Frame")
+    local Card = Instance.new("CanvasGroup")
     Card.Size = UDim2.new(1,0,0,40)
     Card.BackgroundColor3 = C.Surface
     Card.BorderSizePixel = 0
     Card.BackgroundTransparency = 0.05
-    Card.Position = UDim2.new(0,0,0,20)
+    Card.GroupTransparency = 1
     Card.Parent = SnackContainer
     local Cc = Instance.new("UICorner"); Cc.CornerRadius = UDim.new(0,10); Cc.Parent = Card
     local Cs = Instance.new("UIStroke"); Cs.Color = col; Cs.Thickness = 1; Cs.Transparency = 0.4; Cs.Parent = Card
@@ -1082,10 +1503,10 @@ function L:Snackbar(cfg)
             Card:Destroy()
         end)
     end
-    TweenService:Create(Card, T_INFO, {Position=UDim2.new(0,0,0,0)}):Play()
+    TweenService:Create(Card, T_INFO, {GroupTransparency=0}):Play()
     task.delay(dur, function()
         if Card.Parent then
-            TweenService:Create(Card, T_INFO, {Position=UDim2.new(0,0,0,40), BackgroundTransparency=1}):Play()
+            TweenService:Create(Card, T_INFO, {GroupTransparency=1}):Play()
             task.delay(0.3, function() if Card.Parent then Card:Destroy() end end)
         end
     end)
@@ -1110,6 +1531,7 @@ function L:Toast(cfg)
     g.IgnoreGuiInset = true
     if PROT then pcall(PROT, g) end
     g.Parent = GetHui()
+    self._auxGuis=self._auxGuis or {}; table.insert(self._auxGuis,g)
     local Card = Instance.new("Frame")
     Card.Size = UDim2.new(0,180,0,46)
     Card.Position = UDim2.new(0.5,-90,0.5,-23)
@@ -1315,6 +1737,7 @@ L.Transitions.List = {
 }
 
 function L:PlayEffect(name, parent, cfg)
+    if self:GetReducedMotion() then return false end
     local def = self.Effects.List[name]
     if not def then return end
     cfg = cfg or {}
@@ -1336,11 +1759,7 @@ function L:PlayEffect(name, parent, cfg)
                 p.Anchored = false
                 p.CFrame = parent.CFrame * CFrame.new((math.random()-0.5)*4, math.random()*3, (math.random()-0.5)*4)
                 p.Parent = workspace
-                local bv = Instance.new("BodyVelocity")
-                bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-                bv.Velocity = Vector3.new((math.random()-0.5)*8, math.random(8,15), (math.random()-0.5)*8)
-                bv.Parent = p
-                task.delay(def.dur, function() if bv then bv:Destroy() end end)
+                p.AssemblyLinearVelocity = Vector3.new((math.random()-0.5)*8, math.random(8,15), (math.random()-0.5)*8)
                 task.delay(def.dur + 0.1, function() if p and p.Parent then p:Destroy() end end)
             else
                 if not parent or not parent.Parent then return end
@@ -1370,6 +1789,15 @@ end
 function L:PlayTransition(name, target, direction)
     local def = self.Transitions.List[name]
     if not def or not target then return end
+    local hook = self.Sounds and self.Sounds.transitionHooks and self.Sounds.transitionHooks[name]
+    if hook and hook ~= "" then self:PlaySoundAsset(hook, "Transitions") end
+    if self:GetReducedMotion() then
+        target.Position = target:GetAttribute("__HomePos") or target.Position
+        target.Size = target:GetAttribute("__HomeSize") or target.Size
+        target.Rotation = 0
+        if target:IsA("CanvasGroup") then target.GroupTransparency = direction == "in" and 0 or 1 end
+        return true
+    end
     if not target:GetAttribute("__HomePos") then
         target:SetAttribute("__HomePos", target.Position)
         target:SetAttribute("__HomeSize", target.Size)
@@ -1405,6 +1833,33 @@ function L:PlayTransition(name, target, direction)
             end
         end)
     end
+    return true
+end
+
+L.TransitionKits = {
+    Smooth = {Transition="Fade", Effects={}},
+    Explosive = {Transition="BounceIn", Effects={"Confetti","Sparks","Orbs"}},
+    Minimal = {Transition="Fade", Effects={}}
+}
+
+function L:PlayTransitionCombo(transitionName, effectNames, target, direction, cfg)
+    cfg = cfg or {}
+    if not target then return false end
+    local ok = self:PlayTransition(transitionName, target, direction or "in")
+    local names = type(effectNames) == "table" and effectNames or {}
+    for i=1,math.min(#names,3) do
+        local name = names[i]
+        task.delay((tonumber(cfg.Stagger) or 0.08) * (i-1), function()
+            if target.Parent then self:PlayEffect(name,target,cfg.EffectConfig or {}) end
+        end)
+    end
+    return ok ~= nil
+end
+
+function L:PlayTransitionKit(name, target, direction, cfg)
+    local kit = self.TransitionKits[name]
+    if not kit then return false end
+    return self:PlayTransitionCombo(kit.Transition,kit.Effects,target,direction,cfg)
 end
 
 function L:RegisterEffect(name, def) self.Effects.List[name] = def end
@@ -1413,12 +1868,18 @@ function L:RegisterTransition(name, def) self.Transitions.List[name] = def end
 L.UIScale = JsonRead("library_uiscale.json", {global=1, per={}})
 
 function L:SetUIScale(value, key)
+    self.UIScale = type(self.UIScale) == "table" and self.UIScale or {global=1,per={}}
+    self.UIScale.per = type(self.UIScale.per) == "table" and self.UIScale.per or {}
+    value = math.clamp(tonumber(value) or 1, 0.5, 2)
     if key then self.UIScale.per[key] = value else self.UIScale.global = value end
     JsonWrite("library_uiscale.json", self.UIScale)
-    if self._window then self._window:_ApplyUIScale() end
+    for _, win in ipairs(self._allWindows or {}) do if win and not win._destroyed then win:_ApplyUIScale() end end
+    return value
 end
 
 function L:GetUIScale(key)
+    self.UIScale = type(self.UIScale) == "table" and self.UIScale or {global=1,per={}}
+    self.UIScale.per = type(self.UIScale.per) == "table" and self.UIScale.per or {}
     if key and self.UIScale.per[key] then return self.UIScale.per[key] end
     return self.UIScale.global or 1
 end
@@ -1463,6 +1924,9 @@ function L:_AskPlatform()
     gui.IgnoreGuiInset = true
     if PROT then pcall(PROT, gui) end
     gui.Parent = GetHui()
+    self._auxGuis = self._auxGuis or {}
+    table.insert(self._auxGuis, gui)
+    if self._window then self._window._auxGuis=self._window._auxGuis or {}; table.insert(self._window._auxGuis,gui) end
     local Bg = Instance.new("Frame")
     Bg.Size = UDim2.new(1,0,1,0)
     Bg.BackgroundColor3 = C.Overlay
@@ -1565,6 +2029,7 @@ function L:_RunKeyFlow()
     gui.IgnoreGuiInset = true
     if PROT then pcall(PROT, gui) end
     gui.Parent = GetHui()
+    self._auxGuis=self._auxGuis or {}; table.insert(self._auxGuis,gui)
     local Bg = Instance.new("Frame")
     Bg.Size = UDim2.new(1,0,1,0)
     Bg.BackgroundColor3 = C.Overlay
@@ -1740,11 +2205,18 @@ local function SnapToEdge(Frame, File)
     local pos = Frame.AbsolutePosition
     local sz = Frame.AbsoluteSize
     local th = 30
+    local scale = 1
+    local node = Frame.Parent
+    while node do
+        local uiScale = node:FindFirstChildOfClass("UIScale")
+        if uiScale then scale = math.max(uiScale.Scale, 0.01); break end
+        node = node.Parent
+    end
     local nx, ny = Frame.Position.X.Offset, Frame.Position.Y.Offset
-    if pos.X < th then nx = nx + (th - pos.X) + 8
-    elseif pos.X + sz.X > vp.X - th then nx = nx - ((pos.X + sz.X) - (vp.X - th)) - 8 end
-    if pos.Y < th then ny = ny + (th - pos.Y) + 8
-    elseif pos.Y + sz.Y > vp.Y - th then ny = ny - ((pos.Y + sz.Y) - (vp.Y - th)) - 8 end
+    if pos.X < th then nx = nx + ((th - pos.X) + 8)/scale
+    elseif pos.X + sz.X > vp.X - th then nx = nx - (((pos.X + sz.X) - (vp.X - th)) + 8)/scale end
+    if pos.Y < th then ny = ny + ((th - pos.Y) + 8)/scale
+    elseif pos.Y + sz.Y > vp.Y - th then ny = ny - (((pos.Y + sz.Y) - (vp.Y - th)) + 8)/scale end
     Frame.Position = UDim2.new(Frame.Position.X.Scale, nx, Frame.Position.Y.Scale, ny)
     if File then JsonWrite(File, {xs=Frame.Position.X.Scale, x=nx, ys=Frame.Position.Y.Scale, y=ny}) end
 end
@@ -1753,7 +2225,7 @@ function L:CreateWindow(cfg)
     cfg = cfg or {}
     if cfg.Splash then
         self:ShowSplash(cfg.Splash)
-        task.wait(cfg.Splash.Duration or 2)
+        while SplashGui and SplashGui.Parent do task.wait(0.05) end
     end
     if cfg.Theme and self.Palettes[cfg.Theme] then self:SetTheme(cfg.Theme) end
     if cfg.AnimatedTheme then self:SetAnimatedTheme(cfg.AnimatedTheme) end
@@ -1769,7 +2241,7 @@ function L:CreateWindow(cfg)
     if cfg.Key and cfg.Key.Enabled then
         if not self:_RunKeyFlow() then return end
     end
-    self.C = NormalizePalette(self.C)
+    if not self._themeNormalized then self.C = NormalizePalette(self.C); self._themeNormalized=true end
     local C = self.C
     local WinFile = "library_window.json"
     local savedPos = JsonRead(WinFile, nil)
@@ -1815,7 +2287,7 @@ function L:CreateWindow(cfg)
     Shadow.BackgroundTransparency = 0.72
     Shadow.BorderSizePixel = 0
     Shadow.ZIndex = 0
-    Shadow.Parent = sg
+    Shadow.Parent = Main
     local Shc = Instance.new("UICorner"); Shc.CornerRadius = UDim.new(0,22); Shc.Parent = Shadow
     local Mc = Instance.new("UICorner"); Mc.CornerRadius = UDim.new(0,20); Mc.Parent = Main
     local Ms = Instance.new("UIStroke"); Ms.Color = C.Stroke; Ms.Thickness = 1.25; Ms.Transparency = 0.05; Ms.Parent = Main
@@ -1847,6 +2319,7 @@ function L:CreateWindow(cfg)
         img.Position = UDim2.new(0,4,0,4)
         img.BackgroundTransparency = 1
         img.Image = self.Icons[cfg.Icon] or cfg.Icon
+        img:SetAttribute("__VNCIconName",cfg.Icon)
         img.Parent = Logo
     else
         local Lt = Instance.new("TextLabel")
@@ -1983,11 +2456,20 @@ function L:CreateWindow(cfg)
         _header=Header, _logo=Logo, _title=Title, _sub=Sub, _mainStroke=Ms, _shadow=Shadow,
         _statusBar=StatusBar, _statusL=StatusL, _statusR=StatusR,
         _accentStrip=AccentStrip, _winFile=WinFile, _modeFile=modeFile,
-        _allElements={}
+        _allElements={}, _connections={}, _auxGuis={}, _destroyed=false
     }, {__index=L})
+    Win._window = Win
     Win.C = C
     function Win:_ApplyTheme(old, new)
         local c = new or self._lib.C
+        self.C = c
+        for _, tab in ipairs(self._tabs) do
+            if not tab._ownTheme then
+                tab.C = ClonePalette(c)
+                if tab._ownAccent then tab.C.Accent=tab._ownAccent; tab.C.StrokeHot=tab._ownAccent; tab.C.AccentSoft=tab._ownAccent:Lerp(Color3.new(0,0,0),0.35) end
+                for _, section in ipairs(tab._sections) do section.C=tab.C end
+            end
+        end
         self._main.BackgroundColor3 = c.Bg
         self._main.BackgroundTransparency = self._lib.Config.Transparency or 0
         self._gradient.Color = ColorSequence.new(c.Bg, c.Surface)
@@ -2032,39 +2514,69 @@ function L:CreateWindow(cfg)
                 end
             end
         end
+        for _, obj in ipairs(root:GetDescendants()) do
+            if obj:IsA("GuiObject") then
+                if obj:GetAttribute("__VNCBaseTransparency") == nil then obj:SetAttribute("__VNCBaseTransparency",obj.BackgroundTransparency) end
+                local base = obj:GetAttribute("__VNCBaseTransparency")
+                obj.BackgroundTransparency = math.clamp(base + (self._lib.Config.Transparency or 0) * (1-base),0,1)
+            end
+        end
+        self._accentTargetsDirty = true
     end
-    function Win:_ApplyAccent(oldAccent, newAccent, newSoft)
+    function Win:_ApplyAccent(oldAccent, newAccent, newSoft, oldSoft)
         local c = self._lib.C
         oldAccent = oldAccent or c.Accent
         newAccent = newAccent or c.Accent
         newSoft = newSoft or c.AccentSoft
+        for _, tab in ipairs(self._tabs) do
+            if not tab._ownTheme then tab.C=ClonePalette(c) end
+            if tab._ownAccent then tab.C.Accent=tab._ownAccent; tab.C.StrokeHot=tab._ownAccent; tab.C.AccentSoft=tab._ownAccent:Lerp(Color3.new(0,0,0),0.35) end
+            for _, section in ipairs(tab._sections) do section.C=tab.C end
+        end
         self._accentStrip.BackgroundColor3 = newAccent
         self._logo.BackgroundColor3 = newAccent
-        for _, obj in ipairs(self._main:GetDescendants()) do
-            if obj:IsA("GuiObject") and obj.BackgroundColor3 == oldAccent then obj.BackgroundColor3 = newAccent end
-            if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.TextColor3 == oldAccent then obj.TextColor3 = newAccent end
-            if (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) and obj.ImageColor3 == oldAccent then obj.ImageColor3 = newAccent end
-            if obj:IsA("UIStroke") and obj.Color == oldAccent then obj.Color = newAccent end
-            if obj:IsA("GuiObject") and obj.BackgroundColor3 == (self._lib.Palettes[self._lib.ThemeBase or "Dark"] and self._lib.Palettes[self._lib.ThemeBase or "Dark"].AccentSoft) then obj.BackgroundColor3 = newSoft end
+        if self._accentTargetsDirty or not self._accentTargets then
+            local targets={}
+            local function add(obj,property,role)
+                local value=obj[property]
+                local matches=(role=="soft" and oldSoft and value==oldSoft) or (role=="accent" and value==oldAccent)
+                if matches then
+                    table.insert(targets,{Object=obj,Property=property,Role=role})
+                end
+            end
+            for _, obj in ipairs(self._main:GetDescendants()) do
+                if obj:IsA("GuiObject") then add(obj,"BackgroundColor3","accent"); add(obj,"BackgroundColor3","soft") end
+                if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then add(obj,"TextColor3","accent") end
+                if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then add(obj,"ImageColor3","accent") end
+                if obj:IsA("UIStroke") then add(obj,"Color","accent") end
+            end
+            self._accentTargets=targets
+            self._accentTargetsDirty=false
+        end
+        for _, target in ipairs(self._accentTargets) do
+            if target.Object and target.Object.Parent then target.Object[target.Property]=target.Role=="soft" and newSoft or newAccent end
         end
     end
+    Win:_Connect(Main.DescendantAdded,function() Win._accentTargetsDirty=true end)
     function Win:_ApplyFont()
         local f, fb, fm = self._lib.CurrentFont, self._lib.CurrentFontBold, self._lib.CurrentFontMedium
-        self._title.Font = Enum.Font[fb]
-        self._sub.Font = Enum.Font[f]
-        self._statusL.Font = Enum.Font[f]
-        self._statusR.Font = Enum.Font[f]
-        for _, t in ipairs(self._tabs) do
-            t._btnLabel.Font = Enum.Font[fm]
-            for _, s in ipairs(t._sections) do
-                s._headerLabel.Font = Enum.Font[fb]
-            end
+        for _, obj in ipairs(self._main:GetDescendants()) do
+            if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then obj.Font = Enum.Font[f] end
         end
+        self._title.Font = Enum.Font[fb]
+        for _, t in ipairs(self._tabs) do t._btnLabel.Font = Enum.Font[fm] end
+        for _, t in ipairs(self._tabs) do for _, section in ipairs(t._sections) do section._headerLabel.Font = Enum.Font[fb] end end
     end
     function Win:_ApplyUIScale()
-        self._uiscale.Scale = self._lib:GetUIScale("window")
+        self._uiscale.Scale = self._lib:GetUIScale(self._cfg.UIScaleKey or "window")
     end
     function Win:_RefreshIcons()
+        for _, obj in ipairs(self._main:GetDescendants()) do
+            if (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) then
+                local iconName=obj:GetAttribute("__VNCIconName")
+                if iconName then obj.Image=self._lib.Icons[iconName] or obj.Image end
+            end
+        end
         for _, t in ipairs(self._tabs) do
             if t._icon and t._iconName then
                 t._icon.Image = self._lib.Icons[t._iconName] or t._icon.Image
@@ -2077,6 +2589,32 @@ function L:CreateWindow(cfg)
         JsonWrite(self._modeFile, {mode=mode})
         TweenService:Create(self._main, T_INFO, {Size=GetSize(mode)}):Play()
     end
+    function Win:SetPinned(enabled)
+        self._pinned=enabled==true
+        if self._gui and self._gui.Parent then self._gui.DisplayOrder=self._pinned and 999999 or 999996 end
+        return self._pinned
+    end
+    function Win:SetLocked(enabled) self._positionLocked=enabled==true; return self._positionLocked end
+    function Win:SetResizable(enabled) self._resizeHandle.Visible=enabled~=false; return self._resizeHandle.Visible end
+    function Win:SetMinSize(width,height)
+        self._minSize={Width=math.max(320,tonumber(width) or 420),Height=math.max(240,tonumber(height) or 300)}
+        local current=self._main.AbsoluteSize/math.max(self._uiscale.Scale,0.01)
+        if current.X<self._minSize.Width or current.Y<self._minSize.Height then self._main.Size=UDim2.fromOffset(math.max(current.X,self._minSize.Width),math.max(current.Y,self._minSize.Height)) end
+        return self._minSize
+    end
+    function Win:SetFocusMode(enabled)
+        if enabled then
+            if not self._focusSnapshot then self._focusSnapshot={Sidebar=self._sidebar.Visible,Status=self._statusBar.Visible,ContentSize=self._content.Size,ContentPosition=self._content.Position} end
+            self._sidebar.Visible=false; self._statusBar.Visible=false
+            self._content.Position=UDim2.new(0,16,0,58); self._content.Size=UDim2.new(1,-32,1,-82)
+        elseif self._focusSnapshot then
+            self._sidebar.Visible=self._focusSnapshot.Sidebar; self._statusBar.Visible=self._focusSnapshot.Status
+            self._content.Size=self._focusSnapshot.ContentSize; self._content.Position=self._focusSnapshot.ContentPosition
+            self._focusSnapshot=nil
+        end
+        self._focusMode=enabled==true
+        return self._focusMode
+    end
     BtnCompact.MouseButton1Click:Connect(function() self:PlaySound("click"); Win:SetMode("compact") end)
     BtnNormal.MouseButton1Click:Connect(function() self:PlaySound("click"); Win:SetMode("normal") end)
     BtnWide.MouseButton1Click:Connect(function() self:PlaySound("click"); Win:SetMode("wide") end)
@@ -2087,7 +2625,7 @@ function L:CreateWindow(cfg)
     end)
     local dragging, dragStart, startPos, moved = false, nil, nil, false
     DragArea.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        if not Win._positionLocked and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) then
             dragging = true
             moved = false
             dragStart = i.Position
@@ -2095,7 +2633,7 @@ function L:CreateWindow(cfg)
         end
     end)
     self:_Connect(UIS.InputChanged,function(i)
-        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        if dragging and not Win._positionLocked and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
             local d = i.Position - dragStart
             if math.abs(d.X) > 4 or math.abs(d.Y) > 4 then moved = true end
             if moved then
@@ -2120,7 +2658,9 @@ function L:CreateWindow(cfg)
         if not self._hidden then self._lib:PlaySound("open") end
     end
     function Win:SelectTab(t)
+        if not t or t._window ~= self or t._destroyed then return false end
         if self._active == t then return end
+        local C = self.C
         for _, tab in ipairs(self._tabs) do
             local sel = tab == t
             tab._frame.Visible = sel
@@ -2148,8 +2688,17 @@ function L:CreateWindow(cfg)
         if self._destroyed then return end
         self._destroyed=true
         if cfg.OnClose then pcall(cfg.OnClose) end
+        for _, gui in ipairs(self._auxGuis or {}) do if gui and gui.Parent then pcall(function() gui:Destroy() end) end end
+        self._auxGuis = {}
         if self._main and self._main.Parent then self._main.Parent:Destroy() end
-        if self._lib._window==self then self._lib._window=nil end
+        for i = #self._connections, 1, -1 do pcall(function() self._connections[i]:Disconnect() end); self._connections[i]=nil end
+        local wins = self._lib._allWindows or {}
+        local index = table.find(wins, self)
+        if index then table.remove(wins, index) end
+        if self._lib._window==self then
+            self._lib._window=nil
+            for i=#wins,1,-1 do if wins[i] and not wins[i]._destroyed then self._lib._window=wins[i]; break end end
+        end
     end
     Main.GroupTransparency = 0
     self._window=Win
@@ -2160,7 +2709,7 @@ function L:CreateWindow(cfg)
 end
 
 function L:CreateTab(name, icon)
-    local Win = self._window
+    local Win = self._window or (self._main and self)
     if not Win then return end
     local C = Win.C
     local opts = {}
@@ -2170,7 +2719,7 @@ function L:CreateTab(name, icon)
         name = opts.Name or opts.Title or "Tab"
     end
     local Tab = setmetatable({
-        _window=Win, _lib=self, _name=name, _sections={}, _elements={},
+        _window=Win, _lib=Win._lib or self, _name=name, _sections={}, _elements={},
         _iconName=icon, C=C, _ownTheme=nil, _ownAccent=nil
     }, {__index=L})
     local Btn = Instance.new("TextButton")
@@ -2250,16 +2799,19 @@ function L:CreateTab(name, icon)
     end)
     Btn.MouseEnter:Connect(function()
         if Win._active == Tab then return end
-        TweenService:Create(Btn, T_OUT, {BackgroundColor3=C.CardHover}):Play()
-        TweenService:Create(Bs, T_OUT, {Color=C.StrokeHot}):Play()
+        local colors=Tab.C or Win.C
+        TweenService:Create(Btn, T_OUT, {BackgroundColor3=colors.CardHover}):Play()
+        TweenService:Create(Bs, T_OUT, {Color=colors.StrokeHot}):Play()
         TweenService:Create(DragHandle, T_OUT, {BackgroundTransparency=0.5}):Play()
     end)
     Btn.MouseLeave:Connect(function()
         if Win._active == Tab then return end
-        TweenService:Create(Btn, T_OUT, {BackgroundColor3=C.Card}):Play()
-        TweenService:Create(Bs, T_OUT, {Color=C.Stroke}):Play()
+        local colors=Tab.C or Win.C
+        TweenService:Create(Btn, T_OUT, {BackgroundColor3=colors.Card}):Play()
+        TweenService:Create(Bs, T_OUT, {Color=colors.Stroke}):Play()
         TweenService:Create(DragHandle, T_OUT, {BackgroundTransparency=1}):Play()
     end)
+    local dragConnections = {}
     do
         local dragging, dragStart, startY, dragged = false, nil, nil, false
         Btn.InputBegan:Connect(function(i)
@@ -2273,7 +2825,7 @@ function L:CreateTab(name, icon)
                 end
             end
         end)
-        UIS.InputChanged:Connect(function(i)
+        local changedConn = Win:_Connect(UIS.InputChanged,function(i)
             if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
                 local d = i.Position.Y - dragStart
                 if math.abs(d) > 4 then dragged = true end
@@ -2283,7 +2835,8 @@ function L:CreateTab(name, icon)
                 end
             end
         end)
-        UIS.InputEnded:Connect(function(i)
+        table.insert(dragConnections,changedConn)
+        local endedConn = Win:_Connect(UIS.InputEnded,function(i)
             if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
                 if dragging then
                     dragging = false
@@ -2311,6 +2864,7 @@ function L:CreateTab(name, icon)
                 end
             end
         end)
+        table.insert(dragConnections,endedConn)
     end
     Tab._btn = Btn
     Tab._btnLabel = Lb
@@ -2320,19 +2874,69 @@ function L:CreateTab(name, icon)
     Tab._stroke = Bs
     Tab._activeGlow = ActiveGlow
     Tab._dragHandle = DragHandle
+    Tab._connections = dragConnections
     function Tab:SetAccent(color)
+        if typeof(color) ~= "Color3" then return false end
         self._ownAccent = color
+        local old, oldSoft = self.C.Accent, self.C.AccentSoft
+        self.C = ClonePalette(self.C)
+        self.C.Accent, self.C.StrokeHot = color, color
+        self.C.AccentSoft = color:Lerp(Color3.new(0,0,0), 0.35)
+        for _, obj in ipairs(Btn:GetDescendants()) do
+            if obj:IsA("GuiObject") and obj.BackgroundColor3 == old then obj.BackgroundColor3 = color end
+            if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.TextColor3 == old then obj.TextColor3 = color end
+            if (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) and obj.ImageColor3 == old then obj.ImageColor3 = color end
+            if obj:IsA("UIStroke") and obj.Color == old then obj.Color = color end
+        end
         self._frame.ScrollBarImageColor3 = color
-        if self._icon then self._icon.ImageColor3 = color end
+        ActiveGlow.BackgroundColor3 = color
+        DragHandle.BackgroundColor3 = color
+        for _, section in ipairs(self._sections) do section.C = self.C end
+        for _, obj in ipairs(Frame:GetDescendants()) do
+            if obj:IsA("GuiObject") and obj.BackgroundColor3 == old then obj.BackgroundColor3=color end
+            if obj:IsA("GuiObject") and obj.BackgroundColor3 == oldSoft then obj.BackgroundColor3=self.C.AccentSoft end
+            if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.TextColor3 == old then obj.TextColor3=color end
+            if (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) and obj.ImageColor3 == old then obj.ImageColor3=color end
+            if obj:IsA("UIStroke") and obj.Color == old then obj.Color=color end
+        end
+        return true
     end
     function Tab:SetTheme(themeName)
-        if self._lib.Palettes[themeName] then self._ownTheme = self._lib.Palettes[themeName] end
+        local palette = self._lib.Palettes[themeName]
+        if not palette then return false end
+        local old, new = self.C or Win.C, NormalizePalette(palette)
+        self._ownTheme, self.C = ClonePalette(new), new
+        if self._ownAccent then self.C.Accent=self._ownAccent; self.C.StrokeHot=self._ownAccent; self.C.AccentSoft=self._ownAccent:Lerp(Color3.new(0,0,0),0.35) end
+        local function remap(root)
+            for _, obj in ipairs(root:GetDescendants()) do
+                if obj:IsA("GuiObject") then for key,value in pairs(old) do if typeof(value)=="Color3" and obj.BackgroundColor3==value and new[key] then obj.BackgroundColor3=new[key]; break end end end
+                if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then for key,value in pairs(old) do if typeof(value)=="Color3" and obj.TextColor3==value and new[key] then obj.TextColor3=new[key]; break end end end
+                if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then for key,value in pairs(old) do if typeof(value)=="Color3" and obj.ImageColor3==value and new[key] then obj.ImageColor3=new[key]; break end end end
+                if obj:IsA("UIStroke") then for key,value in pairs(old) do if typeof(value)=="Color3" and obj.Color==value and new[key] then obj.Color=new[key]; break end end end
+            end
+        end
+        remap(Btn); remap(Frame)
+        self._frame.ScrollBarImageColor3 = new.Accent
+        Btn.BackgroundColor3 = new.Card
+        Bs.Color = new.Stroke
+        ActiveGlow.BackgroundColor3 = new.Accent
+        DragHandle.BackgroundColor3 = new.Accent
+        Lb.TextColor3 = new.TextDim
+        if iconImg then iconImg.ImageColor3 = new.TextDim end
+        for _, section in ipairs(self._sections) do section.C = new end
+        return true
     end
     function Tab:SetName(n) self._name = n; Lb.Text = n end
     function Tab:Destroy()
-        table.remove(Win._tabs, table.find(Win._tabs, Tab))
+        if self._destroyed then return end
+        self._destroyed=true
+        for _, conn in ipairs(self._connections or {}) do if conn then pcall(function() conn:Disconnect() end) end end
+        self._connections = {}
+        local index=table.find(Win._tabs,Tab)
+        if index then table.remove(Win._tabs,index) end
         Btn:Destroy()
         Frame:Destroy()
+        if Win._active==Tab then Win._active=nil; if Win._tabs[1] then Win:SelectTab(Win._tabs[1]) end end
     end
     table.insert(Win._tabs, Tab)
     if #Win._tabs == 1 then Win:SelectTab(Tab) end
@@ -2342,13 +2946,13 @@ end
 function L:CreateSection(name)
     local Tab = self
     local Win = Tab._window
-    local C = Win.C
+    local C = Tab.C or Win.C
     local opts = {}
     if type(name) == "table" then opts = name; name = opts.Name or opts.Title or "Section" end
     local collapsible = opts.Collapsible ~= false
     local defaultCollapsed = opts.Collapsed or false
     local Sec = setmetatable({
-        _tab=Tab, _lib=Tab._lib, _name=name, _elements={}, C=C,
+        _tab=Tab, _lib=Tab._lib, _window=Win, _name=name, _elements={}, C=C,
         _collapsed=defaultCollapsed, _collapsible=collapsible
     }, {__index=L})
     local Holder = Instance.new("Frame")
@@ -2435,6 +3039,66 @@ function L:CreateSection(name)
     return Sec
 end
 
+local ElementMethods = {}
+function ElementMethods:InitFavorite()
+    if self._favoriteId then self:SetFavorite(self:IsFavorite()) end
+    return self
+end
+function ElementMethods:SetFavorite(enabled)
+    local id=self._favoriteId or self.Name
+    if not id then return false end
+    local lib=self._lib or L
+    if enabled==nil then enabled=not lib:IsFavorite(id) end
+    local state=lib:SetFavorite(id,enabled)
+    lib._favoriteItems=lib._favoriteItems or {}
+    if state then lib._favoriteItems[id]={Name=self._favoriteName or tostring(id),Tab=self._favoriteTab}
+    else lib._favoriteItems[id]=nil end
+    local root=self.Instance
+    if root and root.Parent then
+        if not self._favoriteButton then
+            local star=Instance.new("TextButton"); star.Name="FavoriteButton"; star.Size=UDim2.fromOffset(20,20); star.Position=UDim2.new(1,-24,0,3)
+            star.BackgroundTransparency=1; star.TextSize=16; star.Font=Enum.Font.GothamBold; star.TextColor3=lib.C.Warning; star.AutoButtonColor=false; star.ZIndex=100; star.Parent=root
+            star.MouseButton1Click:Connect(function() self:SetFavorite() end)
+            self._favoriteButton=star
+        end
+        self._favoriteButton.Text=state and "★" or "☆"
+    end
+    return state
+end
+function ElementMethods:IsFavorite()
+    local id=self._favoriteId or self.Name
+    return id and (self._lib or L):IsFavorite(id) or false
+end
+function ElementMethods:Disable()
+    if self._disabled then return self end
+    self._disabled = true
+    local root = self.Instance
+    if root then
+        self._interactableState = {}
+        local list = {root}
+        for _, obj in ipairs(root:GetDescendants()) do table.insert(list,obj) end
+        for _, obj in ipairs(list) do
+            if obj:IsA("GuiObject") then
+                self._interactableState[obj] = {Interactable=obj.Interactable, TextEditable=obj:IsA("TextBox") and obj.TextEditable or nil}
+                pcall(function() obj.Interactable = false end)
+            end
+            if obj:IsA("TextBox") then obj.TextEditable = false end
+        end
+    end
+    return self
+end
+function ElementMethods:Enable()
+    if not self._disabled then return self end
+    self._disabled = false
+    for obj, state in pairs(self._interactableState or {}) do
+        if obj and obj.Parent then
+            pcall(function() obj.Interactable = state.Interactable end)
+            if obj:IsA("TextBox") and state.TextEditable ~= nil then obj.TextEditable = state.TextEditable end
+        end
+    end
+    self._interactableState = nil
+    return self
+end
 function L:_AddElement(a, b)
     local Sec, frame
     if b ~= nil then
@@ -2448,13 +3112,207 @@ function L:_AddElement(a, b)
     if not parent then return nil end
     frame.LayoutOrder = #Sec._elements + 1
     if frame.Parent ~= parent then frame.Parent = parent end
+    local transparency=Sec._lib.Config.Transparency or 0
+    if transparency>0 then
+        local function apply(obj)
+            if obj:IsA("GuiObject") then
+                if obj:GetAttribute("__VNCBaseTransparency")==nil then obj:SetAttribute("__VNCBaseTransparency",obj.BackgroundTransparency) end
+                local base=obj:GetAttribute("__VNCBaseTransparency")
+                obj.BackgroundTransparency=math.clamp(base+transparency*(1-base),0,1)
+            end
+        end
+        apply(frame); for _,obj in ipairs(frame:GetDescendants()) do apply(obj) end
+    end
     table.insert(Sec._elements, frame)
     return frame
 end
 
+function L:CreateTooltip(target, text, cfg)
+    cfg=cfg or {}
+    target=type(target)=="table" and target.Instance or target
+    if not target or not target:IsA("GuiObject") then return nil end
+    local win=self._window or self._tab and self._tab._window or self._window
+    local c=(self.C or (win and win.C) or L.C)
+    local parent=(win and win._overlay) or target.Parent
+    local tip=Instance.new("TextLabel")
+    tip.Name="VNC_Tooltip"; tip.AutomaticSize=Enum.AutomaticSize.Y; tip.Size=UDim2.new(0,cfg.Width or 220,0,0)
+    tip.BackgroundColor3=c.Surface; tip.TextColor3=c.Text; tip.Font=Enum.Font[self.CurrentFont]
+    tip.TextSize=cfg.TextSize or 11; tip.TextWrapped=true; tip.Text=tostring(text or "")
+    tip.Visible=false; tip.ZIndex=1500; tip.Parent=parent
+    local pad=Instance.new("UIPadding"); pad.PaddingLeft=UDim.new(0,8); pad.PaddingRight=UDim.new(0,8); pad.PaddingTop=UDim.new(0,5); pad.PaddingBottom=UDim.new(0,5); pad.Parent=tip
+    local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,6); corner.Parent=tip
+    local function show()
+        if not target.Parent then return end
+        local pos=target.AbsolutePosition; local size=target.AbsoluteSize
+        local scale=win and math.max(win._uiscale.Scale,0.01) or 1
+        tip.Position=UDim2.fromOffset((pos.X-(win and win._main.AbsolutePosition.X or 0))/scale,(pos.Y-(win and win._main.AbsolutePosition.Y or 0)+size.Y)/scale+5)
+        tip.Visible=true
+    end
+    local function hide() tip.Visible=false end
+    local entered=target.MouseEnter:Connect(show); local left=target.MouseLeave:Connect(hide)
+    local touched=target.InputBegan:Connect(function(input) if input.UserInputType==Enum.UserInputType.Touch then show(); task.delay(cfg.Duration or 2,hide) end end)
+    return {Instance=tip,Show=show,Hide=hide,Destroy=function() entered:Disconnect(); left:Disconnect(); touched:Disconnect(); tip:Destroy() end}
+end
+
+function L:CreateBadge(parent, text, cfg)
+    cfg=cfg or {}; parent=type(parent)=="table" and parent.Instance or parent
+    if not parent or not parent:IsA("GuiObject") then return nil end
+    local label=Instance.new("TextLabel"); label.Name="VNC_Badge"
+    label.AnchorPoint=Vector2.new(1,0); label.Position=cfg.Position or UDim2.new(1,-6,0,6)
+    label.Size=cfg.Size or UDim2.new(0,math.max(24,#tostring(text or "")*7+12),0,20)
+    label.BackgroundColor3=cfg.Color or self.C.Accent; label.TextColor3=cfg.TextColor or self.C.White
+    label.Text=tostring(text or ""); label.Font=Enum.Font[self.CurrentFontBold]; label.TextSize=cfg.TextSize or 10
+    label.BorderSizePixel=0; label.ZIndex=(parent.ZIndex or 1)+1; label.Parent=parent
+    local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(1,0); corner.Parent=label
+    return {Instance=label,Set=function(_,value) label.Text=tostring(value); label.Size=UDim2.new(0,math.max(24,#label.Text*7+12),0,20) end,Destroy=function() label:Destroy() end}
+end
+
+local function CreateChoiceControl(Sec,cfg,segmented)
+    cfg=cfg or {}; local C=Sec.C or Sec._window.C
+    local options=cfg.Options or cfg.Values or {}
+    local selected=cfg.Default or options[1]
+    if type(selected)=="number" and options[selected]~=nil then selected=options[selected] end
+    local Wrapped=Instance.new("Frame")
+    Wrapped.Size=UDim2.new(1,0,0,segmented and 64 or math.max(70,#options*32+38))
+    Wrapped.BackgroundColor3=C.Card; Wrapped.BorderSizePixel=0; Wrapped.Parent=Sec._inner or Sec._holder
+    local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,10); corner.Parent=Wrapped
+    local label=Instance.new("TextLabel"); label.Size=UDim2.new(1,-20,0,22); label.Position=UDim2.new(0,10,0,4); label.BackgroundTransparency=1
+    label.Text=cfg.Name or (segmented and "Options" or "Choose one"); label.TextColor3=C.Text; label.Font=Enum.Font[Sec._lib.CurrentFontMedium]; label.TextSize=12; label.TextXAlignment=Enum.TextXAlignment.Left; label.Parent=Wrapped
+    local holder=Instance.new("Frame"); holder.Size=UDim2.new(1,-16,0,segmented and 28 or math.max(0,#options*32)); holder.Position=UDim2.new(0,8,0,30); holder.BackgroundTransparency=1; holder.Parent=Wrapped
+    local layout=Instance.new(segmented and "UIListLayout" or "UIListLayout"); layout.FillDirection=segmented and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical; layout.Padding=UDim.new(0,4); layout.Parent=holder
+    local buttons={}
+    local function refresh()
+        for option,button in pairs(buttons) do
+            local active=option==selected
+            button.BackgroundColor3=active and C.AccentSoft or C.Surface
+            button.TextColor3=active and C.White or C.TextDim
+        end
+    end
+    for index,option in ipairs(options) do
+        local button=Instance.new("TextButton"); button.Name="Choice"; button.Text=tostring(option); button.TextSize=11
+        button.Font=Enum.Font[Sec._lib.CurrentFont]; button.AutoButtonColor=false; button.BorderSizePixel=0
+        button.Size=segmented and UDim2.new(1/math.max(#options,1),-4,1,0) or UDim2.new(1,0,0,28)
+        button.LayoutOrder=index; button.Parent=holder
+        local bc=Instance.new("UICorner"); bc.CornerRadius=UDim.new(0,7); bc.Parent=button
+        buttons[option]=button
+        button.MouseButton1Click:Connect(function()
+            selected=option; refresh()
+            if cfg.Callback then pcall(cfg.Callback,selected) end
+            if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
+        end)
+    end
+    local Element=setmetatable({Instance=Wrapped,_lib=Sec._lib,_favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab},ElementMethods)
+    Element:InitFavorite()
+    function Element:Set(value) if buttons[value] then selected=value; refresh(); if cfg.Callback then pcall(cfg.Callback,value) end end end
+    function Element:Get() return selected end
+    function Element:Destroy() Wrapped:Destroy() end
+    if cfg.Flag then Sec._lib:RegisterState(cfg.Flag,function() return selected end,function(v,silent) if buttons[v] then selected=v; refresh(); if not silent and cfg.Callback then pcall(cfg.Callback,v) end end end) end
+    Sec:_AddElement(Wrapped); refresh(); return Element
+end
+
+function L:CreateRadioGroup(cfg) return CreateChoiceControl(self,cfg,false) end
+function L:CreateSegmentedControl(cfg) return CreateChoiceControl(self,cfg,true) end
+function L:CreateStepSlider(cfg)
+    cfg=cfg or {}
+    local options=cfg.Options or {"Low","Mid","High"}
+    return CreateChoiceControl(self,{Name=cfg.Name or "Step",Options=options,Default=cfg.Default,Flag=cfg.Flag,Callback=cfg.Callback},true)
+end
+
+function L:CreateTimer(cfg)
+    local Sec=self; cfg=cfg or {}; local C=Sec.C or Sec._window.C
+    local remaining=math.max(0,tonumber(cfg.Duration) or 1500); local running=false; local destroyed=false
+    local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,76); root.BackgroundColor3=C.Card; root.BorderSizePixel=0; root.Parent=Sec._inner or Sec._holder
+    local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,10); corner.Parent=root
+    local title=Instance.new("TextLabel"); title.Size=UDim2.new(1,-20,0,20); title.Position=UDim2.new(0,10,0,5); title.BackgroundTransparency=1; title.Text=cfg.Name or "Timer"; title.Font=Enum.Font[Sec._lib.CurrentFontMedium]; title.TextSize=12; title.TextColor3=C.Text; title.TextXAlignment=Enum.TextXAlignment.Left; title.Parent=root
+    local display=Instance.new("TextLabel"); display.Size=UDim2.new(0,100,0,32); display.Position=UDim2.new(0,10,0,30); display.BackgroundTransparency=1; display.Font=Enum.Font.GothamBold; display.TextSize=18; display.TextColor3=C.Accent; display.TextXAlignment=Enum.TextXAlignment.Left; display.Parent=root
+    local function refresh() display.Text=string.format("%02d:%02d",math.floor(remaining/60),math.floor(remaining%60)) end
+    local function button(text,x,callback)
+        local b=Instance.new("TextButton"); b.Size=UDim2.new(0,54,0,28); b.Position=UDim2.new(1,x,0.5,-14); b.AnchorPoint=Vector2.new(1,0); b.BackgroundColor3=C.Surface; b.Text=text; b.TextColor3=C.Text; b.Font=Enum.Font[Sec._lib.CurrentFont]; b.TextSize=10; b.BorderSizePixel=0; b.AutoButtonColor=false; b.Parent=root
+        local bc=Instance.new("UICorner"); bc.CornerRadius=UDim.new(0,7); bc.Parent=b; b.MouseButton1Click:Connect(callback); return b
+    end
+    local startButton
+    local function startTimer()
+        if running then return end
+        running=true; startButton.Text="Pause"
+        task.spawn(function()
+            while running and not destroyed and remaining>0 do task.wait(1); if running and not destroyed then remaining=math.max(0,remaining-1); refresh(); if cfg.Callback then pcall(cfg.Callback,remaining) end end end
+            if remaining==0 and not destroyed then running=false; startButton.Text="Start"; if cfg.OnComplete then pcall(cfg.OnComplete) end end
+        end)
+    end
+    local function pauseTimer() running=false; startButton.Text="Start" end
+    local function resetTimer() running=false; remaining=math.max(0,tonumber(cfg.Duration) or 1500); startButton.Text="Start"; refresh() end
+    button("Reset",-10,resetTimer)
+    startButton=button("Start",-70,function() if running then pauseTimer() else startTimer() end end)
+    local Element=setmetatable({Instance=root,_lib=Sec._lib,_favoriteId=cfg.Flag or cfg.Name,_favoriteName=cfg.Name,_favoriteTab=Sec._tab},ElementMethods); Element:InitFavorite()
+    function Element:Get() return remaining end
+    function Element:Set(seconds) remaining=math.max(0,tonumber(seconds) or 0); refresh() end
+    function Element:Start() startTimer() end
+    function Element:Pause() pauseTimer() end
+    function Element:Reset() resetTimer() end
+    function Element:Destroy() destroyed=true; running=false; root:Destroy() end
+    if cfg.Flag then Sec._lib:RegisterState(cfg.Flag,function() return remaining end,function(value) remaining=math.max(0,tonumber(value) or 0); refresh() end) end
+    Sec:_AddElement(root); refresh(); return Element
+end
+
+function L:CreateTerminal(cfg)
+    local Sec=self; cfg=cfg or {}; local C=Sec.C or Sec._window.C
+    local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,cfg.Height or 180); root.BackgroundColor3=C.Bg; root.BorderSizePixel=0; root.Parent=Sec._inner or Sec._holder
+    local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,10); corner.Parent=root
+    local scroll=Instance.new("ScrollingFrame"); scroll.Size=UDim2.new(1,-12,1,-12); scroll.Position=UDim2.new(0,6,0,6); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4; scroll.ScrollBarImageColor3=C.Accent; scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.Parent=root
+    local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,2); layout.Parent=scroll
+    local api={Instance=root}
+    function api:Print(message,kind)
+        local row=Instance.new("TextLabel"); row.Size=UDim2.new(1,-4,0,0); row.AutomaticSize=Enum.AutomaticSize.Y; row.BackgroundTransparency=1; row.Text="["..os.date("%H:%M:%S").."] "..tostring(message); row.TextWrapped=true; row.TextXAlignment=Enum.TextXAlignment.Left; row.Font=Enum.Font.Code; row.TextSize=11
+        row.TextColor3=kind=="error" and C.Danger or kind=="success" and C.Success or kind=="warning" and C.Warning or C.TextDim; row.Parent=scroll
+        task.defer(function() scroll.CanvasPosition=Vector2.new(0,math.max(0,scroll.AbsoluteCanvasSize.Y-scroll.AbsoluteSize.Y)) end)
+        return row
+    end
+    function api:Clear() for _,child in ipairs(scroll:GetChildren()) do if child:IsA("TextLabel") then child:Destroy() end end end
+    function api:Destroy() root:Destroy() end
+    Sec:_AddElement(root); return api
+end
+
+function L:BindGlobal(name,key,callback,modifiers)
+    if type(callback)~="function" then return nil end
+    modifiers=type(modifiers)=="table" and table.clone(modifiers) or {}
+    local binding={Key=key,Modifiers=modifiers}
+    local conn=UIS.InputBegan:Connect(function(input,processed)
+        if processed or UIS:GetFocusedTextBox() then return end
+        if input.KeyCode~=binding.Key then return end
+        local control=UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl)
+        local shift=UIS:IsKeyDown(Enum.KeyCode.LeftShift) or UIS:IsKeyDown(Enum.KeyCode.RightShift)
+        local alt=UIS:IsKeyDown(Enum.KeyCode.LeftAlt) or UIS:IsKeyDown(Enum.KeyCode.RightAlt)
+        if control==(binding.Modifiers.Control==true) and shift==(binding.Modifiers.Shift==true) and alt==(binding.Modifiers.Alt==true) then pcall(callback,input,binding.Modifiers) end
+    end)
+    local ResizeHandle=Instance.new("TextButton")
+    ResizeHandle.Name="ResizeHandle"; ResizeHandle.Size=UDim2.new(0,18,0,18); ResizeHandle.Position=UDim2.new(1,-20,1,-20)
+    ResizeHandle.BackgroundColor3=C.Accent; ResizeHandle.BackgroundTransparency=0.25; ResizeHandle.Text=""; ResizeHandle.AutoButtonColor=false; ResizeHandle.BorderSizePixel=0; ResizeHandle.ZIndex=50; ResizeHandle.Parent=Main
+    Win._resizeHandle=ResizeHandle
+    local resizeCorner=Instance.new("UICorner"); resizeCorner.CornerRadius=UDim.new(1,0); resizeCorner.Parent=ResizeHandle
+    if cfg.Resizable==false then ResizeHandle.Visible=false end
+    local resizing,resizeStart,resizeSize=false,nil,nil
+    ResizeHandle.InputBegan:Connect(function(i)
+        if not ResizeHandle.Visible or (i.UserInputType~=Enum.UserInputType.MouseButton1 and i.UserInputType~=Enum.UserInputType.Touch) then return end
+        resizing=true; resizeStart=i.Position; resizeSize=Main.AbsoluteSize/math.max(UIScaleObj.Scale,0.01)
+    end)
+    self:_Connect(UIS.InputChanged,function(i)
+        if not resizing or (i.UserInputType~=Enum.UserInputType.MouseMovement and i.UserInputType~=Enum.UserInputType.Touch) then return end
+        local delta=(i.Position-resizeStart)/math.max(UIScaleObj.Scale,0.01)
+        local min=Win._minSize or {Width=cfg.MinWidth or 420,Height=cfg.MinHeight or 300}
+        Main.Size=UDim2.fromOffset(math.max(min.Width,resizeSize.X+delta.X),math.max(min.Height,resizeSize.Y+delta.Y))
+    end)
+    self:_Connect(UIS.InputEnded,function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then resizing=false end end)
+    table.insert(self._connections,conn)
+    local handle={Name=name,Connection=conn}
+    function handle:Set(newKey,newModifiers) binding.Key=newKey; binding.Modifiers=type(newModifiers)=="table" and table.clone(newModifiers) or {}; self.Key=binding.Key; self.Modifiers=binding.Modifiers; end
+    handle.Key,handle.Modifiers=key,modifiers
+    function handle:Destroy() if self.Connection then self.Connection:Disconnect(); self.Connection=nil end end
+    return handle
+end
+
 function L:CreateButton(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local Wrapped = Instance.new("Frame")
     Wrapped.Size = UDim2.new(1,0,0,46)
@@ -2476,6 +3334,7 @@ function L:CreateButton(cfg)
         iconImg.Position = UDim2.new(0,14,0.5,-9)
         iconImg.BackgroundTransparency = 1
         iconImg.Image = Sec._lib.Icons[cfg.Icon] or cfg.Icon
+        iconImg:SetAttribute("__VNCIconName",cfg.Icon)
         iconImg.ImageColor3 = C.Accent
         iconImg.Parent = Wrapped
     end
@@ -2512,12 +3371,8 @@ function L:CreateButton(cfg)
         end
     end
     if cfg.Active then
-        task.spawn(function()
-            while Wrapped.Parent do
-                RefreshVisual()
-                task.wait(0.3)
-            end
-        end)
+        Sec._lib._activeWatchers = Sec._lib._activeWatchers or {}
+        Sec._lib._activeWatchers[Wrapped] = RefreshVisual
     end
     Btn.MouseEnter:Connect(function()
         TweenService:Create(Wrapped, T_OUT, {BackgroundColor3=C.CardHover}):Play()
@@ -2539,17 +3394,18 @@ function L:CreateButton(cfg)
         end
         if cfg.Active then RefreshVisual() end
     end)
-    local Element = {Instance=Wrapped, Button=Btn, _label=Lb}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab, Button=Btn, _label=Lb}, ElementMethods)
+    Element:InitFavorite()
     function Element:SetName(t) Lb.Text = t end
     function Element:SetActive() RefreshVisual() end
-    function Element:Destroy() Wrapped:Destroy() end
+    function Element:Destroy() Sec._lib._activeWatchers[Wrapped]=nil; Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
     return Element
 end
 
 function L:CreateToggle(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local state = cfg.Default == true
     if cfg.Flag then
@@ -2608,7 +3464,8 @@ function L:CreateToggle(cfg)
     end)
     Wrapped.MouseEnter:Connect(function() TweenService:Create(Wrapped, T_OUT, {BackgroundColor3=C.CardHover}):Play() end)
     Wrapped.MouseLeave:Connect(function() TweenService:Create(Wrapped, T_OUT, {BackgroundColor3=C.Card}):Play() end)
-    local Element = {Instance=Wrapped, Value=state, _label=Lb}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab, Value=state, _label=Lb}, ElementMethods)
+    Element:InitFavorite()
     function Element:Set(v) Set(v, true) end
     function Element:Get() return state end
     function Element:Destroy() Wrapped:Destroy() end
@@ -2619,7 +3476,7 @@ end
 
 function L:CreateSlider(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local min, max = tonumber(cfg.Min) or 0, tonumber(cfg.Max) or 100
     if max <= min then max = min + 1 end
@@ -2713,7 +3570,8 @@ function L:CreateSlider(cfg)
             if not silent and cfg.Callback then pcall(cfg.Callback, val) end
         end)
     end
-    local Element = {Instance=Wrapped, Value=val, _label=Lb}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab, Value=val, _label=Lb}, ElementMethods)
+    Element:InitFavorite()
     function Element:Set(v)
         val = math.clamp(v, min, max)
         local t = (val-min)/(max-min)
@@ -2738,7 +3596,7 @@ end
 
 function L:CreateRangeSlider(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local min, max = tonumber(cfg.Min) or 0, tonumber(cfg.Max) or 100
     if max <= min then max = min + 1 end
@@ -2864,7 +3722,8 @@ function L:CreateRangeSlider(cfg)
             if not silent and cfg.Callback then pcall(cfg.Callback,v1,v2) end
         end)
     end
-    local Element = {Instance=Wrapped}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab}, ElementMethods)
+    Element:InitFavorite()
     function Element:Get() return v1, v2 end
     function Element:Set(a, b)
         v1 = math.clamp(tonumber(a) or v1, min, max); v2 = math.clamp(tonumber(b) or v2, min, max); if v2 < v1 then v1, v2 = v2, v1 end
@@ -2881,7 +3740,7 @@ end
 
 function L:CreateInput(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local Wrapped = Instance.new("Frame")
     Wrapped.Size = UDim2.new(1,0,0,70)
@@ -2923,7 +3782,8 @@ function L:CreateInput(cfg)
         if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
     end)
     if cfg.Flag then Sec._lib:RegisterState(cfg.Flag, function() return Box.Text end, function(v, silent) Box.Text=tostring(v or ""); if not silent and cfg.Callback then pcall(cfg.Callback,Box.Text,false) end end) end
-    local Element = {Instance=Wrapped, Box=Box, _label=Lb}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab, Box=Box, _label=Lb}, ElementMethods)
+    Element:InitFavorite()
     function Element:Set(t) Box.Text = tostring(t or ""); if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end end
     function Element:Get() return Box.Text end
     function Element:Destroy() Wrapped:Destroy() end
@@ -2933,7 +3793,7 @@ end
 
 function L:CreateLabel(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     if type(cfg) == "string" then cfg = {Text=cfg} end
     cfg = cfg or {}
     local kind = cfg.Type or "info"
@@ -2959,7 +3819,8 @@ function L:CreateLabel(cfg)
     Lb.TextXAlignment = Enum.TextXAlignment.Left
     Lb.TextWrapped = true
     Lb.Parent = Wrapped
-    local Element = {Instance=Wrapped, Label=Lb, _label=Lb}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab, Label=Lb, _label=Lb}, ElementMethods)
+    Element:InitFavorite()
     function Element:Set(t) Lb.Text = t end
     function Element:Destroy() Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
@@ -2968,7 +3829,7 @@ end
 
 function L:CreateParagraph(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local Wrapped = Instance.new("Frame")
     Wrapped.Size = UDim2.new(1,0,0,0)
@@ -3005,7 +3866,8 @@ function L:CreateParagraph(cfg)
     XT.TextXAlignment = Enum.TextXAlignment.Left
     XT.TextWrapped = true
     XT.Parent = Wrapped
-    local Element = {Instance=Wrapped, _titleLabel=TL, _label=XT}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab, _titleLabel=TL, _label=XT}, ElementMethods)
+    Element:InitFavorite()
     function Element:Set(t) XT.Text = t end
     function Element:Destroy() Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
@@ -3014,7 +3876,7 @@ end
 
 function L:CreateDivider()
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     local D = Instance.new("Frame")
     D.Size = UDim2.new(1,0,0,1)
     D.BackgroundColor3 = C.Stroke
@@ -3026,7 +3888,7 @@ end
 
 function L:CreateDropdown(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local opts = cfg.Options or cfg.Values or cfg.Items or {}
     local multi = cfg.Multi or false
@@ -3151,8 +4013,15 @@ function L:CreateDropdown(cfg)
         if not List.Visible or not Wrapped.Parent then return end
         local wp = Wrapped.AbsolutePosition
         local mp = Sec._window._main.AbsolutePosition
-        List.Position = UDim2.fromOffset(wp.X - mp.X, wp.Y - mp.Y + Wrapped.AbsoluteSize.Y + 6)
-        List.Size = UDim2.fromOffset(math.max(Wrapped.AbsoluteSize.X, 180), 0)
+        local scale=math.max(Sec._window._uiscale.Scale,0.01)
+        local mainSize=Sec._window._main.AbsoluteSize/scale
+        local x=math.clamp((wp.X-mp.X)/scale,8,math.max(8,mainSize.X-math.max(Wrapped.AbsoluteSize.X/scale,180)-8))
+        local y=(wp.Y-mp.Y)/scale+Wrapped.AbsoluteSize.Y/scale+6
+        local listHeight=List.AbsoluteSize.Y/scale
+        List.Size = UDim2.fromOffset(math.max(Wrapped.AbsoluteSize.X/scale, 180), 0)
+        if y+listHeight>mainSize.Y-8 then y=wp.Y-mp.Y-listHeight-6 end
+        y=math.clamp(y,8,math.max(8,mainSize.Y-listHeight-8))
+        List.Position = UDim2.fromOffset(x,y)
     end
     Btn.MouseButton1Click:Connect(function()
         List.Visible = not List.Visible
@@ -3173,7 +4042,8 @@ function L:CreateDropdown(cfg)
             if not silent and cfg.Callback then pcall(cfg.Callback, selected) end
         end)
     end
-    local Element = {Instance=Wrapped}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab}, ElementMethods)
+    Element:InitFavorite()
     function Element:Set(v)
         if multi then
             selected = type(v) == "table" and v or {}
@@ -3212,7 +4082,7 @@ end
 
 function L:CreateColorPicker(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local color = SafeColor(cfg.Default, Color3.fromRGB(128,140,255))
     local h, sat, val = color:ToHSV()
@@ -3258,24 +4128,36 @@ function L:CreateColorPicker(cfg)
     local function setHue(x)
         h=math.clamp((x-Hue.AbsolutePosition.X)/Hue.AbsoluteSize.X,0,1); RefreshPicker(true)
     end
-    SVButton.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then setSV(i.Position.X,i.Position.Y) end end)
-    HueButton.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then setHue(i.Position.X) end end)
-    SVButton.InputChanged:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseMovement and UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then setSV(i.Position.X,i.Position.Y) end end)
-    HueButton.InputChanged:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseMovement and UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then setHue(i.Position.X) end end)
+    local svDragging, hueDragging = false, false
+    SVButton.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then svDragging=true; setSV(i.Position.X,i.Position.Y) end end)
+    HueButton.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then hueDragging=true; setHue(i.Position.X) end end)
+    local pickerMove = Sec._window:_Connect(UIS.InputChanged,function(i)
+        if svDragging and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then setSV(i.Position.X,i.Position.Y) end
+        if hueDragging and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then setHue(i.Position.X) end
+    end)
+    local pickerEnd = Sec._window:_Connect(UIS.InputEnded,function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then svDragging=false; hueDragging=false end
+    end)
     Hex.FocusLost:Connect(function() local c2=HexToColor(Hex.Text); if c2 then h,sat,val=c2:ToHSV(); RefreshPicker(true) else Hex.Text=ColorToHex(color) end end)
     Copy.MouseButton1Click:Connect(function() if CLIP then pcall(CLIP,ColorToHex(color)) end end)
     local function placePop()
-        local wp=Wrapped.AbsolutePosition; local mp=Sec._window._main.AbsolutePosition; local y=wp.Y-mp.Y+Wrapped.AbsoluteSize.Y+6; local x=wp.X-mp.X; local mw=Sec._window._main.AbsoluteSize.X; if x+280>mw then x=mw-290 end; Pop.Position=UDim2.fromOffset(math.max(8,x),math.max(8,y))
+        local wp=Wrapped.AbsolutePosition; local mp=Sec._window._main.AbsolutePosition; local scale=math.max(Sec._window._uiscale.Scale,0.01)
+        local mainSize=Sec._window._main.AbsoluteSize/scale; local popSize=Pop.AbsoluteSize/scale
+        local y=(wp.Y-mp.Y)/scale+Wrapped.AbsoluteSize.Y/scale+6; local x=(wp.X-mp.X)/scale
+        if x+popSize.X>mainSize.X-8 then x=mainSize.X-popSize.X-8 end
+        if y+popSize.Y>mainSize.Y-8 then y=(wp.Y-mp.Y)/scale-popSize.Y-6 end
+        Pop.Position=UDim2.fromOffset(math.clamp(x,8,math.max(8,mainSize.X-popSize.X-8)),math.clamp(y,8,math.max(8,mainSize.Y-popSize.Y-8)))
     end
     local follow
     Preview.MouseButton1Click:Connect(function() Pop.Visible=not Pop.Visible; if Pop.Visible then placePop(); if follow then follow:Disconnect() end; follow=RS.RenderStepped:Connect(placePop) elseif follow then follow:Disconnect(); follow=nil end end)
     if cfg.Flag then Sec._lib:RegisterState(cfg.Flag,function() return ColorToHex(color) end,function(v,silent) local c2=HexToColor(v); if c2 then h,sat,val=c2:ToHSV(); RefreshPicker(not silent) end end) end
-    local Element={Instance=Wrapped}
+    local Element=setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab}, ElementMethods)
+    Element:InitFavorite()
     function Element:Set(c2) if typeof(c2)=="Color3" then h,sat,val=c2:ToHSV(); RefreshPicker(true) end end
     function Element:Get() return color end
     function Element:Open() Pop.Visible=true; placePop() end
     function Element:Close() Pop.Visible=false; if follow then follow:Disconnect(); follow=nil end end
-    function Element:Destroy() if follow then follow:Disconnect() end; Pop:Destroy(); Wrapped:Destroy() end
+    function Element:Destroy() if follow then follow:Disconnect() end; if pickerMove then pickerMove:Disconnect() end; if pickerEnd then pickerEnd:Disconnect() end; Pop:Destroy(); Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
     RefreshPicker(false)
     return Element
@@ -3283,7 +4165,7 @@ end
 
 function L:CreateKeybind(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local key = cfg.Default or Enum.KeyCode.E
     local Wrapped = Instance.new("Frame")
@@ -3317,32 +4199,76 @@ function L:CreateKeybind(cfg)
     local Kc = Instance.new("UICorner"); Kc.CornerRadius = UDim.new(0,8); Kc.Parent = KBtn
     local Ks = Instance.new("UIStroke"); Ks.Color = C.Stroke; Ks.Thickness = 1; Ks.Transparency = 0.4; Ks.Parent = KBtn
     local listening = false
+    local modifiers = type(cfg.Modifiers)=="table" and table.clone(cfg.Modifiers) or {}
+    local function formatKey()
+        local parts={}
+        if modifiers.Control then table.insert(parts,"Ctrl") end
+        if modifiers.Shift then table.insert(parts,"Shift") end
+        if modifiers.Alt then table.insert(parts,"Alt") end
+        table.insert(parts,key.Name)
+        return table.concat(parts,"+")
+    end
+    KBtn.Text=formatKey()
     KBtn.MouseButton1Click:Connect(function()
         listening = true
+        modifiers = {
+            Control=UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl),
+            Shift=UIS:IsKeyDown(Enum.KeyCode.LeftShift) or UIS:IsKeyDown(Enum.KeyCode.RightShift),
+            Alt=UIS:IsKeyDown(Enum.KeyCode.LeftAlt) or UIS:IsKeyDown(Enum.KeyCode.RightAlt)
+        }
         KBtn.Text = "..."
         TweenService:Create(Ks, T_OUT, {Color=C.Accent, Transparency=0}):Play()
     end)
     local keyConnection=UIS.InputBegan:Connect(function(i,gp)
-        if gp or not listening then return end
-        if i.UserInputType==Enum.UserInputType.Keyboard and i.KeyCode~=Enum.KeyCode.Unknown then
-            key=i.KeyCode; KBtn.Text=key.Name; listening=false
+        if i.UserInputType~=Enum.UserInputType.Keyboard then return end
+        if listening and i.KeyCode==Enum.KeyCode.Escape then
+            listening=false; KBtn.Text=formatKey()
             TweenService:Create(Ks,T_OUT,{Color=C.Stroke,Transparency=0.4}):Play()
-            if cfg.Callback then pcall(cfg.Callback,key) end
-            if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
+            return
+        end
+        if listening and not gp and i.KeyCode~=Enum.KeyCode.Unknown then
+            local code=i.KeyCode
+            if code==Enum.KeyCode.LeftControl or code==Enum.KeyCode.RightControl then modifiers.Control=true
+            elseif code==Enum.KeyCode.LeftShift or code==Enum.KeyCode.RightShift then modifiers.Shift=true
+            elseif code==Enum.KeyCode.LeftAlt or code==Enum.KeyCode.RightAlt then modifiers.Alt=true
+            else key=code; listening=false; KBtn.Text=formatKey(); TweenService:Create(Ks,T_OUT,{Color=C.Stroke,Transparency=0.4}):Play(); if cfg.OnChanged then pcall(cfg.OnChanged,key,modifiers) end; if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end end
+            if listening then local prefix={}; if modifiers.Control then table.insert(prefix,"Ctrl") end; if modifiers.Shift then table.insert(prefix,"Shift") end; if modifiers.Alt then table.insert(prefix,"Alt") end; KBtn.Text=#prefix>0 and table.concat(prefix,"+").."+..." or "..." end
+        elseif not gp and not listening and key==i.KeyCode then
+            local ctrl=UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl)
+            local shift=UIS:IsKeyDown(Enum.KeyCode.LeftShift) or UIS:IsKeyDown(Enum.KeyCode.RightShift)
+            local alt=UIS:IsKeyDown(Enum.KeyCode.LeftAlt) or UIS:IsKeyDown(Enum.KeyCode.RightAlt)
+            if ctrl==(modifiers.Control==true) and shift==(modifiers.Shift==true) and alt==(modifiers.Alt==true) and cfg.Callback then pcall(cfg.Callback,key,modifiers) end
         end
     end)
     table.insert(Sec._lib._connections,keyConnection)
-    local Element = {Instance=Wrapped}
-    function Element:Set(k) key = k; KBtn.Text = k.Name end
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab}, ElementMethods)
+    Element:InitFavorite()
+    function Element:Set(k)
+        if type(k)=="table" then modifiers=table.clone(k.Modifiers or {}); k=k.Key end
+        if type(k)=="string" then k=Enum.KeyCode[k] end
+        if typeof(k)=="EnumItem" and k.EnumType==Enum.KeyCode then key=k; KBtn.Text=formatKey() end
+    end
     function Element:Get() return key end
+    function Element:GetCombo() return {Key=key,Modifiers=table.clone(modifiers)} end
     function Element:Destroy()
         listening=false
         if keyConnection then pcall(function() keyConnection:Disconnect() end); keyConnection=nil end
         Wrapped:Destroy()
     end
+    if cfg.Flag then
+        Sec._lib:RegisterState(cfg.Flag,function() return {Key=key.Name,Modifiers=modifiers} end,function(v)
+            if type(v)=="table" then
+                modifiers=type(v.Modifiers)=="table" and table.clone(v.Modifiers) or {}
+                local mapped=type(v.Key)=="string" and Enum.KeyCode[v.Key] or v.Key
+                if typeof(mapped)=="EnumItem" and mapped.EnumType==Enum.KeyCode then key=mapped; KBtn.Text=formatKey() end
+            else Element:Set(v) end
+        end)
+    end
     Sec:_AddElement(Wrapped)
     return Element
 end
+
+function L:CreateHotkeyCombo(cfg) return self:CreateKeybind(cfg) end
 
 function L:CreateBind(cfg)
     return self:CreateKeybind(cfg)
@@ -3350,7 +4276,7 @@ end
 
 function L:CreateProgress(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local Wrapped = Instance.new("Frame")
     Wrapped.Size = UDim2.new(1,0,0,44)
@@ -3393,14 +4319,16 @@ function L:CreateProgress(cfg)
     Fill.Parent = Bar
     local Fc = Instance.new("UICorner"); Fc.CornerRadius = UDim.new(1,0); Fc.Parent = Fill
     local initialProgress = tonumber(cfg.Default or 0) or 0
-    local Element = {Instance=Wrapped}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab}, ElementMethods)
+    Element:InitFavorite()
     function Element:Set(v)
-        v = math.clamp(v, 0, 100)
-        if v > 1 then v = v / 100 end
-        TweenService:Create(Fill, T_OUT, {Size=UDim2.new(v,0,1,0)}):Play()
-        ValL.Text = math.floor(v*100).."%"
+        v = math.clamp(tonumber(v) or 0, 0, 100)
+        local fraction = v / 100
+        TweenService:Create(Fill, T_OUT, {Size=UDim2.new(fraction,0,1,0)}):Play()
+        ValL.Text = math.floor(v+0.5).."%"
         if cfg.Callback then pcall(cfg.Callback, v) end
     end
+    function Element:Get() return tonumber(ValL.Text:match("[%d%.]+")) or 0 end
     function Element:Destroy() Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
     if initialProgress > 0 then Element:Set(initialProgress) end
@@ -3409,7 +4337,7 @@ end
 
 function L:CreateImage(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local Wrapped = Instance.new("Frame")
     Wrapped.Size = UDim2.new(1,0,0, cfg.Height or 120)
@@ -3425,7 +4353,8 @@ function L:CreateImage(cfg)
     Img.Image = cfg.Image or ""
     Img.ScaleType = Enum.ScaleType.Fit
     Img.Parent = Wrapped
-    local Element = {Instance=Wrapped}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab}, ElementMethods)
+    Element:InitFavorite()
     function Element:Set(i) Img.Image = i end
     function Element:Destroy() Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
@@ -3459,7 +4388,8 @@ function L:CreateSearch(cfg)
     Box:GetPropertyChangedSignal("Text"):Connect(function()
         if cfg.Callback then pcall(cfg.Callback, Box.Text) end
     end)
-    local Element = {Instance=Wrapped}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab}, ElementMethods)
+    Element:InitFavorite()
     function Element:Get() return Box.Text end
     function Element:Destroy() Wrapped:Destroy() end
     return Element
@@ -3467,7 +4397,7 @@ end
 
 function L:CreateMiniTabs(cfg)
     local Sec = self
-    local C = Sec._window.C
+    local C = Sec.C or Sec._window.C
     cfg = cfg or {}
     local tabs = cfg.Tabs or {"Tab 1", "Tab 2"}
     local activeIdx = 1
@@ -3516,7 +4446,8 @@ function L:CreateMiniTabs(cfg)
         end)
         table.insert(Buttons, B)
     end
-    local Element = {Instance=Wrapped}
+    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab}, ElementMethods)
+    Element:InitFavorite()
     function Element:SetActive(i) activeIdx = i; Refresh() end
     function Element:GetActive() return activeIdx, tabs[activeIdx] end
     function Element:Destroy() Wrapped:Destroy() end
@@ -3527,6 +4458,7 @@ end
 function L:CreateGlobalSearch(cfg)
     cfg = cfg or {}
     local Win = self._window
+    if not Win or Win._destroyed then return nil end
     local C = Win.C
     local items = cfg.Items or {}
     local gui = Instance.new("ScreenGui")
@@ -3536,6 +4468,9 @@ function L:CreateGlobalSearch(cfg)
     gui.IgnoreGuiInset = true
     if PROT then pcall(PROT, gui) end
     gui.Parent = GetHui()
+    Win._auxGuis = Win._auxGuis or {}
+    table.insert(Win._auxGuis, gui)
+    if cfg.StartHidden then gui.Enabled = false end
     local Overlay = Instance.new("TextButton")
     Overlay.Size = UDim2.new(1,0,1,0)
     Overlay.BackgroundColor3 = C.Overlay
@@ -3589,7 +4524,9 @@ function L:CreateGlobalSearch(cfg)
         if q == "" then Results.Visible = false; return end
         Results.Visible = true
         for _, item in ipairs(items) do
-            if item.Name:lower():find(q, 1, true) or (item.Tab and item.Tab:lower():find(q, 1, true)) then
+            local itemName=tostring(item.Name or item.Title or "Action")
+            local itemTab=tostring(item.Tab or "")
+            if itemName:lower():find(q, 1, true) or itemTab:lower():find(q, 1, true) then
                 local B = Instance.new("TextButton")
                 B.Size = UDim2.new(1,-4,0,34)
                 B.BackgroundColor3 = C.Card
@@ -3602,7 +4539,7 @@ function L:CreateGlobalSearch(cfg)
                 Lb.Size = UDim2.new(1,-100,1,0)
                 Lb.Position = UDim2.new(0,10,0,0)
                 Lb.BackgroundTransparency = 1
-                Lb.Text = item.Name
+                Lb.Text = itemName
                 Lb.Font = Enum.Font[L.CurrentFontMedium]
                 Lb.TextSize = 12
                 Lb.TextColor3 = C.Text
@@ -3612,7 +4549,7 @@ function L:CreateGlobalSearch(cfg)
                 Tb.Size = UDim2.new(0,90,1,0)
                 Tb.Position = UDim2.new(1,-100,0,0)
                 Tb.BackgroundTransparency = 1
-                Tb.Text = item.Tab or ""
+                Tb.Text = itemTab
                 Tb.Font = Enum.Font[L.CurrentFont]
                 Tb.TextSize = 10
                 Tb.TextColor3 = C.TextFaint
@@ -3626,7 +4563,40 @@ function L:CreateGlobalSearch(cfg)
         end
     end
     Input:GetPropertyChangedSignal("Text"):Connect(Search)
-    Input:CaptureFocus()
+    if not cfg.StartHidden then Input:CaptureFocus() end
+    if cfg.StartHidden then
+        local ctrlKey = cfg.Modifier or Enum.KeyCode.LeftControl
+        local paletteKey = cfg.Hotkey or Enum.KeyCode.K
+        Win:_Connect(UIS.InputBegan, function(input, processed)
+            if processed then return end
+            if input.KeyCode == paletteKey and (UIS:IsKeyDown(ctrlKey) or UIS:IsKeyDown(Enum.KeyCode.RightControl)) then
+                gui.Enabled = not gui.Enabled
+                if gui.Enabled then Input:CaptureFocus() else Input:ReleaseFocus() end
+            elseif input.KeyCode == Enum.KeyCode.Escape and gui.Enabled then
+                gui.Enabled = false
+                Input:ReleaseFocus()
+            end
+        end)
+    end
+    return gui
+end
+
+function L:CreateCommandPalette(cfg)
+    cfg = cfg or {}
+    local win=self._window or (self._main and self)
+    if win and win._commandPalette and win._commandPalette.Parent then win._commandPalette:Destroy() end
+    cfg.StartHidden = true
+    cfg.Placeholder = cfg.Placeholder or "Search actions... (Ctrl+K)"
+    cfg.Items=cfg.Items or {}
+    if cfg.IncludeFavorites~=false then
+        for id,item in pairs(self._favoriteItems or {}) do
+            if self:IsFavorite(id) then
+                table.insert(cfg.Items,{Name="★ "..item.Name,Tab=item.Tab and item.Tab._name or "Favorites",Callback=function() if item.Tab and item.Tab._window then item.Tab._window:SelectTab(item.Tab) end end})
+            end
+        end
+    end
+    local gui=self:CreateGlobalSearch(cfg)
+    if win then win._commandPalette=gui end
     return gui
 end
 
@@ -3639,13 +4609,16 @@ local function MakeModalBase(lib, name, width, height)
     gui.IgnoreGuiInset = true
     if PROT then pcall(PROT, gui) end
     gui.Parent = GetHui()
+    lib._auxGuis = lib._auxGuis or {}
+    table.insert(lib._auxGuis, gui)
+    if lib._window then lib._window._auxGuis=lib._window._auxGuis or {}; table.insert(lib._window._auxGuis,gui) end
     local Back = Instance.new("TextButton")
     Back.Size=UDim2.new(1,0,1,0); Back.BackgroundColor3=C.Overlay; Back.BackgroundTransparency=0.26; Back.BorderSizePixel=0; Back.Text=""; Back.AutoButtonColor=false; Back.Parent=gui
     local Card = Instance.new("Frame")
     Card.Size=UDim2.new(0,width,0,height); Card.Position=UDim2.new(.5,-width/2,.5,-height/2); Card.BackgroundColor3=C.Surface; Card.BorderSizePixel=0; Card.Parent=gui
     local Cc=Instance.new("UICorner"); Cc.CornerRadius=UDim.new(0,18); Cc.Parent=Card
     local Cs=Instance.new("UIStroke"); Cs.Color=C.Stroke; Cs.Thickness=1; Cs.Transparency=.05; Cs.Parent=Card
-    local Top=Instance.new("Frame"); Top.Size=UDim2.new(1,-28,0,3); Top.Position=UDim2.new(0,14,0,0); Top.BackgroundColor3=C.Accent; Top.BorderSizePixel=0; Top.Parent=Card; local Tc=Instance.new("UICorner"); Tc.CornerRadius=UDim.new(1,0); Tc.Parent=Top
+    local Top=Instance.new("Frame"); Top.Size=UDim2.new(1,-32,0,3); Top.Position=UDim2.new(0,16,0,2); Top.BackgroundColor3=C.Accent; Top.BorderSizePixel=0; Top.Parent=Card; local Tc=Instance.new("UICorner"); Tc.CornerRadius=UDim.new(1,0); Tc.Parent=Top
     local Icon=Instance.new("Frame"); Icon.Size=UDim2.new(0,42,0,42); Icon.Position=UDim2.new(0,20,0,20); Icon.BackgroundColor3=C.Card; Icon.BorderSizePixel=0; Icon.Parent=Card; local Ic=Instance.new("UICorner"); Ic.CornerRadius=UDim.new(0,12); Ic.Parent=Icon
     local It=Instance.new("TextLabel"); It.Size=UDim2.new(1,0,1,0); It.BackgroundTransparency=1; It.Text="?"; It.Font=Enum.Font.GothamBold; It.TextSize=18; It.TextColor3=C.Accent; It.Parent=Icon
     local Title=Instance.new("TextLabel"); Title.Size=UDim2.new(1,-90,0,24); Title.Position=UDim2.new(0,78,0,22); Title.BackgroundTransparency=1; Title.Font=Enum.Font[lib.CurrentFontBold]; Title.TextSize=16; Title.TextColor3=C.Text; Title.TextXAlignment=Enum.TextXAlignment.Left; Title.Parent=Card
@@ -3670,7 +4643,9 @@ function L:Confirm(cfg)
     Cancel.MouseButton1Click:Connect(function() finish(false) end)
     Confirm.MouseButton1Click:Connect(function() finish(true) end)
     Back.MouseButton1Click:Connect(function() if cfg.CloseOnBackdrop ~= false then finish(false) end end)
-    while not done do task.wait() end
+    local deadline = os.clock() + math.max(1,tonumber(cfg.Timeout) or 180)
+    while not done and gui.Parent and os.clock() < deadline do task.wait(0.05) end
+    if not done and gui.Parent then gui:Destroy() end
     return result
 end
 
@@ -3690,7 +4665,9 @@ function L:Prompt(cfg)
     Confirm.MouseButton1Click:Connect(function() finish(Input.Text) end)
     Back.MouseButton1Click:Connect(function() if cfg.CloseOnBackdrop ~= false then finish(nil) end end)
     task.defer(function() pcall(function() Input:CaptureFocus() end) end)
-    while not done do task.wait() end
+    local deadline = os.clock() + math.max(1,tonumber(cfg.Timeout) or 180)
+    while not done and gui.Parent and os.clock() < deadline do task.wait(0.05) end
+    if not done and gui.Parent then gui:Destroy() end
     return result
 end
 
@@ -3704,9 +4681,9 @@ end
 
 function L:SaveProfile(name,data)
     name=SafeProfileName(name); if not name then return false end
-    local file="library_profile_"..name..".json"
-    JsonWrite(file, data or self:CaptureConfig())
+    self:SaveConfig(name, data)
     local idx = JsonRead("library_profiles_index.json", {names={}})
+    idx.names = type(idx.names) == "table" and idx.names or {}
     local found = false
     for _, n in ipairs(idx.names or {}) do if n == name then found = true; break end end
     if not found then
@@ -3719,14 +4696,15 @@ end
 
 function L:LoadProfile(name)
     name=SafeProfileName(name); if not name then return nil end
-    local data=JsonRead("library_profile_"..name..".json",nil)
+    local data=JsonRead("library_config_"..name..".json",nil) or JsonRead("library_profile_"..name..".json",nil)
     if type(data)=="table" then
-        self._loadingConfig=true
-        for flag,value in pairs(data.values or data) do
-            local entry=self._state[flag]
-            if entry and entry.Set then pcall(entry.Set,value,true) end
+        local loaded = self:LoadConfig(name, true)
+        if not loaded then
+            local previous = self._loadingConfig
+            self._loadingConfig=true
+            pcall(function() for flag,value in pairs(data.values or data) do local entry=self._state[flag]; if entry and entry.Set then entry.Set(value,true) end end end)
+            self._loadingConfig=previous
         end
-        self._loadingConfig=false
         self.Profiles._current=name
     end
     return data
@@ -3734,8 +4712,7 @@ end
 
 function L:DeleteProfile(name)
     name=SafeProfileName(name); if not name then return false end
-    local file="library_profile_"..name..".json"
-    if DF and ISF and ISF(file) then pcall(DF, file) end
+    for _,file in ipairs({"library_profile_"..name..".json","library_config_"..name..".json"}) do if DF and ISF and ISF(file) then pcall(DF, file) end end
     local idx = JsonRead("library_profiles_index.json", {names={}})
     for i, n in ipairs(idx.names or {}) do
         if n == name then table.remove(idx.names, i); break end
@@ -3802,12 +4779,18 @@ function L:LoadConfig(name, silent)
     if not name then return false end
     local data = JsonRead("library_config_"..name..".json", nil)
     if type(data) ~= "table" then return false end
+    self:PushConfigUndoPoint()
+    local wasLoading = self._loadingConfig
     self._loadingConfig = true
-    for flag, value in pairs(data.values or data) do
-        local entry = self._state[flag]
-        if entry and entry.Set then pcall(entry.Set, value, silent ~= false) end
-    end
-    self._loadingConfig = false
+    local ok, err = pcall(function()
+        for flag, value in pairs(data.values or data) do
+            local entry = self._state[flag]
+            if entry and entry.Set then entry.Set(value, silent ~= false) end
+        end
+    end)
+    self._loadingConfig = wasLoading
+    if not ok then warn("[VNC-Lib] Config load stopped: "..tostring(err)); return false end
+    self._lastHistorySnapshot=self:CaptureConfig()
     self.Config.LastConfig = name
     return true
 end
