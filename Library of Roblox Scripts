@@ -1,6 +1,6 @@
 local L = {}
 L.__index = L
-L.Version = "6.5.0"
+L.Version = "6.7.0"
 L._iconAnimationHandles = {}
 L._iconAnimationByImage = setmetatable({}, {__mode="k"})
 local SplashGui = nil
@@ -313,7 +313,19 @@ local function TrackAuxGui(lib,win,gui)
     if ownerWindow then
         ownerWindow._auxGuis=ownerWindow._auxGuis or {}; table.insert(ownerWindow._auxGuis,gui)
         ownerWindow._accentTargetsDirty=true
-        gui.DescendantAdded:Connect(function() ownerWindow._accentTargetsDirty=true end)
+        gui.DescendantAdded:Connect(function(object)
+            ownerWindow._accentTargetsDirty=true
+            local applyTextScale=ownerWindow._applyTextScaleObject
+            if type(applyTextScale)=="function" then
+                task.defer(function()
+                    if object.Parent and not ownerWindow._destroyed then applyTextScale(object) end
+                end)
+            end
+        end)
+        local applyTextScale=ownerWindow._applyTextScaleObject
+        if type(applyTextScale)=="function" then
+            for _,object in ipairs(gui:GetDescendants()) do applyTextScale(object) end
+        end
     end
     local removed=false
     local function removeReferences()
@@ -1396,12 +1408,37 @@ function L:CreateSoundBox(cfg)
         else importPlaylist.Text="No IDs"; task.delay(1.5,function() if importPlaylist.Parent then importPlaylist.Text="Add" end end) end
     end)
     refresh()
-    return {Instance=panel,Gui=gui,Panel=panel,Search=query,Results=results,Close=closeGui,
-        Play=function(id,ch,opts) local options=type(opts)=="table" and table.clone(opts) or {}; options.Track=true; return self:PlaySoundAsset(id,ch,options) end,
-        Pause=function() return self:PauseSound() end,Resume=function() return self:ResumeSound() end,Stop=function(fade) return self:StopSound(fade) end,
-        Seek=function(seconds) local sound=self._activeSound or self._pausedSound; if sound and sound.Parent and sound.TimeLength>0 then sound.TimePosition=math.clamp(tonumber(seconds) or 0,0,math.max(0,sound.TimeLength)); return true end return false end,
-        SetLooped=function(_,value) looped=value==true; loop.Text=looped and "Loop: On" or "Loop: Off"; return looped end,
-        GetPlayback=function() local sound=self._activeSound or self._pausedSound; return sound and sound.Parent and {Position=sound.TimePosition,Length=sound.TimeLength,Playing=sound.IsPlaying,Paused=sound==self._pausedSound} or nil end}
+    local soundBoxHandle={Instance=panel,Gui=gui,Panel=panel,Search=query,Results=results,Close=closeGui}
+    soundBoxHandle.Play=function(first,second,third,fourth)
+        local id,ch,opts
+        if first==soundBoxHandle then id,ch,opts=second,third,fourth else id,ch,opts=first,second,third end
+        local options=type(opts)=="table" and table.clone(opts) or {}; options.Track=true
+        return self:PlaySoundAsset(id,ch,options)
+    end
+    soundBoxHandle.Pause=function() return self:PauseSound() end
+    soundBoxHandle.Resume=function() return self:ResumeSound() end
+    soundBoxHandle.Stop=function(first,second)
+        local fade=first
+        if first==soundBoxHandle then fade=second end
+        return self:StopSound(fade)
+    end
+    soundBoxHandle.Seek=function(first,second)
+        local seconds=first
+        if first==soundBoxHandle then seconds=second end
+        local sound=self._activeSound or self._pausedSound
+        if sound and sound.Parent and sound.TimeLength>0 then sound.TimePosition=math.clamp(tonumber(seconds) or 0,0,math.max(0,sound.TimeLength)); return true end
+        return false
+    end
+    soundBoxHandle.SetLooped=function(first,second)
+        looped=(first==soundBoxHandle and second or first)==true
+        loop.Text=looped and "Loop: On" or "Loop: Off"
+        return looped
+    end
+    soundBoxHandle.GetPlayback=function()
+        local sound=self._activeSound or self._pausedSound
+        return sound and sound.Parent and {Position=sound.TimePosition,Length=sound.TimeLength,Playing=sound.IsPlaying,Paused=sound==self._pausedSound} or nil
+    end
+    return soundBoxHandle
 end
 
 function L:CreateSoundLibrary(cfg) return self:CreateSoundBox(cfg) end
@@ -2208,7 +2245,7 @@ function L:Notify(cfg)
     Cb.Size = UDim2.new(0,20,0,20)
     Cb.Position = UDim2.new(1,-24,0,8)
     Cb.BackgroundTransparency = 1
-    Cb.Text = "X"
+    Cb.Text = "×"
     Cb.TextColor3 = C.TextFaint
     Cb.Font = Enum.Font.GothamBold
     Cb.TextSize = 12
@@ -2643,22 +2680,33 @@ function L:PlayTransition(name, target, direction, cfg)
     direction=direction=="out" and "out" or "in"
     cfg=type(cfg)=="table" and cfg or {}
     local hook=self.Sounds and self.Sounds.transitionHooks and self.Sounds.transitionHooks[name]
-    if hook and hook~="" then self:PlaySoundAsset(hook,"Transitions") end
+    if hook and hook~="" then
+        local soundOwner=self._lib or self
+        soundOwner._transitionSoundAt=soundOwner._transitionSoundAt or {}
+        local now=os.clock()
+        if now-(soundOwner._transitionSoundAt[name] or 0)>=0.05 then
+            soundOwner._transitionSoundAt[name]=now
+            self:PlaySoundAsset(hook,"Transitions")
+        end
+    end
     self._activeTransitions=self._activeTransitions or setmetatable({}, {__mode="k"})
     local previous=self._activeTransitions[target]
     if previous then for _,tween in ipairs(previous.Tweens) do pcall(function() tween:Cancel() end) end end
-    local entry={Tweens={}}
+    local entry={Tweens={},OriginalBackgroundColor=previous and previous.OriginalBackgroundColor or target.BackgroundColor3}
     self._activeTransitions[target]=entry
     local home=target:GetAttribute("__HomePos")
     local homeSize=target:GetAttribute("__HomeSize")
+    local homeRotation=target:GetAttribute("__HomeRotation")
     if not previous or not home or not homeSize or target:GetAttribute("__HomeDirty")==true then
         home=cfg.HomePosition or target.Position; homeSize=cfg.HomeSize or target.Size
-        target:SetAttribute("__HomePos",home); target:SetAttribute("__HomeSize",homeSize); target:SetAttribute("__HomeDirty",false)
+        homeRotation=ClampNumber(cfg.HomeRotation,target.Rotation,-3600,3600)
+        target:SetAttribute("__HomePos",home); target:SetAttribute("__HomeSize",homeSize); target:SetAttribute("__HomeRotation",homeRotation); target:SetAttribute("__HomeDirty",false)
     end
     if typeof(home)~="UDim2" then home=target.Position end
     if typeof(homeSize)~="UDim2" then homeSize=target.Size end
+    if type(homeRotation)~="number" or homeRotation~=homeRotation or homeRotation==math.huge or homeRotation==-math.huge then homeRotation=target.Rotation end
     if self:GetReducedMotion() then
-        target.Position=home; target.Size=homeSize; target.Rotation=0
+        target.Position=home; target.Size=homeSize; target.Rotation=homeRotation
         if target:IsA("CanvasGroup") then target.GroupTransparency=direction=="in" and 0 or 1 end
         self._activeTransitions[target]=nil
         return true
@@ -2673,27 +2721,35 @@ function L:PlayTransition(name, target, direction, cfg)
     local offset=typeof(cfg.Offset)=="UDim2" and cfg.Offset or def.offset
     local scale=typeof(cfg.Scale)=="UDim2" and cfg.Scale or def.scale
     local rotation=ClampNumber(cfg.Rotation,ClampNumber(def.rotation,0,-3600,3600),-3600,3600)
+    if cfg.Spin==true then rotation+=360
+    elseif type(cfg.Spin)=="number" then rotation+=ClampNumber(cfg.Spin,0,-3600,3600) end
+    local colorShift=typeof(cfg.ColorShift)=="Color3" and cfg.ColorShift or (cfg.ColorShift==true and self.C and self.C.Accent or nil)
     if direction=="in" then
-        target.Position=home; target.Size=homeSize; target.Rotation=0
+        target.Position=home; target.Size=homeSize; target.Rotation=homeRotation
+        if colorShift then target.BackgroundColor3=colorShift end
         if target:IsA("CanvasGroup") then target.GroupTransparency=1 end
         local startPosition,startSize=home,homeSize
         if typeof(offset)=="UDim2" then startPosition=UDim2.new(home.X.Scale+offset.X.Scale,home.X.Offset+offset.X.Offset,home.Y.Scale+offset.Y.Scale,home.Y.Offset+offset.Y.Offset) end
         if typeof(scale)=="UDim2" then startSize=UDim2.new(homeSize.X.Scale+scale.X.Scale,homeSize.X.Offset+scale.X.Offset,homeSize.Y.Scale+scale.Y.Scale,homeSize.Y.Offset+scale.Y.Offset) end
-        target.Position=startPosition; target.Size=startSize; target.Rotation=rotation
+        target.Position=startPosition; target.Size=startSize; target.Rotation=homeRotation+rotation
         local info=TweenInfo.new(duration,style,easingDirection)
-        tween({Position=home,Size=homeSize,Rotation=0},info)
+        tween({Position=home,Size=homeSize,Rotation=homeRotation,BackgroundColor3=entry.OriginalBackgroundColor},info)
         if target:IsA("CanvasGroup") then tween({GroupTransparency=0},info) end
     else
         local endPosition,endSize=home,homeSize
         if typeof(offset)=="UDim2" then endPosition=UDim2.new(home.X.Scale+offset.X.Scale,home.X.Offset+offset.X.Offset,home.Y.Scale+offset.Y.Scale,home.Y.Offset+offset.Y.Offset) end
         if typeof(scale)=="UDim2" then endSize=UDim2.new(homeSize.X.Scale+scale.X.Scale,homeSize.X.Offset+scale.X.Offset,homeSize.Y.Scale+scale.Y.Scale,homeSize.Y.Offset+scale.Y.Offset) end
         local info=TweenInfo.new(duration*0.8,style,D.In)
-        tween({Position=endPosition,Size=endSize,Rotation=rotation},info)
+        tween({Position=endPosition,Size=endSize,Rotation=homeRotation+rotation},info)
+        if colorShift then tween({BackgroundColor3=colorShift},info) end
         if target:IsA("CanvasGroup") then tween({GroupTransparency=1},info) end
     end
     task.delay(duration+0.35,function()
         if self._activeTransitions[target]~=entry then return end
-        if direction=="out" and target.Parent then target.Position=home; target.Size=homeSize; target.Rotation=0 end
+        if direction=="out" and target.Parent then
+            target.Position=home; target.Size=homeSize; target.Rotation=homeRotation
+            if colorShift then target.BackgroundColor3=entry.OriginalBackgroundColor end
+        end
         self._activeTransitions[target]=nil
     end)
     return true
@@ -2779,13 +2835,18 @@ function L:RemoveTransition(name)
 end
 
 L.UIScale = JsonRead("library_uiscale.json", {global=1, per={}})
+local uiScaleSaveToken=0
 
 function L:SetUIScale(value, key)
     self.UIScale = type(self.UIScale) == "table" and self.UIScale or {global=1,per={}}
     self.UIScale.per = type(self.UIScale.per) == "table" and self.UIScale.per or {}
     value = ClampNumber(value,1,0.5,2)
     if key then self.UIScale.per[key] = value else self.UIScale.global = value end
-    JsonWrite("library_uiscale.json", self.UIScale)
+    uiScaleSaveToken+=1
+    local saveToken=uiScaleSaveToken
+    task.delay(0.25,function()
+        if saveToken==uiScaleSaveToken then JsonWrite("library_uiscale.json", self.UIScale) end
+    end)
     for _, win in ipairs(self._allWindows or {}) do if win and not win._destroyed then win:_ApplyUIScale() end end
     return value
 end
@@ -3354,7 +3415,9 @@ function L:CreateWindow(cfg)
     TabsHolder.Position = UDim2.new(0,4,0,4)
     TabsHolder.BackgroundTransparency = 1
     TabsHolder.BorderSizePixel = 0
-    TabsHolder.ScrollBarThickness = 0
+    TabsHolder.ScrollBarThickness = 4
+    TabsHolder.ScrollBarImageColor3 = C.Accent
+    TabsHolder.ScrollBarImageTransparency = 0.25
     TabsHolder.CanvasSize = UDim2.new(0,0,0,0)
     TabsHolder.AutomaticCanvasSize = Enum.AutomaticSize.Y
     TabsHolder.Parent = Sidebar
@@ -3367,6 +3430,40 @@ function L:CreateWindow(cfg)
     Tp.PaddingLeft = UDim.new(0,6)
     Tp.PaddingRight = UDim.new(0,6)
     Tp.Parent = TabsHolder
+    local TabSearch = Instance.new("TextBox")
+    TabSearch.Name = "TabSearch"
+    TabSearch.Size = UDim2.new(1,-8,0,28)
+    TabSearch.Position = UDim2.new(0,4,0,4)
+    TabSearch.BackgroundColor3 = C.Card
+    TabSearch.TextColor3 = C.Text
+    TabSearch.PlaceholderColor3 = C.TextFaint
+    TabSearch.PlaceholderText = "Search tabs..."
+    TabSearch.Text = ""
+    TabSearch.ClearTextOnFocus = false
+    TabSearch.Font = Enum.Font.Gotham
+    TabSearch.TextSize = 10
+    TabSearch.TextXAlignment = Enum.TextXAlignment.Left
+    TabSearch.BorderSizePixel = 0
+    TabSearch.Visible = false
+    TabSearch.Parent = Sidebar
+    local TabSearchCorner = Instance.new("UICorner")
+    TabSearchCorner.CornerRadius = UDim.new(0,8)
+    TabSearchCorner.Parent = TabSearch
+    local TabSearchPadding = Instance.new("UIPadding")
+    TabSearchPadding.PaddingLeft = UDim.new(0,9)
+    TabSearchPadding.PaddingRight = UDim.new(0,7)
+    TabSearchPadding.Parent = TabSearch
+    local TabSearchEmpty = Instance.new("TextLabel")
+    TabSearchEmpty.Name = "TabSearchEmpty"
+    TabSearchEmpty.Size = UDim2.new(1,-16,0,24)
+    TabSearchEmpty.Position = UDim2.new(0,8,0,40)
+    TabSearchEmpty.BackgroundTransparency = 1
+    TabSearchEmpty.Text = "No tabs found"
+    TabSearchEmpty.TextColor3 = C.TextFaint
+    TabSearchEmpty.Font = Enum.Font.Gotham
+    TabSearchEmpty.TextSize = 10
+    TabSearchEmpty.Visible = false
+    TabSearchEmpty.Parent = Sidebar
     local Content = Instance.new("Frame")
     Content.Size = UDim2.new(1,-(cfg.TabWidth or 170)-20,1,-96)
     Content.Position = UDim2.new(0,(cfg.TabWidth or 170)+16,0,58)
@@ -3398,14 +3495,29 @@ function L:CreateWindow(cfg)
     StatusR.Size = UDim2.new(0.4,-74,1,0)
     StatusR.Position = UDim2.new(0.6,0,0,0)
     StatusR.BackgroundTransparency = 1
-    StatusR.Text = IS_MOBILE and "Mobile" or "RightControl"
+    local toggleKeys = {}
+    if type(cfg.ToggleKeys) == "table" then
+        for _, key in ipairs(cfg.ToggleKeys) do
+            if typeof(key) == "EnumItem" and key.EnumType == Enum.KeyCode then table.insert(toggleKeys,key) end
+        end
+    elseif typeof(cfg.ToggleKeys) == "EnumItem" and cfg.ToggleKeys.EnumType == Enum.KeyCode then
+        table.insert(toggleKeys,cfg.ToggleKeys)
+    end
+    if #toggleKeys==0 then table.insert(toggleKeys,Enum.KeyCode.RightControl) end
+    local shortcutNames={}
+    for index,key in ipairs(toggleKeys) do
+        if index<=2 then table.insert(shortcutNames,key.Name) end
+    end
+    if #toggleKeys>2 then shortcutNames[#shortcutNames+1]="+"..tostring(#toggleKeys-2) end
+    StatusR.Text = IS_MOBILE and "Mobile" or table.concat(shortcutNames," + ")
     StatusR.Font = Enum.Font.Gotham
-    StatusR.TextSize = 10
+    StatusR.TextSize = 11
     StatusR.TextColor3 = C.TextFaint
     StatusR.TextXAlignment = Enum.TextXAlignment.Right
     StatusR.Parent = StatusBar
     local Win = setmetatable({
         _lib=self, _gui=sg, _main=Main, _sidebar=Sidebar, _tabsHolder=TabsHolder,
+        _tabSearchBox=TabSearch, _tabSearchEmpty=TabSearchEmpty, _tabSearchEnabled=cfg.TabSearch~=false,
         _content=Content, _overlay=OverlayLayer, _tabs={}, _active=nil, _cfg=cfg, _mode=savedMode,
         _sizes=sizes, _uiscale=UIScaleObj, _gradient=Grad,
         _header=Header, _logo=Logo, _title=Title, _sub=Sub, _tagHolder=TagHolder, _mainStroke=Ms, _shadow=Shadow,
@@ -3417,6 +3529,86 @@ function L:CreateWindow(cfg)
     }, {__index=L})
     Win._window = Win
     Win.C = C
+    Win._textScale=ClampNumber(cfg.TextScale,1.1,0.85,1.5)
+    Win._minimumTextSize=math.floor(ClampNumber(cfg.MinimumTextSize,10,8,18)+0.5)
+    Win._textSizeRegistry=setmetatable({}, {__mode="k"})
+    local function applyWindowTextScale(object)
+        if not object or not (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) or object.TextScaled then return end
+        local registry=Win._textSizeRegistry
+        local record=registry[object]
+        if not record then
+            record={Base=object.TextSize,Scale=1,Last=object.TextSize}
+            registry[object]=record
+        elseif object.TextSize~=record.Last then
+            record.Base=object.TextSize/math.max(record.Scale,0.01)
+        end
+        local nextSize=math.max(Win._minimumTextSize,math.floor(record.Base*Win._textScale+0.5))
+        if object.TextSize~=nextSize then object.TextSize=nextSize end
+        record.Scale=Win._textScale
+        record.Last=nextSize
+    end
+    Win._applyTextScaleObject=applyWindowTextScale
+    function Win:_UpdateTabSearchLayout()
+        local box,empty,sidebar,holder=self._tabSearchBox,self._tabSearchEmpty,self._sidebar,self._tabsHolder
+        if not box or not empty or not sidebar or not holder or self._destroyed then return false end
+        local scale=math.max(self._uiscale and self._uiscale.Scale or 1,0.01)
+        local sidebarHeight=sidebar.AbsoluteSize.Y/scale
+        if sidebarHeight<=0 then return false end
+        local top=self._userInfoCard and self._userInfoCard.Instance and self._userInfoCard.Instance.Parent and 72 or 4
+        local tabCount=#(self._tabs or {})
+        local contentHeight=tabCount*42+math.max(0,tabCount-1)*Tl.Padding.Offset+Tp.PaddingTop.Offset
+        local shouldShow=self._tabSearchEnabled and contentHeight>sidebarHeight-top-8
+        box.Visible=shouldShow
+        box.Position=UDim2.new(0,4,0,top)
+        holder.Position=UDim2.new(0,4,0,top+(shouldShow and 36 or 0))
+        holder.Size=UDim2.new(1,-8,1,-(top+(shouldShow and 40 or 8)))
+        empty.Position=holder.Position
+        empty.Size=holder.Size
+        return shouldShow
+    end
+    function Win:_RefreshTabSearch()
+        local box,empty=self._tabSearchBox,self._tabSearchEmpty
+        if not box or not empty or self._destroyed then return false end
+        local query=self._tabSearchEnabled and tostring(box.Text or ""):lower() or ""
+        local firstMatch,activeMatches
+        for _,tab in ipairs(self._tabs or {}) do
+            local matches=query=="" or tostring(tab._name or ""):lower():find(query,1,true)~=nil
+            if tab._btn and tab._btn.Parent then tab._btn.Visible=matches end
+            if matches and not firstMatch then firstMatch=tab end
+            if tab==self._active then activeMatches=matches end
+        end
+        empty.Visible=query~="" and firstMatch==nil
+        self:_UpdateTabSearchLayout()
+        if not self._updatingTabFilter and activeMatches==false and firstMatch and type(self.SelectTab)=="function" then
+            self._updatingTabFilter=true
+            self:SelectTab(firstMatch)
+            self._updatingTabFilter=false
+        end
+        return firstMatch~=nil
+    end
+    Win:_Connect(TabSearch:GetPropertyChangedSignal("Text"),function() Win:_RefreshTabSearch() end)
+    Win:_Connect(Sidebar:GetPropertyChangedSignal("AbsoluteSize"),function() Win:_UpdateTabSearchLayout() end)
+    function Win:SetTextScale(scale)
+        if self._destroyed then return false end
+        self._textScale=ClampNumber(scale,1.1,0.85,1.5)
+        for _,object in ipairs(self._main:GetDescendants()) do applyWindowTextScale(object) end
+        for _,gui in ipairs(self._auxGuis or {}) do
+            if gui and gui.Parent then
+                for _,object in ipairs(gui:GetDescendants()) do applyWindowTextScale(object) end
+            end
+        end
+        for object in pairs(self._textSizeRegistry) do
+            if object.Parent then applyWindowTextScale(object) else self._textSizeRegistry[object]=nil end
+        end
+        return self._textScale
+    end
+    function Win:GetTextScale() return self._textScale end
+    for _,object in ipairs(Main:GetDescendants()) do applyWindowTextScale(object) end
+    Win:_Connect(Main.DescendantAdded,function(object)
+        task.defer(function()
+            if not Win._destroyed and object.Parent then applyWindowTextScale(object) end
+        end)
+    end)
     function Win:SetStatusText(text)
         self._statusBaseText=tostring(text or "")
         if self._statusL then
@@ -3501,6 +3693,12 @@ function L:CreateWindow(cfg)
         self._logo.BackgroundColor3 = c.Accent
         self._statusL.TextColor3 = c.TextFaint
         self._statusR.TextColor3 = c.TextFaint
+        if self._tabSearchBox then
+            self._tabSearchBox.BackgroundColor3=c.Card
+            self._tabSearchBox.TextColor3=c.Text
+            self._tabSearchBox.PlaceholderColor3=c.TextFaint
+        end
+        if self._tabSearchEmpty then self._tabSearchEmpty.TextColor3=c.TextFaint end
         local root = self._main
         local themeRevision = (self._themeRevision or 0) + 1
         self._themeRevision = themeRevision
@@ -3809,7 +4007,25 @@ function L:CreateWindow(cfg)
     end
     function Win:SelectTab(t)
         if not t or t._window ~= self or t._destroyed then return false end
-        if self._active == t then return end
+        if t._btn and not t._btn.Visible and not self._updatingTabFilter and self._tabSearchBox and self._tabSearchBox.Text~="" then
+            self._tabSearchBox.Text=""
+            self:_RefreshTabSearch()
+        end
+        local function keepSelectedTabVisible()
+            local holder,button=self._tabsHolder,t._btn
+            if not holder or not button or not holder.Parent then return end
+            local scale=math.max(self._uiscale and self._uiscale.Scale or 1,0.01)
+            local current=holder.CanvasPosition.Y
+            local top=(button.AbsolutePosition.Y-holder.AbsolutePosition.Y)/scale+current
+            local bottom=top+button.AbsoluteSize.Y/scale
+            local viewBottom=current+holder.AbsoluteSize.Y/scale
+            local nextY=current
+            if top<current then nextY=top-8
+            elseif bottom>viewBottom then nextY=bottom-holder.AbsoluteSize.Y/scale+8 end
+            local maxY=math.max(0,holder.AbsoluteCanvasSize.Y/scale-holder.AbsoluteSize.Y/scale)
+            holder.CanvasPosition=Vector2.new(0,math.clamp(nextY,0,maxY))
+        end
+        if self._active == t then keepSelectedTabVisible(); return true end
         for _, tab in ipairs(self._tabs) do
             local sel = tab == t
             local C = tab.C or self.C
@@ -3825,9 +4041,10 @@ function L:CreateWindow(cfg)
             end
         end
         self._active = t
+        keepSelectedTabVisible()
         self._lib:PlaySound("click")
+        return true
     end
-    local toggleKeys = cfg.ToggleKeys or {Enum.KeyCode.RightControl}
     Win:_Connect(UIS.InputBegan,function(i,gp)
         if gp then return end
         if i.KeyCode==Enum.KeyCode.Escape and cfg.CloseOnEscape~=false and not UIS:GetFocusedTextBox() then
@@ -3953,7 +4170,7 @@ function L:CreateUserInfoCard(cfg)
     username.Parent=root
     local idButton=Instance.new("TextButton")
     idButton.Name="CopyUserId"
-    idButton.Size=UDim2.new(1,-62,0,13)
+    idButton.Size=UDim2.new(1,-62,0,16)
     idButton.Position=UDim2.fromOffset(56,40)
     idButton.BackgroundTransparency=1
     idButton.TextColor3=C.TextFaint
@@ -3967,10 +4184,7 @@ function L:CreateUserInfoCard(cfg)
     local function restoreSidebar()
         if win._userInfoCard==handle then
             win._userInfoCard=nil
-            if tabs.Parent then
-                tabs.Position=UDim2.new(0,4,0,4)
-                tabs.Size=UDim2.new(1,-8,1,-8)
-            end
+            if tabs.Parent and win._UpdateTabSearchLayout then win:_UpdateTabSearchLayout() end
         end
     end
     root.Destroying:Connect(function() requestRevision+=1; restoreSidebar() end)
@@ -4008,6 +4222,7 @@ function L:CreateUserInfoCard(cfg)
     end
     applyPlayer(player)
     win._userInfoCard=handle
+    if win._UpdateTabSearchLayout then win:_UpdateTabSearchLayout() end
     return handle
 end
 
@@ -4265,7 +4480,13 @@ function L:CreateTab(name, icon)
         Win._accentTargetsDirty=true
         return true
     end
-    function Tab:SetName(n) self._name = n; Lb.Text = n end
+    function Tab:SetName(n)
+        if type(n)~="string" then return false end
+        self._name=n
+        Lb.Text=n
+        if Win._RefreshTabSearch then Win:_RefreshTabSearch() end
+        return true
+    end
     function Tab:Destroy()
         if self._destroyed then return end
         self._destroyed=true
@@ -4276,9 +4497,12 @@ function L:CreateTab(name, icon)
         Btn:Destroy()
         Frame:Destroy()
         if Win._active==Tab then Win._active=nil; if Win._tabs[1] then Win:SelectTab(Win._tabs[1]) end end
+        if Win._RefreshTabSearch then Win:_RefreshTabSearch() end
     end
     table.insert(Win._tabs, Tab)
     if #Win._tabs == 1 then Win:SelectTab(Tab) end
+    if Win._RefreshTabSearch then Win:_RefreshTabSearch() end
+    task.defer(function() if not Win._destroyed and Win._UpdateTabSearchLayout then Win:_UpdateTabSearchLayout() end end)
     return Tab
 end
 
@@ -4750,8 +4974,15 @@ end
 function L:CreateTimer(cfg)
     local Sec=self; if not IsElementContainer(Sec) then return nil,"section or tab required" end
     cfg=cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C
-    local remaining=ClampNumber(cfg.Duration,1500,0,86400); local running=false; local destroyed=false
+    local remaining=ClampNumber(cfg.Duration,1500,0,86400); local running=false; local destroyed=false; local timerToken=0
     local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,76); root.BackgroundColor3=C.Card; root.BorderSizePixel=0; root.Parent=Sec._inner or Sec._holder
+    local function cleanupTimer()
+        if destroyed then return end
+        destroyed=true
+        running=false
+        timerToken+=1
+    end
+    root.Destroying:Connect(cleanupTimer)
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,10); corner.Parent=root
     local title=Instance.new("TextLabel"); title.Size=UDim2.new(1,-20,0,20); title.Position=UDim2.new(0,10,0,5); title.BackgroundTransparency=1; title.Text=cfg.Name or "Timer"; title.Font=Enum.Font[Sec._lib.CurrentFontMedium]; title.TextSize=12; title.TextColor3=C.Text; title.TextXAlignment=Enum.TextXAlignment.Left; title.Parent=root
     local display=Instance.new("TextLabel"); display.Size=UDim2.new(0,100,0,32); display.Position=UDim2.new(0,10,0,30); display.BackgroundTransparency=1; display.Font=Enum.Font.GothamBold; display.TextSize=18; display.TextColor3=C.Accent; display.TextXAlignment=Enum.TextXAlignment.Left; display.Parent=root
@@ -4762,24 +4993,52 @@ function L:CreateTimer(cfg)
     end
     local startButton
     local function startTimer()
-        if running then return end
-        running=true; startButton.Text="Pause"
+        if destroyed or running then return false end
+        running=true; timerToken+=1; local token=timerToken; startButton.Text="Pause"
         task.spawn(function()
-            while running and not destroyed and remaining>0 do task.wait(1); if running and not destroyed then remaining=math.max(0,remaining-1); refresh(); if cfg.Callback then pcall(cfg.Callback,remaining) end end end
-            if remaining==0 and not destroyed then running=false; startButton.Text="Start"; if cfg.OnComplete then pcall(cfg.OnComplete) end end
+            while running and not destroyed and timerToken==token and remaining>0 do
+                task.wait(1)
+                if running and not destroyed and timerToken==token then
+                    remaining=math.max(0,remaining-1)
+                    refresh()
+                    if cfg.Callback then pcall(cfg.Callback,remaining) end
+                end
+            end
+            if timerToken==token and remaining==0 and not destroyed then
+                running=false
+                startButton.Text="Start"
+                if cfg.OnComplete then pcall(cfg.OnComplete) end
+            end
         end)
+        return true
     end
-    local function pauseTimer() running=false; startButton.Text="Start" end
-    local function resetTimer() running=false; remaining=ClampNumber(cfg.Duration,1500,0,86400); startButton.Text="Start"; refresh() end
+    local function pauseTimer()
+        if destroyed then return false end
+        running=false; timerToken+=1; startButton.Text="Start"
+        return true
+    end
+    local function resetTimer()
+        if destroyed then return false end
+        running=false; timerToken+=1; remaining=ClampNumber(cfg.Duration,1500,0,86400); startButton.Text="Start"; refresh()
+        return true
+    end
     button("Reset",-10,resetTimer)
     startButton=button("Start",-70,function() if running then pauseTimer() else startTimer() end end)
     local Element=setmetatable({Instance=root,_lib=Sec._lib,_favoriteId=cfg.Flag or cfg.Name,_favoriteName=cfg.Name,_favoriteTab=Sec._tab},ElementMethods); Element:InitFavorite()
     function Element:Get() return remaining end
-    function Element:Set(seconds) remaining=ClampNumber(seconds,0,0,86400); refresh() end
-    function Element:Start() startTimer() end
-    function Element:Pause() pauseTimer() end
-    function Element:Reset() resetTimer() end
-    function Element:Destroy() destroyed=true; running=false; root:Destroy() end
+    function Element:Set(seconds)
+        if destroyed then return false end
+        remaining=ClampNumber(seconds,0,0,86400); refresh()
+        if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
+        return remaining
+    end
+    function Element:Start() return startTimer() end
+    function Element:Pause() return pauseTimer() end
+    function Element:Reset() return resetTimer() end
+    function Element:Destroy()
+        cleanupTimer()
+        if root.Parent then root:Destroy() end
+    end
     if cfg.Flag then Sec._lib:RegisterState(cfg.Flag,function() return remaining end,function(value) remaining=ClampNumber(value,0,0,86400); refresh() end) end
     Sec:_AddElement(root); refresh(); return Element
 end
@@ -5042,12 +5301,13 @@ function L:CreateToggle(cfg)
     Knob.BorderSizePixel = 0
     Knob.Parent = Switch
     local Kc = Instance.new("UICorner"); Kc.CornerRadius = UDim.new(1,0); Kc.Parent = Knob
+    local Element
     local function Set(v, silent)
         state = v==true
+        if Element then Element.Value=state end
         TweenService:Create(Switch, T_OUT, {BackgroundColor3=state and C.Success or C.Surface}):Play()
         TweenService:Create(Knob, T_OUT, {Position=state and UDim2.new(1,-20,0.5,-8) or UDim2.new(0,3,0.5,-8), BackgroundColor3=state and C.White or C.TextDim}):Play()
         if cfg.Flag then
-            Sec._lib._state[cfg.Flag]={Get=function() return state end,Set=function(v) Set(v,true) end}
             if Sec._lib.Config.AutoSave and not silent then task.delay(Sec._lib.Config.SaveDelay,function() if not Sec._lib._destroyed then pcall(function() Sec._lib:SaveState() end) end end) end
             if not silent then Sec._lib:_ScheduleConfigAutoSave() end
         end
@@ -5060,7 +5320,7 @@ function L:CreateToggle(cfg)
     end)
     Wrapped.MouseEnter:Connect(function() TweenService:Create(Wrapped, T_OUT, {BackgroundColor3=C.CardHover}):Play() end)
     Wrapped.MouseLeave:Connect(function() TweenService:Create(Wrapped, T_OUT, {BackgroundColor3=C.Card}):Play() end)
-    local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab, Value=state, _label=Lb}, ElementMethods)
+    Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab, Value=state, _label=Lb}, ElementMethods)
     Element:InitFavorite()
     function Element:Set(v) Set(v, true) end
     function Element:Get() return state end
@@ -5652,15 +5912,19 @@ function L:CreateDropdown(cfg)
     Btn.Text = ""
     Btn.AutoButtonColor = false
     Btn.Parent = Wrapped
-    local List = Instance.new("Frame")
+    local List = Instance.new("ScrollingFrame")
     List.Size = UDim2.new(1,0,0,0)
-    List.AutomaticSize = Enum.AutomaticSize.Y
+    List.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    List.CanvasSize = UDim2.new(0,0,0,0)
     List.Position = UDim2.new(0,0,1,6)
     List.BackgroundColor3 = C.Surface
     List.BorderSizePixel = 0
     List.Visible = false
     List.ZIndex = 500
     List.ClipsDescendants = true
+    List.ScrollBarThickness = 4
+    List.ScrollBarImageColor3 = C.Accent
+    List.ScrollBarImageTransparency = 0.2
     List.Parent = Sec._window._overlay
     local Lc = Instance.new("UICorner"); Lc.CornerRadius = UDim.new(0,10); Lc.Parent = List
     local Ls = Instance.new("UIStroke"); Ls.Color = C.Stroke; Ls.Thickness = 1; Ls.Transparency = 0.4; Ls.Parent = List
@@ -5674,6 +5938,10 @@ function L:CreateDropdown(cfg)
     Ll.Parent = List
     local searchBox
     local followConn
+    Wrapped.Destroying:Connect(function()
+        if followConn then followConn:Disconnect(); followConn=nil end
+        if List.Parent then List:Destroy() end
+    end)
     if cfg.Searchable==true or cfg.Search==true then
         searchBox=Instance.new("TextBox")
         searchBox.Name="DropdownSearch"; searchBox.Size=UDim2.new(1,0,0,28); searchBox.BackgroundColor3=C.Card
@@ -5750,10 +6018,12 @@ function L:CreateDropdown(cfg)
         local mp = Sec._window._main.AbsolutePosition
         local scale=math.max(Sec._window._uiscale.Scale,0.01)
         local mainSize=Sec._window._main.AbsoluteSize/scale
-        local x=math.clamp((wp.X-mp.X)/scale,8,math.max(8,mainSize.X-math.max(Wrapped.AbsoluteSize.X/scale,180)-8))
+        local width=math.max(Wrapped.AbsoluteSize.X/scale,180)
+        local x=math.clamp((wp.X-mp.X)/scale,8,math.max(8,mainSize.X-width-8))
+        local contentHeight=math.max(Ll.AbsoluteContentSize.Y+12,40)
+        local listHeight=math.min(contentHeight,math.max(40,mainSize.Y-16))
+        List.Size=UDim2.fromOffset(width,listHeight)
         local y=(wp.Y-mp.Y)/scale+Wrapped.AbsoluteSize.Y/scale+6
-        local listHeight=List.AbsoluteSize.Y/scale
-        List.Size = UDim2.fromOffset(math.max(Wrapped.AbsoluteSize.X/scale, 180), 0)
         if y+listHeight>mainSize.Y-8 then y=wp.Y-mp.Y-listHeight-6 end
         y=math.clamp(y,8,math.max(8,mainSize.Y-listHeight-8))
         List.Position = UDim2.fromOffset(x,y)
@@ -5886,16 +6156,48 @@ function L:CreateColorPicker(cfg)
         Pop.Position=UDim2.fromOffset(math.clamp(x,8,math.max(8,mainSize.X-popSize.X-8)),math.clamp(y,8,math.max(8,mainSize.Y-popSize.Y-8)))
     end
     local follow
-    Preview.MouseButton1Click:Connect(function() Pop.Visible=not Pop.Visible; if Pop.Visible then placePop(); if follow then follow:Disconnect() end; follow=RS.RenderStepped:Connect(placePop) elseif follow then follow:Disconnect(); follow=nil end end)
+    local function stopFollowing()
+        if follow then follow:Disconnect(); follow=nil end
+    end
+    local function startFollowing()
+        if follow then follow:Disconnect(); follow=nil end
+        placePop()
+        task.defer(function()
+            if Pop.Parent and Pop.Visible then placePop() end
+        end)
+        follow=RS.RenderStepped:Connect(function()
+            if not Pop.Parent or not Pop.Visible then stopFollowing(); return end
+            placePop()
+        end)
+    end
+    Pop.Destroying:Connect(function()
+        stopFollowing()
+        svDragging=false; hueDragging=false
+        if pickerMove then pickerMove:Disconnect(); pickerMove=nil end
+        if pickerEnd then pickerEnd:Disconnect(); pickerEnd=nil end
+    end)
+    Wrapped.Destroying:Connect(function()
+        stopFollowing()
+        if Pop.Parent then Pop:Destroy() end
+    end)
+    Preview.MouseButton1Click:Connect(function()
+        Pop.Visible=not Pop.Visible
+        if Pop.Visible then startFollowing() else stopFollowing() end
+    end)
     if cfg.Flag then Sec._lib:RegisterState(cfg.Flag,function() return ColorToHex(color) end,function(v,silent) local c2=HexToColor(v); if c2 then h,sat,val=c2:ToHSV(); RefreshPicker(not silent) end end) end
     local Element=setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab}, ElementMethods)
     Element:InitFavorite()
     Element._extraRoots={Pop}
     function Element:Set(c2) if typeof(c2)=="Color3" then h,sat,val=c2:ToHSV(); RefreshPicker(true) end end
     function Element:Get() return color end
-    function Element:Open() Pop.Visible=true; placePop() end
-    function Element:Close() Pop.Visible=false; if follow then follow:Disconnect(); follow=nil end end
-    function Element:Destroy() if follow then follow:Disconnect() end; if pickerMove then pickerMove:Disconnect() end; if pickerEnd then pickerEnd:Disconnect() end; Pop:Destroy(); Wrapped:Destroy() end
+    function Element:Open()
+        if not Pop.Parent then return false end
+        Pop.Visible=true
+        startFollowing()
+        return true
+    end
+    function Element:Close() Pop.Visible=false; stopFollowing() end
+    function Element:Destroy() stopFollowing(); if pickerMove then pickerMove:Disconnect(); pickerMove=nil end; if pickerEnd then pickerEnd:Disconnect(); pickerEnd=nil end; Pop:Destroy(); Wrapped:Destroy() end
     Sec:_AddElement(Wrapped)
     RefreshPicker(false)
     return Element
@@ -8212,9 +8514,15 @@ function L:AnimateLogo(window,kind)
             if kind=="spin" then goal={Rotation=base.Rotation+360}; duration=2
             elseif kind=="bounce" then goal={Position=UDim2.new(base.Position.X.Scale,base.Position.X.Offset,base.Position.Y.Scale,base.Position.Y.Offset-6)}; duration=.45
             else goal={Size=UDim2.new(base.Size.X.Scale,base.Size.X.Offset+4,base.Size.Y.Scale,base.Size.Y.Offset+4)}; duration=.6 end
-            tween=TweenService:Create(logo,TweenInfo.new(duration,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut),goal); tween:Play(); task.wait(duration)
+            local easingStyle=kind=="spin" and Enum.EasingStyle.Linear or Enum.EasingStyle.Sine
+            local easingDirection=kind=="spin" and Enum.EasingDirection.Out or Enum.EasingDirection.InOut
+            tween=TweenService:Create(logo,TweenInfo.new(duration,easingStyle,easingDirection),goal); tween:Play(); task.wait(duration)
             if not active or not logo.Parent then break end
-            tween=TweenService:Create(logo,TweenInfo.new(duration,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut),base); tween:Play(); task.wait(duration)
+            if kind=="spin" then
+                logo.Rotation=base.Rotation
+            else
+                tween=TweenService:Create(logo,TweenInfo.new(duration,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut),base); tween:Play(); task.wait(duration)
+            end
         end
         if active then handle:Stop() end
     end)
@@ -8782,7 +9090,7 @@ function L:CreateSoundSettings(cfg)
     local slotTest=Instance.new("TextButton"); slotTest.Size=UDim2.fromOffset(50,24); slotTest.Position=UDim2.new(1,-60,0,180); slotTest.BackgroundColor3=C.Surface; slotTest.TextColor3=C.TextDim; slotTest.Text="Test"; slotTest.Font=Enum.Font[lib.CurrentFont]; slotTest.TextSize=9; slotTest.Parent=root
     local slotStatus=Instance.new("TextLabel"); slotStatus.Size=UDim2.new(1,-72,0,24); slotStatus.Position=UDim2.fromOffset(8,180); slotStatus.BackgroundTransparency=1; slotStatus.TextColor3=C.TextFaint; slotStatus.Text=""; slotStatus.Font=Enum.Font[lib.CurrentFont]; slotStatus.TextSize=9; slotStatus.TextXAlignment=Enum.TextXAlignment.Left; slotStatus.Parent=root
     local historyTitle=Instance.new("TextLabel"); historyTitle.Size=UDim2.new(1,-16,0,18); historyTitle.Position=UDim2.fromOffset(8,206); historyTitle.BackgroundTransparency=1; historyTitle.Text="Recent playback"; historyTitle.TextColor3=C.Text; historyTitle.Font=Enum.Font[lib.CurrentFontMedium]; historyTitle.TextSize=10; historyTitle.TextXAlignment=Enum.TextXAlignment.Left; historyTitle.Parent=root
-    local history=Instance.new("ScrollingFrame"); history.Size=UDim2.new(1,-16,0,50); history.Position=UDim2.fromOffset(8,226); history.BackgroundColor3=C.Surface; history.BorderSizePixel=0; history.ScrollBarThickness=3; history.AutomaticCanvasSize=Enum.AutomaticSize.Y; history.CanvasSize=UDim2.new(); history.Parent=root
+    local history=Instance.new("ScrollingFrame"); history.Size=UDim2.new(1,-16,0,50); history.Position=UDim2.fromOffset(8,226); history.BackgroundColor3=C.Surface; history.BorderSizePixel=0; history.ScrollBarThickness=3; history.ScrollBarImageColor3=C.Accent; history.AutomaticCanvasSize=Enum.AutomaticSize.Y; history.CanvasSize=UDim2.new(); history.Parent=root
     local historyLayout=Instance.new("UIListLayout"); historyLayout.Padding=UDim.new(0,2); historyLayout.Parent=history
     local playlistName=Instance.new("TextBox"); playlistName.Size=UDim2.new(.24,-8,0,26); playlistName.Position=UDim2.fromOffset(8,282); playlistName.BackgroundColor3=C.Surface; playlistName.TextColor3=C.Text; playlistName.PlaceholderColor3=C.TextFaint; playlistName.PlaceholderText="Playlist"; playlistName.Font=Enum.Font[lib.CurrentFont]; playlistName.TextSize=9; playlistName.ClearTextOnFocus=false; playlistName.Parent=root
     local playlistIds=Instance.new("TextBox"); playlistIds.Size=UDim2.new(.56,-8,0,26); playlistIds.Position=UDim2.new(.24,2,0,282); playlistIds.BackgroundColor3=C.Surface; playlistIds.TextColor3=C.Text; playlistIds.PlaceholderColor3=C.TextFaint; playlistIds.PlaceholderText="Paste sound IDs"; playlistIds.Font=Enum.Font[lib.CurrentFont]; playlistIds.TextSize=9; playlistIds.ClearTextOnFocus=false; playlistIds.Parent=root
@@ -8818,7 +9126,7 @@ function L:CreateSoundSettings(cfg)
         else
             for _,entry in ipairs(entries) do
                 local selectedEntry=entry
-                local row=Instance.new("TextButton"); row.Size=UDim2.new(1,-4,0,18); row.BackgroundTransparency=1; row.TextXAlignment=Enum.TextXAlignment.Left; row.TextColor3=C.TextDim; row.Font=Enum.Font[lib.CurrentFont]; row.TextSize=9
+            local row=Instance.new("TextButton"); row.Size=UDim2.new(1,-4,0,20); row.BackgroundTransparency=1; row.TextXAlignment=Enum.TextXAlignment.Left; row.TextColor3=C.TextDim; row.Font=Enum.Font[lib.CurrentFont]; row.TextSize=10
                 row.Text=tostring(selectedEntry.slot or selectedEntry.channel or "Sound").."  ·  "..tostring(selectedEntry.id or "")
                 row.Parent=history
                 row.MouseButton1Click:Connect(function() if selectedEntry.id then lib:PlaySoundAsset(selectedEntry.id,selectedEntry.channel or "Music") end end)
