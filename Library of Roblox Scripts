@@ -1,6 +1,6 @@
 local L = {}
 L.__index = L
-L.Version = "6.3.1"
+L.Version = "6.3.3"
 L._iconAnimationHandles = {}
 L._iconAnimationByImage = setmetatable({}, {__mode="k"})
 local SplashGui = nil
@@ -579,9 +579,13 @@ function L:Destroy()
     for _, gui in ipairs(table.clone(self._auxGuis or {})) do if gui and gui.Parent then pcall(function() gui:Destroy() end) end end
     self._auxGuis = {}
     self._notifyGui=nil; self._notifyContainer=nil; self._snackGui=nil; self._snackContainer=nil
+    self._notificationHistoryGui=nil; self._themeEditorGui=nil; self._themeEditorWorking=nil; self._transitionEditorGui=nil
     local windows=table.clone(self._allWindows or {})
     for _, w in ipairs(windows) do
-        if w and not w._destroyed then pcall(function() w:Destroy() end) end
+        if w then
+            w._commandPalette=nil
+            if not w._destroyed then pcall(function() w:Destroy() end) end
+        end
     end
     self._allWindows = {}
     self._window = nil
@@ -766,10 +770,23 @@ L.Sounds = {
     open="", close="", key="", notify="",
     enabled=true, volume=0.5, silent=false,
     channels={UI=1,Effects=1,Transitions=1,Music=1,Ambient=1},
-    favorites={}, history={}, playlists={}, transitionHooks={}
+    favorites={}, history={}, playlists={}, transitionHooks={}, library={}
 }
 L.Sounds.favorites=JsonRead("library_sound_favorites.json",{})
 if type(L.Sounds.favorites)~="table" then L.Sounds.favorites={} end
+
+local DefaultSoundChannels={"Music","UI","Effects","Transitions","Ambient"}
+local function GetSoundChannelNames(sounds)
+    local names={}; local seen={}; local extras={}
+    for _,name in ipairs(DefaultSoundChannels) do seen[name]=true; table.insert(names,name) end
+    local channels=type(sounds)=="table" and type(sounds.channels)=="table" and sounds.channels or {}
+    for name in pairs(channels) do
+        if type(name)=="string" and name~="" and not seen[name] then seen[name]=true; table.insert(extras,name) end
+    end
+    table.sort(extras,function(a,b) return a:lower()<b:lower() end)
+    for _,name in ipairs(extras) do table.insert(names,name) end
+    return names
+end
 
 function L:SetSounds(cfg)
     cfg=type(cfg)=="table" and cfg or {}
@@ -778,17 +795,31 @@ function L:SetSounds(cfg)
     self.Sounds.enabled=self.Sounds.enabled~=false
     self.Sounds.silent=self.Sounds.silent==true
     self.Sounds.channels=type(self.Sounds.channels)=="table" and self.Sounds.channels or {}
-    for _,channel in ipairs({"UI","Effects","Transitions","Music","Ambient"}) do self.Sounds.channels[channel]=ClampNumber((type(cfg.channels)=="table" and cfg.channels[channel]) or self.Sounds.channels[channel],1,0,1) end
+    if type(cfg.channels)=="table" then
+        for channel,value in pairs(cfg.channels) do
+            if type(channel)=="string" and channel~="" then self.Sounds.channels[channel]=ClampNumber(value,self.Sounds.channels[channel] or 1,0,1) end
+        end
+    end
+    for channel,value in pairs(self.Sounds.channels) do
+        if type(channel)=="string" and channel~="" then self.Sounds.channels[channel]=ClampNumber(value,1,0,1) end
+    end
+    for _,channel in ipairs(DefaultSoundChannels) do self.Sounds.channels[channel]=ClampNumber(self.Sounds.channels[channel],1,0,1) end
     self.Sounds.favorites = type(self.Sounds.favorites)=="table" and self.Sounds.favorites or {}
     self.Sounds.history = type(self.Sounds.history)=="table" and self.Sounds.history or {}
     self.Sounds.playlists = type(self.Sounds.playlists)=="table" and self.Sounds.playlists or {}
     self.Sounds.transitionHooks = type(self.Sounds.transitionHooks)=="table" and self.Sounds.transitionHooks or {}
     self.Sounds.library=type(self.Sounds.library)=="table" and self.Sounds.library or {}
+    local invalidSoundNames={}
     for name,entry in pairs(self.Sounds.library) do
         local normalized=type(entry)=="table" and NormalizeSoundId(entry.Id)
-        if type(name)~="string" or type(entry)~="table" or not normalized then self.Sounds.library[name]=nil
+        if type(name)~="string" or type(entry)~="table" or not normalized then invalidSoundNames[#invalidSoundNames+1]=name
         else entry.Name=tostring(entry.Name or name); entry.Category=tostring(entry.Category or "General"); entry.Id=normalized end
     end
+    for _,name in ipairs(invalidSoundNames) do self.Sounds.library[name]=nil end
+    self:Emit("SoundSettingsChanged",{
+        Silent=self.Sounds.silent,Enabled=self.Sounds.enabled,Volume=self.Sounds.volume,
+        Channels=table.clone(self.Sounds.channels)
+    })
 end
 
 function L:SetSoundChannelVolume(channel, volume)
@@ -964,16 +995,29 @@ function L:CreateSoundBox(cfg)
     local play=makeText("TextButton",panel,UDim2.new(0,72,0,32),UDim2.new(0,92,0,84),"Play",theme.AccentSoft)
     local stop=makeText("TextButton",panel,UDim2.new(0,72,0,32),UDim2.new(0,172,0,84),"Fade stop",theme.Card)
     local silent=makeText("TextButton",panel,UDim2.new(0,92,0,32),UDim2.new(0,252,0,84),"Silent: "..(self.Sounds.silent and "on" or "off"),theme.Card)
+    local refreshChannelOptions,channelSubscription
     local silentSubscription=self:On("SoundSettingsChanged",function(state)
         if gui.Parent then silent.Text="Silent: "..(state and state.Silent and "on" or "off") end
     end)
-    gui.Destroying:Connect(function() if silentSubscription then silentSubscription:Disconnect() end end)
+    gui.Destroying:Connect(function()
+        if silentSubscription then silentSubscription:Disconnect() end
+        if channelSubscription then channelSubscription:Disconnect() end
+    end)
     local channel=makeText("TextButton",panel,UDim2.new(0,180,0,30),UDim2.new(0,12,0,124),"Channel: Music",theme.Card)
     local channelVolume=makeText("TextBox",panel,UDim2.new(0,72,0,30),UDim2.new(1,-84,0,124),tostring((self.Sounds.channels or {}).Music or 1),theme.Card)
     channelVolume.PlaceholderText="Mix"; channelVolume.ClearTextOnFocus=false
-    local channels={"Music","UI","Effects","Transitions","Ambient"}; local channelIndex=1
-    channel.MouseButton1Click:Connect(function() channelIndex=channelIndex%#channels+1; channel.Text="Channel: "..channels[channelIndex]; channelVolume.Text=tostring((self.Sounds.channels or {})[channels[channelIndex]] or 1) end)
-    channelVolume.FocusLost:Connect(function() channelVolume.Text=tostring(self:SetSoundChannelVolume(channels[channelIndex],channelVolume.Text)) end)
+    local channels=GetSoundChannelNames(self.Sounds); local channelIndex=table.find(channels,"Music") or 1
+    refreshChannelOptions=function()
+        local selected=channels[channelIndex]
+        channels=GetSoundChannelNames(self.Sounds)
+        channelIndex=table.find(channels,selected) or 1
+        local selectedChannel=channels[channelIndex] or "Music"
+        channel.Text="Channel: "..selectedChannel
+        channelVolume.Text=tostring((self.Sounds.channels or {})[selectedChannel] or 1)
+    end
+    channelSubscription=self:On("SoundSettingsChanged",function() if gui.Parent and refreshChannelOptions then refreshChannelOptions() end end)
+    channel.MouseButton1Click:Connect(function() channelIndex=channelIndex%#channels+1; refreshChannelOptions() end)
+    channelVolume.FocusLost:Connect(function() self:SetSoundChannelVolume(channels[channelIndex],channelVolume.Text); refreshChannelOptions() end)
     play.MouseButton1Click:Connect(function()
         local n=tonumber(pitch.Text) or 1
         self:PlaySoundAsset(asset.Text,channels[channelIndex],{Pitch=n,FadeIn=cfg.FadeIn or 0})
@@ -1018,7 +1062,18 @@ function L:CreateSoundBox(cfg)
         local sound=self._activeSound
         if sound and sound.Parent and sound.TimeLength>0 then sound.TimePosition=math.clamp((x-seekTrack.AbsolutePosition.X)/math.max(seekTrack.AbsoluteSize.X,1),0,1)*sound.TimeLength end
     end
-    seekHit.MouseButton1Down:Connect(function(x) seekAt(x) end)
+    local seekDragging=false; local seekConnections={}
+    table.insert(seekConnections,seekHit.InputBegan:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+            seekDragging=true; seekAt(input.Position.X)
+        end
+    end))
+    table.insert(seekConnections,UIS.InputChanged:Connect(function(input)
+        if seekDragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then seekAt(input.Position.X) end
+    end))
+    table.insert(seekConnections,UIS.InputEnded:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then seekDragging=false end
+    end))
     local playbackActive=true
     task.spawn(function()
         while playbackActive and gui.Parent do
@@ -1031,7 +1086,10 @@ function L:CreateSoundBox(cfg)
             task.wait(0.2)
         end
     end)
-    gui.Destroying:Connect(function() playbackActive=false end)
+    gui.Destroying:Connect(function()
+        playbackActive=false
+        for _,connection in ipairs(seekConnections) do if connection then connection:Disconnect() end end
+    end)
     query:GetPropertyChangedSignal("Text"):Connect(refresh)
     favorites.MouseButton1Click:Connect(function() favoritesOnly=not favoritesOnly; favorites.Text=favoritesOnly and "Favorites" or "All sounds"; refresh() end)
     refresh()
@@ -1143,18 +1201,6 @@ function L:SetFocusMode(enabled,window)
     if not win or type(win.SetFocusMode)~="function" then return false end
     return win:SetFocusMode(enabled)
 end
-function L:SetReadingMode(enabled,window)
-    local win=window or self._window
-    if not win or type(win.SetFocusMode)~="function" then return false end
-    win:SetFocusMode(enabled)
-    if enabled then
-        for _,obj in ipairs(win._main:GetDescendants()) do if obj:IsA("TextLabel") then if not obj:GetAttribute("__VNCReadingSize") then obj:SetAttribute("__VNCReadingSize",obj.TextSize) end; obj.TextSize=math.max(obj.TextSize,14) end end
-    else
-        for _,obj in ipairs(win._main:GetDescendants()) do if obj:IsA("TextLabel") then local size=obj:GetAttribute("__VNCReadingSize"); if size then obj.TextSize=size; obj:SetAttribute("__VNCReadingSize",nil) end end end
-    end
-    return enabled==true
-end
-
 function L:SetCustomTheme(t)
     if type(t) ~= "table" then return false end
     local merged = ClonePalette(self.Palettes.Dark)
@@ -2190,6 +2236,7 @@ function L:PlayEffect(name, parent, cfg)
     local color=typeof(cfg.Color)=="Color3" and cfg.Color or def.color
     if typeof(color)~="Color3" then color=self.C.Accent end
     local count=math.floor(ClampNumber(cfg.Count,20,1,200))
+    local batchSize=math.floor(ClampNumber(cfg.BatchSize,20,1,200))
     local duration=ClampNumber(cfg.Duration,def.dur or 1,0.05,30)
     local minSize=math.floor(ClampNumber(def.minS,4,1,500))
     local maxSize=math.floor(ClampNumber(def.maxS,minSize,1,500))
@@ -2226,7 +2273,7 @@ function L:PlayEffect(name, parent, cfg)
                 }):Play()
                 Debris:AddItem(particle,duration+0.2)
             end
-            if index%20==0 and index<count then task.wait() end
+            if index%batchSize==0 and index<count then task.wait() end
         end
     end)
     return true
@@ -3281,7 +3328,13 @@ function L:CreateWindow(cfg)
         if self._destroyed then return end
         self._destroyed=true
         if self._lib and self._lib._hubIdleState and self._lib._hubIdleState.hiddenWindows then self._lib._hubIdleState.hiddenWindows[self]=nil end
-        if self._lib and self._lib.Macros then pcall(function() self._lib:StopMacroPlayback() end) end
+        if self._lib and self._lib.Macros then
+            local anotherWindowOpen=false
+            for _,window in ipairs(self._lib._allWindows or {}) do
+                if window~=self and window and not window._destroyed then anotherWindowOpen=true; break end
+            end
+            if not anotherWindowOpen then pcall(function() self._lib:StopMacroPlayback() end) end
+        end
         if self._particleHandle then pcall(function() self._particleHandle:Destroy() end) end
         if self._spotlightHandle then pcall(function() self._spotlightHandle:Destroy() end) end
         if self._logoAnimation then pcall(function() self._logoAnimation:Stop() end) end
@@ -3789,7 +3842,8 @@ function L:CreateBadge(parent, text, cfg)
 end
 
 local function CreateChoiceControl(Sec,cfg,segmented)
-    cfg=cfg or {}; local C=Sec.C or Sec._window.C
+    if type(Sec)~="table" or not (Sec._inner or Sec._holder) then return nil,"section required" end
+    cfg=cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C
     local options=cfg.Options or cfg.Values or {}
     local selected=cfg.Default or options[1]
     if type(selected)=="number" and options[selected]~=nil then selected=options[selected] end
@@ -3840,7 +3894,8 @@ function L:CreateStepSlider(cfg)
 end
 
 function L:CreateTimer(cfg)
-    local Sec=self; cfg=cfg or {}; local C=Sec.C or Sec._window.C
+    local Sec=self; if type(Sec)~="table" or not (Sec._inner or Sec._holder) then return nil,"section required" end
+    cfg=cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C
     local remaining=math.max(0,tonumber(cfg.Duration) or 1500); local running=false; local destroyed=false
     local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,76); root.BackgroundColor3=C.Card; root.BorderSizePixel=0; root.Parent=Sec._inner or Sec._holder
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,10); corner.Parent=root
@@ -3876,7 +3931,8 @@ function L:CreateTimer(cfg)
 end
 
 function L:CreateTerminal(cfg)
-    local Sec=self; cfg=cfg or {}; local C=Sec.C or Sec._window.C
+    local Sec=self; if type(Sec)~="table" or not (Sec._inner or Sec._holder) then return nil,"section required" end
+    cfg=cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C
     local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,cfg.Height or 180); root.BackgroundColor3=C.Bg; root.BorderSizePixel=0; root.Parent=Sec._inner or Sec._holder
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,10); corner.Parent=root
     local scroll=Instance.new("ScrollingFrame"); scroll.Size=UDim2.new(1,-12,1,-12); scroll.Position=UDim2.new(0,6,0,6); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4; scroll.ScrollBarImageColor3=C.Accent; scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.Parent=root
@@ -3894,7 +3950,8 @@ function L:CreateTerminal(cfg)
     local function highlightLua(source)
         source=tostring(source or "")
         local chunks={}; local i=1; local length=#source
-        local function colored(token,color) table.insert(chunks,'<font color="'..color..'">'..escapeRichText(token)..'</font>') end
+        local function append(value) chunks[#chunks+1]=value end
+        local function colored(token,color) append('<font color="'..color..'">'..escapeRichText(token)..'</font>') end
         while i<=length do
             local two=source:sub(i,i+1); local char=source:sub(i,i)
             if two=="--" then
@@ -3908,11 +3965,11 @@ function L:CreateTerminal(cfg)
                 colored(source:sub(i,math.min(j-1,length)),"#D7A9E3"); i=j
             elseif char:match("[%a_]") then
                 local word=source:sub(i):match("^[%a_][%w_]*") or char
-                if keywords[word] then colored(word,"#82B1FF") elseif word=="print" or word=="warn" or word=="game" or word=="script" or word=="workspace" then colored(word,"#65C6C4") else table.insert(chunks,escapeRichText(word)) end
+                if keywords[word] then colored(word,"#82B1FF") elseif word=="print" or word=="warn" or word=="game" or word=="script" or word=="workspace" then colored(word,"#65C6C4") else append(escapeRichText(word)) end
                 i+=#word
             elseif char:match("%d") then
                 local number=source:sub(i):match("^%d[%w_%.]*") or char; colored(number,"#E7BC72"); i+=#number
-            else table.insert(chunks,escapeRichText(char)); i+=1 end
+            else append(escapeRichText(char)); i+=1 end
         end
         return table.concat(chunks)
     end
@@ -5019,10 +5076,14 @@ function L:CreateImage(cfg)
 end
 
 function L:CreateSearch(cfg)
-    cfg = cfg or {}
     local Tab = self
+    if type(Tab)~="table" then return nil,"tab required" end
     local Win = Tab._window
-    local C = Tab.C or Win.C
+    if not Win or Win._destroyed or not Tab._frame or type(Tab._sections)~="table" then return nil,"tab required" end
+    cfg=type(cfg)=="table" and cfg or {}
+    if Tab._searchElement and Tab._searchElement.Destroy then pcall(function() Tab._searchElement:Destroy() end) end
+    local lib=Tab._lib or L
+    local C = Tab.C or (Win and Win.C) or (lib and lib.C) or L.C
     local Wrapped = Instance.new("Frame")
     Wrapped.Size = UDim2.new(1,0,0,38)
     Wrapped.LayoutOrder = 0
@@ -5037,7 +5098,7 @@ function L:CreateSearch(cfg)
     Box.BackgroundTransparency = 1
     Box.Text = ""
     Box.PlaceholderText = cfg.Placeholder or "Search..."
-    Box.Font = Enum.Font[Tab._lib.CurrentFont]
+    Box.Font = Enum.Font[lib.CurrentFont]
     Box.TextSize = 12
     Box.TextColor3 = C.Text
     Box.PlaceholderColor3 = C.TextFaint
@@ -5083,16 +5144,18 @@ function L:CreateSearch(cfg)
         if cfg.Callback then pcall(cfg.Callback,Box.Text) end
     end)
     Tab._connections=Tab._connections or {}; table.insert(Tab._connections,connection)
-    local Element = {Instance=Wrapped, TextBox=Box, _lib=Tab._lib}
+    local Element = {Instance=Wrapped, TextBox=Box, _lib=lib}
     function Element:Get() return Box.Text end
     function Element:Set(value) Box.Text=tostring(value or "") end
     function Element:Destroy()
+        if connection then connection:Disconnect(); connection=nil end
         Box.Text=""; filterElements()
         if Tab._searchRefresh==filterElements then Tab._searchRefresh=nil end
-        if connection then connection:Disconnect(); connection=nil end
+        if Tab._searchElement==Element then Tab._searchElement=nil end
         Wrapped:Destroy()
     end
     Element.Refresh=filterElements
+    Tab._searchElement=Element
     if cfg.Filter~=false then filterElements() end
     return Element
 end
@@ -5158,11 +5221,16 @@ function L:CreateMiniTabs(cfg)
 end
 
 function L:CreateGlobalSearch(cfg)
-    cfg = cfg or {}
+    cfg = type(cfg)=="table" and cfg or {}
     local Win = self._window
     if not Win or Win._destroyed then return nil end
+    if cfg.StartHidden then
+        local previous=Win._globalSearchPalette
+        if previous and previous.Parent then previous:Destroy() end
+        Win._globalSearchPalette=nil
+    end
     local C = Win.C
-    local items = cfg.Items or {}
+    local items = type(cfg.Items)=="table" and cfg.Items or {}
     local gui = Instance.new("ScreenGui")
     gui.Name = "LibraryGlobalSearch_"..tostring(math.random(1,999999))
     gui.ResetOnSpawn = false
@@ -5170,7 +5238,6 @@ function L:CreateGlobalSearch(cfg)
     gui.IgnoreGuiInset = true
     if PROT then pcall(PROT, gui) end
     gui.Parent = GetHui()
-    Win._auxGuis = Win._auxGuis or {}
     TrackAuxGui(self._lib or self,Win,gui)
     if cfg.StartHidden then gui.Enabled = false end
     local Overlay = Instance.new("TextButton")
@@ -5231,6 +5298,7 @@ function L:CreateGlobalSearch(cfg)
             if ok and type(extra)=="table" then for _,item in ipairs(extra) do table.insert(searchItems,item) end end
         end
         for _, item in ipairs(searchItems) do
+            if type(item)=="table" then
             local itemName=tostring(item.Name or item.Title or "Action")
             local itemTab=tostring(item.Tab or "")
             if itemName:lower():find(q, 1, true) or itemTab:lower():find(q, 1, true) then
@@ -5267,15 +5335,16 @@ function L:CreateGlobalSearch(cfg)
                     Close()
                 end)
             end
+            end
         end
     end
     Input:GetPropertyChangedSignal("Text"):Connect(Search)
     if not cfg.StartHidden then Input:CaptureFocus() end
     if cfg.StartHidden then
-        local ctrlKey = cfg.Modifier or Enum.KeyCode.LeftControl
-        local paletteKey = cfg.Hotkey or Enum.KeyCode.K
-        Win:_Connect(UIS.InputBegan, function(input, processed)
-            if processed then return end
+        local ctrlKey = typeof(cfg.Modifier)=="EnumItem" and cfg.Modifier or Enum.KeyCode.LeftControl
+        local paletteKey = typeof(cfg.Hotkey)=="EnumItem" and cfg.Hotkey or Enum.KeyCode.K
+        local hotkeyConnection=UIS.InputBegan:Connect(function(input, processed)
+            if processed and input.KeyCode~=Enum.KeyCode.Escape then return end
             if input.KeyCode == paletteKey and (UIS:IsKeyDown(ctrlKey) or UIS:IsKeyDown(Enum.KeyCode.RightControl)) then
                 gui.Enabled = not gui.Enabled
                 if gui.Enabled then Input:CaptureFocus() else Input:ReleaseFocus() end
@@ -5283,6 +5352,13 @@ function L:CreateGlobalSearch(cfg)
                 gui.Enabled = false
                 Input:ReleaseFocus()
             end
+        end)
+        Win._globalSearchHotkey=hotkeyConnection
+        Win._globalSearchPalette=gui
+        gui.Destroying:Connect(function()
+            if hotkeyConnection then pcall(function() hotkeyConnection:Disconnect() end) end
+            if Win._globalSearchHotkey==hotkeyConnection then Win._globalSearchHotkey=nil end
+            if Win._globalSearchPalette==gui then Win._globalSearchPalette=nil end
         end)
     end
     return gui
@@ -5861,7 +5937,8 @@ function L:CreateUndoRedoControls(parent)
 end
 
 function L:CreateColorSlider(cfg)
-    local Sec=self; cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or Sec._window.C; local value=ClampNumber(cfg.Default,0,0,1)
+    local Sec=self; if type(Sec)~="table" or not (Sec._inner or Sec._holder) then return nil,"section required" end
+    cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C; local value=ClampNumber(cfg.Default,0,0,1)
     local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,60); root.BackgroundColor3=C.Card; root.BorderSizePixel=0; root.Parent=Sec._inner or Sec._holder
     local title=Instance.new("TextLabel"); title.Size=UDim2.new(1,-32,0,20); title.Position=UDim2.fromOffset(16,6); title.BackgroundTransparency=1; title.Text=tostring(cfg.Name or "Color Slider"); title.TextColor3=C.Text; title.Font=Enum.Font[Sec._lib.CurrentFontMedium]; title.TextSize=12; title.TextXAlignment=Enum.TextXAlignment.Left; title.Parent=root
     local bar=Instance.new("Frame"); bar.Size=UDim2.new(1,-32,0,12); bar.Position=UDim2.fromOffset(16,36); bar.BackgroundColor3=Color3.new(1,1,1); bar.BorderSizePixel=0; bar.Parent=root
@@ -5871,7 +5948,6 @@ function L:CreateColorSlider(cfg)
     local tc=Instance.new("UICorner"); tc.CornerRadius=UDim.new(1,0); tc.Parent=thumb
     local hit=Instance.new("TextButton"); hit.Size=UDim2.new(1,0,1,0); hit.BackgroundTransparency=1; hit.Text=""; hit.Parent=bar
     local dragging=false; local connections={}
-    table.insert(connections,lib:On("SoundSettingsChanged",function() if root.Parent then refresh() end end))
     local function set(v,silent,user)
         value=ClampNumber(v,0,0,1); thumb.Position=UDim2.new(value,0,.5,0)
         if not silent and cfg.Callback then pcall(cfg.Callback,Color3.fromHSV(value,1,1),value) end
@@ -5891,7 +5967,8 @@ function L:CreateColorSlider(cfg)
 end
 
 function L:CreateGradientPicker(cfg)
-    local Sec=self; cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or Sec._window.C
+    local Sec=self; if type(Sec)~="table" or not (Sec._inner or Sec._holder) then return nil,"section required" end
+    cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C
     local colorA=SafeColor(cfg.Color1,Color3.fromRGB(255,0,0)); local colorB=SafeColor(cfg.Color2,Color3.fromRGB(0,0,255)); local rotation=ClampNumber(cfg.Rotation,0,0,360)
     local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,100); root.BackgroundColor3=C.Card; root.BorderSizePixel=0; root.Parent=Sec._inner or Sec._holder
     local title=Instance.new("TextLabel"); title.Size=UDim2.new(1,-32,0,20); title.Position=UDim2.fromOffset(16,5); title.BackgroundTransparency=1; title.Text=tostring(cfg.Name or "Gradient"); title.TextColor3=C.Text; title.Font=Enum.Font[Sec._lib.CurrentFontMedium]; title.TextSize=12; title.TextXAlignment=Enum.TextXAlignment.Left; title.Parent=root
@@ -5924,8 +6001,9 @@ function L:CreateGradientPicker(cfg)
 end
 
 function L:CreateMultiInput(cfg)
-    local Sec=self; cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or Sec._window.C
-    local fields=type(cfg.Fields)=="table" and table.clone(cfg.Fields) or {"Field 1","Field 2"}; if #fields==0 then fields={"Field 1"} end; while #fields>6 do table.remove(fields) end
+    local Sec=self; if type(Sec)~="table" or not (Sec._inner or Sec._holder) then return nil,"section required" end
+    cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C
+    local fields=type(cfg.Fields)=="table" and table.clone(cfg.Fields) or {"Field 1","Field 2"}; if #fields==0 then fields={"Field 1"} end; if #fields>6 then return nil,"maximum 6 input fields supported" end
     local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,64); root.BackgroundColor3=C.Card; root.BorderSizePixel=0; root.Parent=Sec._inner or Sec._holder
     if cfg.Name then local title=Instance.new("TextLabel"); title.Size=UDim2.new(1,-24,0,18); title.Position=UDim2.fromOffset(12,4); title.BackgroundTransparency=1; title.Text=tostring(cfg.Name); title.TextColor3=C.Text; title.Font=Enum.Font[Sec._lib.CurrentFontMedium]; title.TextSize=12; title.TextXAlignment=Enum.TextXAlignment.Left; title.Parent=root end
     local holder=Instance.new("Frame"); holder.Size=UDim2.new(1,-24,0,32); holder.Position=UDim2.fromOffset(12,cfg.Name and 26 or 16); holder.BackgroundTransparency=1; holder.Parent=root
@@ -5954,7 +6032,7 @@ function L:CreateNestedTabs(parentSection,cfg)
     if type(self)=="table" and (self._inner or self._holder) then cfg=type(parentSection)=="table" and parentSection or cfg; parentSection=nil
     elseif parentSection and type(parentSection)=="table" and (parentSection._inner or parentSection._holder) then Sec=parentSection
     else return nil,"parent section is required" end
-    cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or Sec._window.C; local names=type(cfg.Tabs)=="table" and table.clone(cfg.Tabs) or {"General","Advanced","About"}; if #names==0 then return nil,"at least one nested tab is required" end; while #names>12 do table.remove(names) end
+    cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C; local names=type(cfg.Tabs)=="table" and table.clone(cfg.Tabs) or {"General","Advanced","About"}; if #names==0 then return nil,"at least one nested tab is required" end; if #names>12 then return nil,"maximum 12 nested tabs supported" end
     local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,0); root.AutomaticSize=Enum.AutomaticSize.Y; root.BackgroundTransparency=1; root.Parent=Sec._inner or Sec._holder
     local bar=Instance.new("Frame"); bar.Size=UDim2.new(1,0,0,32); bar.BackgroundColor3=C.Surface; bar.BorderSizePixel=0; bar.Parent=root
     local barLayout=Instance.new("UIListLayout"); barLayout.FillDirection=Enum.FillDirection.Horizontal; barLayout.Padding=UDim.new(0,4); barLayout.Parent=bar
@@ -5980,7 +6058,8 @@ function L:CreateNestedTabs(parentSection,cfg)
 end
 
 function L:CreateTree(cfg)
-    local Sec=self; cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or Sec._window.C; local data=type(cfg.Data)=="table" and cfg.Data or {}; local maxDepth=math.floor(ClampNumber(cfg.MaxDepth,16,1,32))
+    local Sec=self; if type(Sec)~="table" or not (Sec._inner or Sec._holder) then return nil,"section required" end
+    cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C; local data=type(cfg.Data)=="table" and cfg.Data or {}; local maxDepth=math.floor(ClampNumber(cfg.MaxDepth,16,1,32))
     local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,0); root.AutomaticSize=Enum.AutomaticSize.Y; root.BackgroundColor3=C.Card; root.BorderSizePixel=0; root.Parent=Sec._inner or Sec._holder
     local rootLayout=Instance.new("UIListLayout"); rootLayout.Padding=UDim.new(0,2); rootLayout.Parent=root
     local nodeCount=0
@@ -6014,8 +6093,9 @@ function L:CreateTree(cfg)
 end
 
 function L:CreateTable(cfg)
-    local Sec=self; cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or Sec._window.C; local columns=type(cfg.Columns)=="table" and table.clone(cfg.Columns) or {"Column 1","Column 2"}; if #columns==0 then columns={"Column 1"} end; while #columns>12 do table.remove(columns) end
-    local rows=type(cfg.Rows)=="table" and table.clone(cfg.Rows) or {}; while #rows>2000 do table.remove(rows) end
+    local Sec=self; if type(Sec)~="table" or not (Sec._inner or Sec._holder) then return nil,"section required" end
+    cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C; local columns=type(cfg.Columns)=="table" and table.clone(cfg.Columns) or {"Column 1","Column 2"}; if #columns==0 then columns={"Column 1"} end; if #columns>12 then return nil,"maximum 12 table columns supported" end
+    local rows=type(cfg.Rows)=="table" and table.clone(cfg.Rows) or {}; local totalRowCount=#rows; local truncatedRowCount=math.max(0,totalRowCount-2000); while #rows>2000 do table.remove(rows) end
     local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,0); root.AutomaticSize=Enum.AutomaticSize.Y; root.BackgroundColor3=C.Card; root.BorderSizePixel=0; root.Parent=Sec._inner or Sec._holder
     local header=Instance.new("Frame"); header.Size=UDim2.new(1,0,0,32); header.BackgroundColor3=C.Surface; header.BorderSizePixel=0; header.Parent=root
     for i,column in ipairs(columns) do local label=Instance.new("TextLabel"); label.Size=UDim2.new(1/#columns,0,1,0); label.Position=UDim2.new((i-1)/#columns,0,0,0); label.BackgroundTransparency=1; label.Text=tostring(column); label.TextColor3=C.Text; label.Font=Enum.Font[Sec._lib.CurrentFontBold]; label.TextSize=11; label.TextXAlignment=Enum.TextXAlignment.Left; label.Parent=header end
@@ -6027,17 +6107,23 @@ function L:CreateTable(cfg)
             local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,28); row.BackgroundColor3=i%2==0 and C.Card or C.Surface; row.BorderSizePixel=0; row.Parent=body
             for j=1,#columns do local cell=Instance.new("TextLabel"); cell.Size=UDim2.new(1/#columns,0,1,0); cell.Position=UDim2.new((j-1)/#columns,0,0,0); cell.BackgroundTransparency=1; local value=rowData; if type(rowData)=="table" then value=rowData[j]; if value==nil and type(columns[j])=="string" then value=rowData[columns[j]] end end; cell.Text=tostring(value or ""):sub(1,512); cell.TextColor3=C.TextDim; cell.Font=Enum.Font[Sec._lib.CurrentFont]; cell.TextSize=11; cell.TextXAlignment=Enum.TextXAlignment.Left; cell.Parent=row end
         end
+        if truncatedRowCount>0 then
+            local notice=Instance.new("TextLabel"); notice.Name="RowLimitNotice"; notice.Size=UDim2.new(1,0,0,24); notice.BackgroundTransparency=1; notice.Text=string.format("Showing first 2,000 of %d rows",totalRowCount); notice.TextColor3=C.TextFaint; notice.Font=Enum.Font[Sec._lib.CurrentFont]; notice.TextSize=10; notice.Parent=body
+        end
     end
     render()
     local element=setmetatable({Instance=root,_lib=Sec._lib,_favoriteId=cfg.Flag or cfg.Name,_favoriteName=cfg.Name,_favoriteTab=Sec._tab},ElementMethods); element:InitFavorite()
     function element:GetRows() return table.clone(rows) end
-    function element:SetRows(newRows) if type(newRows)~="table" then return false end; rows=table.clone(newRows); while #rows>2000 do table.remove(rows) end; render(); return true end
+    function element:GetRowCount() return totalRowCount end
+    function element:GetTruncatedRowCount() return truncatedRowCount end
+    function element:SetRows(newRows) if type(newRows)~="table" then return false end; rows=table.clone(newRows); totalRowCount=#rows; truncatedRowCount=math.max(0,totalRowCount-2000); while #rows>2000 do table.remove(rows) end; render(); return true end
     function element:Destroy() root:Destroy() end
     Sec:_AddElement(root); return element
 end
 
 function L:CreateCarousel(cfg)
-    local Sec=self; cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or Sec._window.C; local images={}; if type(cfg.Images)=="table" then for _,imageId in ipairs(cfg.Images) do if type(imageId)=="string" and imageId~="" and #images<500 then table.insert(images,imageId:sub(1,256)) end end end; local index=#images>0 and math.floor(ClampNumber(cfg.Default,1,1,#images)) or 0
+    local Sec=self; if type(Sec)~="table" or not (Sec._inner or Sec._holder) then return nil,"section required" end
+    cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C; local images={}; if type(cfg.Images)=="table" then for _,imageId in ipairs(cfg.Images) do if type(imageId)=="string" and imageId~="" and #images<500 then table.insert(images,imageId:sub(1,256)) end end end; local index=#images>0 and math.floor(ClampNumber(cfg.Default,1,1,#images)) or 0
     local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,ClampNumber(cfg.Height,180,80,800)); root.BackgroundColor3=C.Surface; root.BorderSizePixel=0; root.ClipsDescendants=true; root.Parent=Sec._inner or Sec._holder
     local image=Instance.new("ImageLabel"); image.Size=UDim2.new(1,-16,1,-16); image.Position=UDim2.fromOffset(8,8); image.BackgroundTransparency=1; image.ScaleType=Enum.ScaleType.Fit; image.Image=images[index] or ""; image.Parent=root
     local counter=Instance.new("TextLabel"); counter.Size=UDim2.fromOffset(64,20); counter.Position=UDim2.new(.5,-32,1,-25); counter.BackgroundColor3=C.Card; counter.TextColor3=C.Text; counter.Text="0 / 0"; counter.Font=Enum.Font[Sec._lib.CurrentFont]; counter.TextSize=10; counter.Parent=root
@@ -6342,6 +6428,7 @@ function L:SetReadingModeAdvanced(enabled,window)
 end
 
 local function MakeSectionScroll(section,name,height)
+    if type(section)~="table" or not (section._inner or section._holder) then return nil,"section required" end
     local win=section._window or ResolveWindow(section)
     local C=section.C or (win and win.C) or L.C
     local root=Instance.new("Frame"); root.Name=name; root.Size=UDim2.new(1,0,0,ClampNumber(height,250,80,900)); root.BackgroundColor3=C.Surface; root.BorderSizePixel=0
@@ -6354,10 +6441,29 @@ end
 
 function L:CreatePlayerList(cfg)
     local section=self; cfg=type(cfg)=="table" and cfg or {}; local lib=section._lib or section; local win=section._window
+    if not (section._inner or section._holder) then return nil,"section required" end
     if not win then return nil,"window required" end
     local root,scroll,layout,C=MakeSectionScroll(section,"PlayerList",cfg.Height or 280)
-    local rows={}; local connections={}; local destroyed=false
-    root.Destroying:Connect(function() destroyed=true; for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end; table.clear(rows) end)
+    local rows={}; local connections={}; local destroyed=false; local thumbnailQueue={}; local thumbnailWorkers=0
+    local thumbnailConcurrency=math.floor(ClampNumber(cfg.ThumbnailConcurrency,3,1,6))
+    root.Destroying:Connect(function() destroyed=true; table.clear(thumbnailQueue); for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end; table.clear(rows) end)
+    local function queueThumbnail(player,row,avatar)
+        table.insert(thumbnailQueue,{Player=player,Row=row,Avatar=avatar})
+        while thumbnailWorkers<thumbnailConcurrency do
+            thumbnailWorkers+=1
+            task.spawn(function()
+                while not destroyed and #thumbnailQueue>0 do
+                    local item=table.remove(thumbnailQueue,1)
+                    if item and rows[item.Player]==item.Row and item.Row.Parent then
+                        local ok,image=pcall(function() return Players:GetUserThumbnailAsync(item.Player.UserId,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size48x48) end)
+                        if ok and image and item.Avatar.Parent and rows[item.Player]==item.Row then item.Avatar.Image=image end
+                    end
+                    task.wait(0.05)
+                end
+                thumbnailWorkers-=1
+            end)
+        end
+    end
     local function actionButton(parent,text,x,width)
         local button=Instance.new("TextButton"); button.Size=UDim2.fromOffset(width or 42,30); button.Position=UDim2.new(1,x,0.5,-15); button.BackgroundColor3=C.Card; button.TextColor3=C.Text; button.Text=text; button.Font=Enum.Font[lib.CurrentFontBold]; button.TextSize=11; button.BorderSizePixel=0; button.AutoButtonColor=false; button.Parent=parent
         local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,6); corner.Parent=button
@@ -6373,6 +6479,15 @@ function L:CreatePlayerList(cfg)
         local copy=actionButton(row,"ID",-132,36)
         local profile=actionButton(row,"Ver",-90,38)
         local friend=actionButton(row,"+",-46,38)
+        local function refreshActionLayout()
+            local compact=row.AbsoluteSize.X<280
+            label.Size=UDim2.new(1,compact and -160 or -190,1,0)
+            copy.Size=UDim2.fromOffset(compact and 28 or 36,30); copy.Position=UDim2.new(1,compact and -104 or -132,.5,-15); copy.TextSize=compact and 9 or 11
+            profile.Size=UDim2.fromOffset(compact and 32 or 38,30); profile.Position=UDim2.new(1,compact and -70 or -90,.5,-15); profile.TextSize=compact and 9 or 11
+            friend.Size=UDim2.fromOffset(compact and 30 or 38,30); friend.Position=UDim2.new(1,compact and -36 or -46,.5,-15); friend.TextSize=compact and 9 or 11
+        end
+        row:GetPropertyChangedSignal("AbsoluteSize"):Connect(refreshActionLayout)
+        task.defer(refreshActionLayout)
         copy.MouseButton1Click:Connect(function()
             if CLIP then local ok=pcall(CLIP,tostring(player.UserId)); lib:Notify({Title=ok and "ID copiado" or "Falha ao copiar",Text=tostring(player.UserId),Type=ok and "success" or "warning"})
             else lib:Notify({Title="ID do jogador",Text=tostring(player.UserId),Type="info"}) end
@@ -6387,10 +6502,7 @@ function L:CreatePlayerList(cfg)
             if not ok then lib:Notify({Title="Solicitação indisponível",Text="O prompt de amizade não está disponível neste contexto.",Type="warning"}) end
         end)
         rows[player]=row
-        task.spawn(function()
-            local ok,image=pcall(function() return Players:GetUserThumbnailAsync(player.UserId,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size48x48) end)
-            if ok and row.Parent then avatar.Image=image end
-        end)
+        queueThumbnail(player,row,avatar)
     end
     local function removePlayer(player)
         local row=rows[player]; rows[player]=nil
@@ -6407,14 +6519,20 @@ function L:CreatePlayerList(cfg)
         end)
         for index,player in ipairs(ordered) do local row=rows[player]; if row and row.Parent then row.LayoutOrder=index end end
     end
+    local sortQueued=false
+    local function scheduleSort()
+        if sortQueued then return end
+        sortQueued=true
+        task.delay(0.05,function() sortQueued=false; if not destroyed then sortRows() end end)
+    end
     local function refresh()
         for _,player in ipairs(Players:GetPlayers()) do addPlayer(player) end
         for player in pairs(rows) do if player.Parent~=Players then removePlayer(player) end end
         sortRows()
         return #Players:GetPlayers()
     end
-    table.insert(connections,win:_Connect(Players.PlayerAdded,function(player) addPlayer(player); sortRows() end))
-    table.insert(connections,win:_Connect(Players.PlayerRemoving,function(player) removePlayer(player); sortRows() end))
+    table.insert(connections,win:_Connect(Players.PlayerAdded,function(player) addPlayer(player); scheduleSort() end))
+    table.insert(connections,win:_Connect(Players.PlayerRemoving,function(player) removePlayer(player); scheduleSort() end))
     refresh()
     local handle={Instance=root,Rows=rows,Refresh=refresh}
     function handle:Destroy()
@@ -6427,6 +6545,7 @@ end
 
 function L:CreatePlayerTracker(cfg)
     local section=self; cfg=type(cfg)=="table" and cfg or {}; local lib=section._lib or section; local win=section._window
+    if type(section)~="table" or not (section._inner or section._holder) then return nil,"section required" end
     if not win then return nil,"window required" end
     local root,scroll,layout,C=MakeSectionScroll(section,"PlayerTracker",cfg.Height or 220)
     local connections={}; local rows={}; local destroyed=false; local limit=math.floor(ClampNumber(cfg.MaxEntries,80,10,300))
@@ -6453,6 +6572,7 @@ end
 
 function L:CreateFriendTracker(cfg)
     local section=self; cfg=type(cfg)=="table" and cfg or {}; local lib=section._lib or section; local win=section._window
+    if not (section._inner or section._holder) then return nil,"section required" end
     if not win then return nil,"window required" end
     local root,scroll,layout,C=MakeSectionScroll(section,"FriendTracker",cfg.Height or 260)
     local status=Instance.new("TextLabel"); status.Size=UDim2.new(1,-4,0,28); status.BackgroundColor3=C.Card; status.TextColor3=C.TextDim; status.Font=Enum.Font[lib.CurrentFont]; status.TextSize=10; status.Text="Press Refresh to load online friends"; status.Parent=scroll
@@ -6472,7 +6592,8 @@ function L:CreateFriendTracker(cfg)
             if not ok or type(result)~="table" then status.Text="Friend presence is unavailable in this context."; return end
             status.Text=string.format("%d online friend(s) · updated %s",#result,os.date("%H:%M:%S"))
             for _,friendData in ipairs(result) do
-                local userId=tonumber(friendData.UserId or friendData.userId)
+                if type(friendData)=="table" then
+                local userId=tonumber(friendData.VisitorId or friendData.UserId or friendData.userId or friendData.UserID)
                 local display=tostring(friendData.DisplayName or friendData.UserName or friendData.Username or "Friend")
                 local username=tostring(friendData.UserName or friendData.Username or display)
                 local location=tostring(friendData.LastLocation or friendData.lastLocation or "Online")
@@ -6481,6 +6602,7 @@ function L:CreateFriendTracker(cfg)
                 if userId then
                     local inspect=Instance.new("TextButton"); inspect.Size=UDim2.fromOffset(42,28); inspect.Position=UDim2.new(1,-48,.5,-14); inspect.BackgroundColor3=C.Surface; inspect.TextColor3=C.Text; inspect.Text="Ver"; inspect.Font=Enum.Font[lib.CurrentFontBold]; inspect.TextSize=10; inspect.Parent=row
                     inspect.MouseButton1Click:Connect(function() pcall(function() GuiService:InspectPlayerFromUserId(userId) end) end)
+                end
                 end
             end
         end)
@@ -6512,7 +6634,8 @@ end
 
 L._serverHistoryFile="library_server_history.json"
 function L:GetServerHistory()
-    return JsonRead(self._serverHistoryFile,{})
+    local history=JsonRead(self._serverHistoryFile,{})
+    return type(history)=="table" and history or {}
 end
 function L:WriteLastJobId(jobId,placeId)
     jobId=tostring(jobId or "")
@@ -6547,8 +6670,9 @@ end
 
 function L:CreateServerList(cfg)
     local section=self; cfg=type(cfg)=="table" and cfg or {}; local lib=section._lib or section; local win=section._window
+    if not (section._inner or section._holder) then return nil,"section required" end
     if not win then return nil,"window required" end
-    local C=section.C or win.C; local placeId=tonumber(cfg.PlaceId)
+    local C=section.C or (win and win.C) or lib.C or L.C; local placeId=tonumber(cfg.PlaceId)
     if not placeId or placeId~=placeId or placeId==math.huge or placeId==-math.huge or placeId<=0 then placeId=game.PlaceId end
     placeId=math.floor(placeId)
     local root=Instance.new("Frame"); root.Name="ServerList"; root.Size=UDim2.new(1,0,0,ClampNumber(cfg.Height,300,120,900)); root.BackgroundColor3=C.Surface; root.BorderSizePixel=0
@@ -6556,6 +6680,7 @@ function L:CreateServerList(cfg)
     local status=Instance.new("TextLabel"); status.Size=UDim2.new(1,-132,0,30); status.Position=UDim2.fromOffset(8,4); status.BackgroundTransparency=1; status.Text="Public servers"; status.TextColor3=C.TextDim; status.Font=Enum.Font[lib.CurrentFont]; status.TextSize=10; status.TextXAlignment=Enum.TextXAlignment.Left; status.Parent=root
     local refreshButton=Instance.new("TextButton"); refreshButton.Size=UDim2.fromOffset(62,26); refreshButton.Position=UDim2.new(1,-128,0,5); refreshButton.BackgroundColor3=C.AccentSoft; refreshButton.TextColor3=C.White; refreshButton.Text="Refresh"; refreshButton.Font=Enum.Font[lib.CurrentFontBold]; refreshButton.TextSize=10; refreshButton.Parent=root
     local moreButton=Instance.new("TextButton"); moreButton.Size=UDim2.fromOffset(56,26); moreButton.Position=UDim2.new(1,-62,0,5); moreButton.BackgroundColor3=C.Card; moreButton.TextColor3=C.Text; moreButton.Text="More"; moreButton.Font=Enum.Font[lib.CurrentFontBold]; moreButton.TextSize=10; moreButton.Parent=root
+    moreButton.Active=false; moreButton.AutoButtonColor=false
     local scroll=Instance.new("ScrollingFrame"); scroll.Size=UDim2.new(1,-12,1,-42); scroll.Position=UDim2.fromOffset(6,36); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4; scroll.ScrollBarImageColor3=C.Accent; scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(); scroll.Parent=root
     local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,5); layout.Parent=scroll
     local connections={}; local nextCursor=nil; local requestToken=0; local destroyed=false
@@ -6618,8 +6743,9 @@ end
 
 function L:CreateServerInfoPanel(cfg)
     local section=self; cfg=type(cfg)=="table" and cfg or {}; local lib=section._lib or section; local win=section._window
+    if not (section._inner or section._holder) then return nil,"section required" end
     if not win then return nil,"window required" end
-    local C=section.C or win.C; local root=Instance.new("Frame"); root.Name="ServerInfoPanel"; root.Size=UDim2.new(1,0,0,ClampNumber(cfg.Height,100,60,500)); root.BackgroundColor3=C.Card; root.BorderSizePixel=0
+    local C=section.C or (win and win.C) or lib.C or L.C; local root=Instance.new("Frame"); root.Name="ServerInfoPanel"; root.Size=UDim2.new(1,0,0,ClampNumber(cfg.Height,100,60,500)); root.BackgroundColor3=C.Card; root.BorderSizePixel=0
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,9); corner.Parent=root
     local label=Instance.new("TextLabel"); label.Size=UDim2.new(1,-20,1,-14); label.Position=UDim2.fromOffset(10,7); label.BackgroundTransparency=1; label.TextColor3=C.Text; label.Font=Enum.Font[lib.CurrentFont]; label.TextSize=11; label.TextWrapped=true; label.TextXAlignment=Enum.TextXAlignment.Left; label.TextYAlignment=Enum.TextYAlignment.Top; label.Parent=root
     section:_AddElement(root)
@@ -6664,6 +6790,7 @@ end
 
 function L:CreateRejoinLastServer(cfg)
     local section=self; cfg=type(cfg)=="table" and cfg or {}; local lib=section._lib or section
+    if not (section._inner or section._holder) then return nil,"section required" end
     return section:CreateButton({Name=cfg.Name or "Rejoin last server",Icon=cfg.Icon,Callback=function()
         local ok,err=lib:RejoinLastServer(cfg.OnJoin)
         if cfg.Callback then pcall(cfg.Callback,ok,err) end
@@ -6673,8 +6800,9 @@ end
 
 function L:CreateSoundSettings(cfg)
     local section=self; cfg=type(cfg)=="table" and cfg or {}; local lib=section._lib or section; local win=section._window
+    if not (section._inner or section._holder) then return nil,"section required" end
     if not win then return nil,"window required" end
-    local C=section.C or win.C; local root=Instance.new("Frame"); root.Name="SoundSettings"; root.Size=UDim2.new(1,0,0,112); root.BackgroundColor3=C.Card; root.BorderSizePixel=0
+    local C=section.C or (win and win.C) or lib.C or L.C; local root=Instance.new("Frame"); root.Name="SoundSettings"; root.Size=UDim2.new(1,0,0,112); root.BackgroundColor3=C.Card; root.BorderSizePixel=0
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,9); corner.Parent=root
     local title=Instance.new("TextLabel"); title.Size=UDim2.new(1,-16,0,20); title.Position=UDim2.fromOffset(8,4); title.BackgroundTransparency=1; title.Text=cfg.Name or "Hub sounds"; title.TextColor3=C.Text; title.Font=Enum.Font[lib.CurrentFontBold]; title.TextSize=11; title.TextXAlignment=Enum.TextXAlignment.Left; title.Parent=root
     local enabled=Instance.new("TextButton"); enabled.Size=UDim2.fromOffset(92,26); enabled.Position=UDim2.fromOffset(8,29); enabled.BackgroundColor3=C.Surface; enabled.TextColor3=C.Text; enabled.Font=Enum.Font[lib.CurrentFont]; enabled.TextSize=10; enabled.Parent=root
@@ -6683,17 +6811,34 @@ function L:CreateSoundSettings(cfg)
     local volumeBar=Instance.new("Frame"); volumeBar.Size=UDim2.new(1,-16,0,10); volumeBar.Position=UDim2.fromOffset(8,64); volumeBar.BackgroundColor3=C.Surface; volumeBar.BorderSizePixel=0; volumeBar.Parent=root
     local fill=Instance.new("Frame"); fill.Size=UDim2.new(ClampNumber(lib.Sounds.volume,.5,0,1),0,1,0); fill.BackgroundColor3=C.Accent; fill.BorderSizePixel=0; fill.Parent=volumeBar
     local volumeHit=Instance.new("TextButton"); volumeHit.Size=UDim2.new(1,0,1,12); volumeHit.Position=UDim2.new(0,0,.5,-6); volumeHit.BackgroundTransparency=1; volumeHit.Text=""; volumeHit.Parent=volumeBar
-    local channels={"UI","Effects","Transitions","Music","Ambient"}; local channelIndex=1
+    local channels=GetSoundChannelNames(lib.Sounds); local channelIndex=table.find(channels,"UI") or 1
     local channel=Instance.new("TextButton"); channel.Size=UDim2.fromOffset(142,26); channel.Position=UDim2.fromOffset(8,78); channel.BackgroundColor3=C.Surface; channel.TextColor3=C.Text; channel.Font=Enum.Font[lib.CurrentFont]; channel.TextSize=10; channel.Parent=root
     local mixLabel=Instance.new("TextButton"); mixLabel.Size=UDim2.new(1,-166,0,26); mixLabel.Position=UDim2.fromOffset(158,78); mixLabel.BackgroundTransparency=1; mixLabel.TextColor3=C.TextDim; mixLabel.Font=Enum.Font[lib.CurrentFont]; mixLabel.TextSize=10; mixLabel.TextXAlignment=Enum.TextXAlignment.Left; mixLabel.Parent=root
+    local function refreshChannels()
+        local selected=channels[channelIndex]
+        channels=GetSoundChannelNames(lib.Sounds)
+        channelIndex=table.find(channels,selected) or 1
+    end
     local function refresh()
+        refreshChannels()
         enabled.Text="Sounds: "..(lib.Sounds.enabled and "On" or "Off"); silent.Text="Mute: "..(lib.Sounds.silent and "On" or "Off")
         local vol=ClampNumber(lib.Sounds.volume,0.5,0,1); fill.Size=UDim2.new(vol,0,1,0); volumeLabel.Text=string.format("Volume %d%%",math.floor(vol*100+.5))
-        channel.Text="Channel: "..channels[channelIndex]; mixLabel.Text=string.format("Mix: %d%%",math.floor(ClampNumber((lib.Sounds.channels or {})[channels[channelIndex]],1,0,1)*100+.5))
+        local selectedChannel=channels[channelIndex] or "UI"
+        channel.Text="Channel: "..selectedChannel; mixLabel.Text=string.format("Mix: %d%%",math.floor(ClampNumber((lib.Sounds.channels or {})[selectedChannel],1,0,1)*100+.5))
     end
-    local function setVolume(x) if volumeBar.AbsoluteSize.X<=0 then return end; lib.Sounds.volume=math.clamp((x-volumeBar.AbsolutePosition.X)/volumeBar.AbsoluteSize.X,0,1); refresh() end
+    local function emitSettingsChanged()
+        lib:Emit("SoundSettingsChanged",{
+            Silent=lib.Sounds.silent,Enabled=lib.Sounds.enabled,Volume=lib.Sounds.volume,
+            Channels=table.clone(lib.Sounds.channels or {})
+        })
+    end
+    local function setVolume(x)
+        if volumeBar.AbsoluteSize.X<=0 then return end
+        lib.Sounds.volume=math.clamp((x-volumeBar.AbsolutePosition.X)/volumeBar.AbsoluteSize.X,0,1)
+        emitSettingsChanged(); refresh()
+    end
     volumeHit.MouseButton1Down:Connect(function(x) setVolume(x) end)
-    enabled.MouseButton1Click:Connect(function() lib.Sounds.enabled=not lib.Sounds.enabled; if not lib.Sounds.enabled then lib:StopSound(.15) end; refresh() end)
+    enabled.MouseButton1Click:Connect(function() lib.Sounds.enabled=not lib.Sounds.enabled; if not lib.Sounds.enabled then lib:StopSound(.15) end; emitSettingsChanged(); refresh() end)
     silent.MouseButton1Click:Connect(function() lib:SetSoundSilent(not lib.Sounds.silent); refresh() end)
     channel.MouseButton1Click:Connect(function() channelIndex=channelIndex%#channels+1; refresh() end)
     mixLabel.MouseButton1Click:Connect(function()
@@ -6703,18 +6848,20 @@ function L:CreateSoundSettings(cfg)
         lib:SetSoundChannelVolume(channels[channelIndex],nextLevel); refresh()
     end)
     local dragging=false; local connections={}
+    table.insert(connections,lib:On("SoundSettingsChanged",function() if root.Parent then refresh() end end))
     table.insert(connections,volumeHit.InputBegan:Connect(function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=true; setVolume(input.Position.X) end end))
     table.insert(connections,win:_Connect(UIS.InputChanged,function(input) if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then setVolume(input.Position.X) end end))
     table.insert(connections,win:_Connect(UIS.InputEnded,function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=false end end))
     section:_AddElement(root); refresh()
-    local handle={Instance=root,Refresh=refresh,SetVolume=function(_,value) lib.Sounds.volume=ClampNumber(value,0,0,1); refresh() end}
+    local handle={Instance=root,Refresh=refresh,SetVolume=function(_,value) lib.Sounds.volume=ClampNumber(value,0,0,1); emitSettingsChanged(); refresh() end}
     root.Destroying:Connect(function() for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end end)
     function handle:Destroy() for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end; if root.Parent then root:Destroy() end end
     return handle
 end
 
 function L:CreateCollapsibleGroup(cfg)
-    local parent=self; cfg=type(cfg)=="table" and cfg or {}; local C=parent.C or parent._window.C; local collapsed=cfg.Collapsed==true
+    local parent=self; if type(parent)~="table" or not (parent._inner or parent._holder) then return nil,"section required" end
+    cfg=type(cfg)=="table" and cfg or {}; local C=parent.C or (parent._window and parent._window.C) or (parent._lib and parent._lib.C) or L.C; local collapsed=cfg.Collapsed==true
     local root=Instance.new("Frame"); root.Name="CollapsibleGroup"; root.Size=UDim2.new(1,0,0,0); root.AutomaticSize=Enum.AutomaticSize.Y; root.BackgroundColor3=C.Surface; root.BorderSizePixel=0
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,8); corner.Parent=root
     local header=Instance.new("TextButton"); header.Size=UDim2.new(1,0,0,32); header.BackgroundTransparency=1; header.Text=""; header.AutoButtonColor=false; header.Parent=root
