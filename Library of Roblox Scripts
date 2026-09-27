@@ -1,6 +1,6 @@
 local L = {}
 L.__index = L
-L.Version = "6.4.0"
+L.Version = "6.5.0"
 L._iconAnimationHandles = {}
 L._iconAnimationByImage = setmetatable({}, {__mode="k"})
 local SplashGui = nil
@@ -664,7 +664,15 @@ function L:SetTransparency(value)
     end
     return value
 end
-function L:SetReducedMotion(enabled) self.Config=self.Config or {}; self.Config.ReducedMotion=enabled==true; return self.Config.ReducedMotion end
+function L:SetReducedMotion(enabled)
+    self.Config=self.Config or {}; self.Config.ReducedMotion=enabled==true
+    if self.Config.ReducedMotion then
+        for _,win in ipairs(self._allWindows or {}) do
+            if win and win._logoAnimation and win._logoAnimation.Stop then win._logoAnimation:Stop() end
+        end
+    end
+    return self.Config.ReducedMotion
+end
 function L:GetReducedMotion() return self.Config and self.Config.ReducedMotion==true or false end
 
 L.Palettes = {
@@ -818,12 +826,20 @@ L.Sounds = {
     open="", close="", key="", notify="",
     enabled=true, volume=0.5, silent=false,
     channels={UI=1,Effects=1,Transitions=1,Music=1,Ambient=1},
+    ducking={enabled=false,volume=.35,channels={UI=true}},
     favorites={}, history={}, playlists={}, transitionHooks={}, library={}
 }
 L.Sounds.favorites=JsonRead("library_sound_favorites.json",{})
 if type(L.Sounds.favorites)~="table" then L.Sounds.favorites={} end
 
 local DefaultSoundChannels={"Music","UI","Effects","Transitions","Ambient"}
+local DefaultSoundSlots={"click","hover","success","error","open","close","key","notify"}
+local savedSoundSlots=JsonRead("library_sound_slots.json",{})
+if type(savedSoundSlots)=="table" then
+    for _,slot in ipairs(DefaultSoundSlots) do
+        if savedSoundSlots[slot]~=nil then L.Sounds[slot]=NormalizeSoundId(savedSoundSlots[slot]) or "" end
+    end
+end
 local function GetSoundChannelNames(sounds)
     local names={}; local seen={}; local extras={}
     for _,name in ipairs(DefaultSoundChannels) do seen[name]=true; table.insert(names,name) end
@@ -838,13 +854,16 @@ end
 
 function L:SetSounds(cfg)
     cfg=type(cfg)=="table" and cfg or {}
-    for k, v in pairs(cfg) do if k~="channels" then self.Sounds[k] = v end end
+    for k,v in pairs(cfg) do
+        if type(k)=="string" and k:lower()~="channels" then self.Sounds[k]=v end
+    end
     self.Sounds.volume=ClampNumber(self.Sounds.volume,0.5,0,1)
     self.Sounds.enabled=self.Sounds.enabled~=false
     self.Sounds.silent=self.Sounds.silent==true
     self.Sounds.channels=type(self.Sounds.channels)=="table" and self.Sounds.channels or {}
-    if type(cfg.channels)=="table" then
-        for channel,value in pairs(cfg.channels) do
+    local configuredChannels=type(cfg.channels)=="table" and cfg.channels or cfg.Channels
+    if type(configuredChannels)=="table" then
+        for channel,value in pairs(configuredChannels) do
             if type(channel)=="string" and channel~="" then self.Sounds.channels[channel]=ClampNumber(value,self.Sounds.channels[channel] or 1,0,1) end
         end
     end
@@ -852,11 +871,20 @@ function L:SetSounds(cfg)
         if type(channel)=="string" and channel~="" then self.Sounds.channels[channel]=ClampNumber(value,1,0,1) end
     end
     for _,channel in ipairs(DefaultSoundChannels) do self.Sounds.channels[channel]=ClampNumber(self.Sounds.channels[channel],1,0,1) end
+    for _,slot in ipairs(DefaultSoundSlots) do
+        local raw=self.Sounds[slot]
+        if raw==nil or tostring(raw):match("^%s*$") then self.Sounds[slot]=""
+        else self.Sounds[slot]=NormalizeSoundId(raw) or "" end
+    end
     self.Sounds.favorites = type(self.Sounds.favorites)=="table" and self.Sounds.favorites or {}
     self.Sounds.history = type(self.Sounds.history)=="table" and self.Sounds.history or {}
     self.Sounds.playlists = type(self.Sounds.playlists)=="table" and self.Sounds.playlists or {}
     self.Sounds.transitionHooks = type(self.Sounds.transitionHooks)=="table" and self.Sounds.transitionHooks or {}
     self.Sounds.library=type(self.Sounds.library)=="table" and self.Sounds.library or {}
+    self.Sounds.ducking=type(self.Sounds.ducking)=="table" and self.Sounds.ducking or {enabled=false,volume=.35,channels={UI=true}}
+    self.Sounds.ducking.enabled=self.Sounds.ducking.enabled==true
+    self.Sounds.ducking.volume=ClampNumber(self.Sounds.ducking.volume,.35,0,1)
+    self.Sounds.ducking.channels=type(self.Sounds.ducking.channels)=="table" and self.Sounds.ducking.channels or {UI=true}
     local invalidSoundNames={}
     for name,entry in pairs(self.Sounds.library) do
         local normalized=type(entry)=="table" and NormalizeSoundId(entry.Id)
@@ -864,9 +892,10 @@ function L:SetSounds(cfg)
         else entry.Name=tostring(entry.Name or name); entry.Category=tostring(entry.Category or "General"); entry.Id=normalized end
     end
     for _,name in ipairs(invalidSoundNames) do self.Sounds.library[name]=nil end
+    if self._UpdateSoundDucking then self:_UpdateSoundDucking() end
     self:Emit("SoundSettingsChanged",{
         Silent=self.Sounds.silent,Enabled=self.Sounds.enabled,Volume=self.Sounds.volume,
-        Channels=table.clone(self.Sounds.channels)
+        Channels=table.clone(self.Sounds.channels),Ducking=self.Sounds.ducking.enabled
     })
 end
 
@@ -876,6 +905,79 @@ function L:SetSoundChannelVolume(channel, volume)
     self.Sounds.channels[channel] = ClampNumber(volume,1,0,1)
     self:Emit("SoundSettingsChanged",{Silent=self.Sounds.silent,Enabled=self.Sounds.enabled,Volume=self.Sounds.volume,Channel=channel,ChannelVolume=self.Sounds.channels[channel]})
     return self.Sounds.channels[channel]
+end
+
+function L:_UpdateSoundDucking()
+    local sounds=self._duckedSoundVolumes or {}
+    local config=self.Sounds and self.Sounds.ducking or {}
+    local factor=(config.enabled==true and (self._soundDuckCount or 0)>0) and ClampNumber(config.volume,.35,0,1) or 1
+    for sound,baseVolume in pairs(sounds) do
+        if sound and sound.Parent then
+            pcall(function() TweenService:Create(sound,T_FAST,{Volume=ClampNumber(baseVolume,0,0,1)*factor}):Play() end)
+        else
+            sounds[sound]=nil
+        end
+    end
+end
+
+function L:_BeginSoundDuck(channel)
+    local config=self.Sounds and self.Sounds.ducking
+    if type(config)~="table" or config.enabled~=true then return nil end
+    local channels=type(config.channels)=="table" and config.channels or {UI=true}
+    if channels[channel]~=true then return nil end
+    self._soundDuckCount=(self._soundDuckCount or 0)+1
+    if self._soundDuckCount==1 then self:_UpdateSoundDucking() end
+    local released=false
+    return function()
+        if released then return end
+        released=true
+        self._soundDuckCount=math.max(0,(self._soundDuckCount or 0)-1)
+        if self._soundDuckCount==0 then self:_UpdateSoundDucking() end
+    end
+end
+
+function L:SetSoundDucking(enabled,cfg)
+    cfg=type(cfg)=="table" and cfg or {}
+    self.Sounds.ducking=type(self.Sounds.ducking)=="table" and self.Sounds.ducking or {enabled=false,volume=.35,channels={UI=true}}
+    self.Sounds.ducking.enabled=enabled==true
+    if cfg.Volume~=nil then self.Sounds.ducking.volume=ClampNumber(cfg.Volume,.35,0,1) end
+    if type(cfg.Channels)=="table" then
+        local selected={}
+        for channel,value in pairs(cfg.Channels) do if type(channel)=="string" and value==true then selected[channel]=true end end
+        self.Sounds.ducking.channels=selected
+    end
+    self:_UpdateSoundDucking()
+    self:Emit("SoundSettingsChanged",{Ducking=self.Sounds.ducking.enabled,Enabled=self.Sounds.enabled,Silent=self.Sounds.silent,Volume=self.Sounds.volume})
+    return self.Sounds.ducking.enabled
+end
+
+function L:SetSoundSlot(slot, assetId)
+    if type(slot)~="string" or not table.find(DefaultSoundSlots,slot) then
+        return false,"unknown sound slot"
+    end
+    if assetId==nil or tostring(assetId):match("^%s*$") then
+        self.Sounds[slot]=""
+    else
+        local normalized=NormalizeSoundId(assetId)
+        if not normalized then return false,"sound id must be a numeric asset id or rbxassetid:// URI" end
+        self.Sounds[slot]=normalized
+    end
+    local saved={}
+    for _,soundSlot in ipairs(DefaultSoundSlots) do saved[soundSlot]=self.Sounds[soundSlot] or "" end
+    JsonWrite("library_sound_slots.json",saved)
+    self:Emit("SoundSettingsChanged",{Slot=slot,AssetId=self.Sounds[slot]})
+    return true,self.Sounds[slot]
+end
+
+function L:GetSoundHistory(limit)
+    local history=type(self.Sounds.history)=="table" and self.Sounds.history or {}
+    local count=math.floor(ClampNumber(limit,#history,0,50))
+    local result={}
+    for index=1,math.min(count,#history) do
+        local entry=history[index]
+        result[index]=type(entry)=="table" and table.clone(entry) or entry
+    end
+    return result
 end
 
 function L:SetSoundSilent(silent)
@@ -914,6 +1016,7 @@ function L:ImportSoundPlaylist(name, ids, category)
     end
     self.Sounds.playlists = self.Sounds.playlists or {}
     self.Sounds.playlists[name] = {category=category or "Custom", sounds=list}
+    self:Emit("SoundPlaylistsChanged",name,table.clone(list))
     return list
 end
 function L:PlaySoundPlaylist(name,index)
@@ -924,11 +1027,13 @@ function L:PlaySoundPlaylist(name,index)
 end
 
 function L:StopSound(fadeDuration)
-    local sound = self._activeSound
+    local sound = self._activeSound or self._pausedSound
     if not sound then return false end
     self._soundFadeToken=(self._soundFadeToken or 0)+1
     local token=self._soundFadeToken
     self._activeSound=nil
+    self._pausedSound=nil
+    self:Emit("SoundPlaybackChanged",{State="Stopped",Sound=sound})
     local duration=ClampNumber(fadeDuration,0,0,10)
     if duration == 0 then pcall(function() sound:Stop(); sound:Destroy() end); return true end
     local startVolume = sound.Volume
@@ -945,6 +1050,27 @@ function L:StopSound(fadeDuration)
     return true
 end
 
+function L:PauseSound()
+    local sound=self._activeSound
+    if not sound or not sound.Parent or not sound.IsPlaying then return false end
+    local ok=pcall(function() sound:Pause() end)
+    if not ok then return false end
+    self._pausedSound=sound
+    self:Emit("SoundPlaybackChanged",{State="Paused",Sound=sound})
+    return true
+end
+
+function L:ResumeSound()
+    local sound=self._pausedSound
+    if not sound or not sound.Parent then self._pausedSound=nil; return false end
+    local ok=pcall(function() sound:Resume() end)
+    if not ok then return false end
+    self._pausedSound=nil
+    self._activeSound=sound
+    self:Emit("SoundPlaybackChanged",{State="Playing",Sound=sound})
+    return true
+end
+
 function L:_PlaySoundId(id, slot, channel, options)
     if self._destroyed then return false,"library is destroyed" end
     if self.Sounds.silent or not self.Sounds.enabled then return false,"sound playback is disabled" end
@@ -958,29 +1084,74 @@ function L:_PlaySoundId(id, slot, channel, options)
         if existing and existing.Parent then activeCount+=1 else self._activeSoundInstances[existing]=nil end
     end
     if activeCount>=32 then return false,"active sound limit reached" end
+    local createdSound; local releaseDuck
     local ok,sound=pcall(function()
         local s = Instance.new("Sound")
+        createdSound=s
         s.SoundId = id
-        local targetVolume = ClampNumber(self.Sounds.volume,0.5,0,1) * ClampNumber((self.Sounds.channels or {})[channel],1,0,1)
+        local baseTargetVolume=ClampNumber(self.Sounds.volume,0.5,0,1) * ClampNumber((self.Sounds.channels or {})[channel],1,0,1)
+        local targetVolume=baseTargetVolume
+        self._duckedSoundVolumes=self._duckedSoundVolumes or setmetatable({}, {__mode="k"})
+        if channel=="Music" or channel=="Ambient" then
+            self._duckedSoundVolumes[s]=baseTargetVolume
+            local ducking=self.Sounds.ducking
+            if ducking and ducking.enabled and (self._soundDuckCount or 0)>0 then targetVolume*=ClampNumber(ducking.volume,.35,0,1) end
+        end
         s.Volume = fadeIn>0 and 0 or targetVolume
         if options.Pitch~=nil then s.PlaybackSpeed=ClampNumber(options.Pitch,1,0.5,2) end
+        s.Looped=options.Looped==true
         s.Parent = SS
         self._activeSoundInstances[s]=true
+        releaseDuck=self:_BeginSoundDuck(channel)
         self.Sounds.history = self.Sounds.history or {}
         table.insert(self.Sounds.history, 1, {id=id, slot=slot, channel=channel, time=os.time()})
         while #self.Sounds.history > 50 do table.remove(self.Sounds.history) end
-        if channel == "Music" or channel == "Ambient" then
+        if channel == "Music" or channel == "Ambient" or options.Track==true then
             self:StopSound(options and options.FadeOut or 0.15)
             self._activeSound = s
+            self._pausedSound=nil
         end
         s:Play()
+        if self._activeSound==s then self:Emit("SoundPlaybackChanged",{State="Playing",Sound=s}) end
+        local startTime=ClampNumber(options.TimePosition,0,0,3600000)
+        if startTime>0 then
+            task.spawn(function()
+                local deadline=os.clock()+5
+                while s.Parent and not s.IsLoaded and os.clock()<deadline do task.wait(0.05) end
+                if s.Parent and s.IsLoaded and s.TimeLength>0 then
+                    pcall(function() s.TimePosition=math.clamp(startTime,0,math.max(s.TimeLength-0.05,0)) end)
+                end
+            end)
+        end
         if fadeIn>0 then TweenService:Create(s,TweenInfo.new(math.max(fadeIn,0.05)),{Volume=targetVolume}):Play() end
-        s.Ended:Connect(function() if self._activeSound == s then self._activeSound=nil end; s:Destroy() end)
-        s.Destroying:Connect(function() self._activeSoundInstances[s]=nil; if self._activeSound==s then self._activeSound=nil end end)
-        task.delay(120, function() if s and s.Parent then s:Destroy() end end)
+        s.Ended:Connect(function()
+            if self._activeSound == s then self._activeSound=nil end
+            if self._pausedSound == s then self._pausedSound=nil end
+            self:Emit("SoundPlaybackChanged",{State="Ended",Sound=s})
+            s:Destroy()
+        end)
+        s.Destroying:Connect(function()
+            self._activeSoundInstances[s]=nil
+            if self._duckedSoundVolumes then self._duckedSoundVolumes[s]=nil end
+            if releaseDuck then releaseDuck(); releaseDuck=nil end
+            if self._activeSound==s then self._activeSound=nil end
+            if self._pausedSound==s then self._pausedSound=nil end
+        end)
+        local maxDuration=options.MaxDuration~=nil and ClampNumber(options.MaxDuration,120,1,86400)
+            or (s.Looped and 0 or ((channel=="Music" or channel=="Ambient") and 3600 or 120))
+        if maxDuration>0 then task.delay(maxDuration,function() if s and s.Parent then s:Destroy() end end) end
+        self:Emit("SoundPlayed",{Id=id,Slot=slot,Channel=channel,Time=os.time()})
         return s
     end)
-    if not ok then return false,tostring(sound) end
+    if not ok then
+        if createdSound then
+            if self._activeSoundInstances then self._activeSoundInstances[createdSound]=nil end
+            if self._activeSound==createdSound then self._activeSound=nil end
+            pcall(function() createdSound:Stop(); createdSound:Destroy() end)
+        end
+        if releaseDuck then releaseDuck(); releaseDuck=nil end
+        return false,tostring(sound)
+    end
     return sound~=nil
 end
 
@@ -1059,19 +1230,29 @@ function L:CreateSoundBox(cfg)
     title.TextXAlignment=Enum.TextXAlignment.Left; title.Font=Enum.Font[self.CurrentFontBold]
     local asset=makeText("TextBox",panel,UDim2.new(1,-24,0,34),UDim2.new(0,12,0,42),"",theme.Card)
     asset.PlaceholderText="Asset ID or rbxassetid://..."; asset.ClearTextOnFocus=false
-    local pitch=makeText("TextBox",panel,UDim2.new(0,72,0,32),UDim2.new(0,12,0,84),"1",theme.Card); pitch.PlaceholderText="Pitch"
-    local play=makeText("TextButton",panel,UDim2.new(0,72,0,32),UDim2.new(0,92,0,84),"Play",theme.AccentSoft)
-    local stop=makeText("TextButton",panel,UDim2.new(0,72,0,32),UDim2.new(0,172,0,84),"Fade stop",theme.Card)
-    local silent=makeText("TextButton",panel,UDim2.new(0,92,0,32),UDim2.new(0,252,0,84),"Silent: "..(self.Sounds.silent and "on" or "off"),theme.Card)
+    local pitch=makeText("TextBox",panel,UDim2.new(0,52,0,32),UDim2.new(0,12,0,84),"1",theme.Card); pitch.PlaceholderText="Pitch"
+    local play=makeText("TextButton",panel,UDim2.new(0,58,0,32),UDim2.new(0,70,0,84),"Play",theme.AccentSoft)
+    local pause=makeText("TextButton",panel,UDim2.new(0,58,0,32),UDim2.new(0,134,0,84),"Pause",theme.Card)
+    local stop=makeText("TextButton",panel,UDim2.new(0,58,0,32),UDim2.new(0,198,0,84),"Stop",theme.Card)
+    local silent=makeText("TextButton",panel,UDim2.new(0,82,0,32),UDim2.new(0,264,0,84),"Mute: "..(self.Sounds.silent and "on" or "off"),theme.Card)
     local refreshChannelOptions,channelSubscription
     local silentSubscription=self:On("SoundSettingsChanged",function(state)
-        if gui.Parent then silent.Text="Silent: "..(state and state.Silent and "on" or "off") end
+        if gui.Parent then silent.Text="Mute: "..(state and state.Silent and "on" or "off") end
+    end)
+    local playbackSubscription=self:On("SoundPlaybackChanged",function(state)
+        if not gui.Parent then return end
+        if state and state.State=="Paused" then pause.Text="Resume"
+        elseif state and state.State=="Playing" then pause.Text="Pause"
+        elseif state and (state.State=="Ended" or state.State=="Stopped") then pause.Text="Pause" end
     end)
     gui.Destroying:Connect(function()
         if silentSubscription then silentSubscription:Disconnect() end
         if channelSubscription then channelSubscription:Disconnect() end
+        if playbackSubscription then playbackSubscription:Disconnect() end
     end)
     local channel=makeText("TextButton",panel,UDim2.new(0,180,0,30),UDim2.new(0,12,0,124),"Channel: Music",theme.Card)
+    local looped=false
+    local loop=makeText("TextButton",panel,UDim2.new(0,68,0,30),UDim2.new(0,198,0,124),"Loop: Off",theme.Card)
     local channelVolume=makeText("TextBox",panel,UDim2.new(0,72,0,30),UDim2.new(1,-84,0,124),tostring((self.Sounds.channels or {}).Music or 1),theme.Card)
     channelVolume.PlaceholderText="Mix"; channelVolume.ClearTextOnFocus=false
     local channels=GetSoundChannelNames(self.Sounds); local channelIndex=table.find(channels,"Music") or 1
@@ -1088,8 +1269,14 @@ function L:CreateSoundBox(cfg)
     channelVolume.FocusLost:Connect(function() self:SetSoundChannelVolume(channels[channelIndex],channelVolume.Text) end)
     play.MouseButton1Click:Connect(function()
         local n=tonumber(pitch.Text) or 1
-        self:PlaySoundAsset(asset.Text,channels[channelIndex],{Pitch=n,FadeIn=cfg.FadeIn or 0})
+        self:PlaySoundAsset(asset.Text,channels[channelIndex],{Pitch=n,FadeIn=cfg.FadeIn or 0,Looped=looped,Track=true})
+        play.Text="Play"
     end)
+    pause.MouseButton1Click:Connect(function()
+        if self._pausedSound then self:ResumeSound()
+        elseif self._activeSound and self._activeSound.Parent and self._activeSound.IsPlaying then self:PauseSound() end
+    end)
+    loop.MouseButton1Click:Connect(function() looped=not looped; loop.Text=looped and "Loop: On" or "Loop: Off" end)
     stop.MouseButton1Click:Connect(function() self:StopSound(cfg.FadeOut or 0.35) end)
     silent.MouseButton1Click:Connect(function() self:SetSoundSilent(not self.Sounds.silent) end)
     local close=makeText("TextButton",panel,UDim2.new(0,28,0,26),UDim2.new(1,-38,0,8),"×",theme.Card)
@@ -1104,23 +1291,61 @@ function L:CreateSoundBox(cfg)
             self:RegisterSound(name,soundId,category)
         end
     end
-    local query=makeText("TextBox",panel,UDim2.new(1,-104,0,30),UDim2.new(0,12,0,164),"",theme.Card)
+    local query=makeText("TextBox",panel,UDim2.new(1,-112,0,30),UDim2.new(0,12,0,164),"",theme.Card)
     query.PlaceholderText="Search sound library..."; query.ClearTextOnFocus=false
-    local favoritesOnly=false
-    local favorites=makeText("TextButton",panel,UDim2.new(0,84,0,30),UDim2.new(1,-96,0,164),"All sounds",theme.Card)
+    local views={"Library","Favorites","History","Playlists"}; local viewIndex=1
+    local viewButton=makeText("TextButton",panel,UDim2.new(0,84,0,30),UDim2.new(1,-96,0,164),views[viewIndex],theme.Card)
     local results=Instance.new("ScrollingFrame")
-    results.Size=UDim2.new(1,-24,0,174); results.Position=UDim2.new(0,12,0,202); results.BackgroundTransparency=1; results.BorderSizePixel=0
+    results.Size=UDim2.new(1,-24,0,134); results.Position=UDim2.new(0,12,0,202); results.BackgroundTransparency=1; results.BorderSizePixel=0
     results.ScrollBarThickness=4; results.ScrollBarImageColor3=theme.Accent; results.CanvasSize=UDim2.new(0,0,0,0); results.AutomaticCanvasSize=Enum.AutomaticSize.Y; results.Parent=panel
     local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,4); layout.Parent=results
+    local playlistName=makeText("TextBox",panel,UDim2.new(0,76,0,30),UDim2.new(0,12,0,342),"",theme.Card)
+    playlistName.PlaceholderText="Playlist"; playlistName.ClearTextOnFocus=false
+    local playlistIds=makeText("TextBox",panel,UDim2.new(1,-184,0,30),UDim2.new(0,96,0,342),"",theme.Card)
+    playlistIds.PlaceholderText="IDs separated by spaces or commas"; playlistIds.ClearTextOnFocus=false
+    local importPlaylist=makeText("TextButton",panel,UDim2.new(0,68,0,30),UDim2.new(1,-80,0,342),"Add",theme.AccentSoft)
     local function refresh()
         for _,child in ipairs(results:GetChildren()) do if child:IsA("GuiObject") and child~=layout then child:Destroy() end end
-        for _,sound in ipairs(self:SearchSounds(query.Text,nil,favoritesOnly)) do
-            local row=Instance.new("Frame"); row.Size=UDim2.new(1,-4,0,30); row.BackgroundColor3=theme.Card; row.BorderSizePixel=0; row.Parent=results
-            local name=makeText("TextButton",row,UDim2.new(1,-38,1,0),UDim2.new(0,0,0,0),sound.Name.."  ·  "..sound.Category,theme.Card)
-            name.TextXAlignment=Enum.TextXAlignment.Left; name.MouseButton1Click:Connect(function() asset.Text=sound.Id end)
-            local star=makeText("TextButton",row,UDim2.new(0,32,1,0),UDim2.new(1,-32,0,0),self:IsSoundFavorite(sound.Id) and "★" or "☆",theme.Card)
-            star.MouseButton1Click:Connect(function() self:SetSoundFavorite(sound.Id,not self:IsSoundFavorite(sound.Id)); star.Text=self:IsSoundFavorite(sound.Id) and "★" or "☆" end)
+        local visibleSounds={}
+        local mode=views[viewIndex]
+        if mode=="Library" or mode=="Favorites" then
+            visibleSounds=self:SearchSounds(query.Text,nil,mode=="Favorites")
+        elseif mode=="History" then
+            local needle=query.Text:lower()
+            for _,entry in ipairs(self:GetSoundHistory(50)) do
+                local id=tostring(entry.id or "")
+                local title=tostring(entry.slot or entry.channel or "Sound").."  ·  "..id
+                if needle=="" or title:lower():find(needle,1,true) then table.insert(visibleSounds,{Name=title,Category="History",Id=id}) end
+            end
+        else
+            local names={}; for name in pairs(self.Sounds.playlists or {}) do if type(name)=="string" then table.insert(names,name) end end; table.sort(names)
+            local needle=query.Text:lower()
+            for _,name in ipairs(names) do
+                local playlistNameValue=name
+                local playlist=self.Sounds.playlists[playlistNameValue]
+                local count=type(playlist)=="table" and type(playlist.sounds)=="table" and #playlist.sounds or 0
+                if needle=="" or playlistNameValue:lower():find(needle,1,true) then
+                    local category=type(playlist)=="table" and tostring(playlist.category or "Custom") or "Custom"
+                    table.insert(visibleSounds,{Name=playlistNameValue.."  ·  "..tostring(count).." tracks",Category=category,Playlist=playlistNameValue})
+                end
+            end
         end
+        for _,sound in ipairs(visibleSounds) do
+            local selectedSound=sound
+            local row=Instance.new("Frame"); row.Size=UDim2.new(1,-4,0,30); row.BackgroundColor3=theme.Card; row.BorderSizePixel=0; row.Parent=results
+            local name=makeText("TextButton",row,UDim2.new(1,-38,1,0),UDim2.new(0,0,0,0),selectedSound.Name.."  ·  "..selectedSound.Category,theme.Card)
+            name.TextXAlignment=Enum.TextXAlignment.Left
+            if selectedSound.Playlist then
+                name.MouseButton1Click:Connect(function() self:PlaySoundPlaylist(selectedSound.Playlist,1) end)
+                local playList=makeText("TextButton",row,UDim2.new(0,32,1,0),UDim2.new(1,-32,0,0),"▶",theme.Card)
+                playList.MouseButton1Click:Connect(function() self:PlaySoundPlaylist(selectedSound.Playlist,1) end)
+            else
+                name.MouseButton1Click:Connect(function() asset.Text=tostring(selectedSound.Id or "") end)
+                local star=makeText("TextButton",row,UDim2.new(0,32,1,0),UDim2.new(1,-32,0,0),self:IsSoundFavorite(selectedSound.Id) and "★" or "☆",theme.Card)
+                star.MouseButton1Click:Connect(function() self:SetSoundFavorite(selectedSound.Id,not self:IsSoundFavorite(selectedSound.Id)); star.Text=self:IsSoundFavorite(selectedSound.Id) and "★" or "☆" end)
+            end
+        end
+        viewButton.Text=mode
     end
     local seekTrack=Instance.new("Frame"); seekTrack.Name="PlaybackSeekTrack"; seekTrack.Size=UDim2.new(1,-24,0,6); seekTrack.Position=UDim2.new(0,12,0,386); seekTrack.BackgroundColor3=theme.Card; seekTrack.BorderSizePixel=0; seekTrack.Parent=panel
     local seekFill=Instance.new("Frame"); seekFill.Size=UDim2.new(0,0,1,0); seekFill.BackgroundColor3=theme.Accent; seekFill.BorderSizePixel=0; seekFill.Parent=seekTrack
@@ -1162,9 +1387,21 @@ function L:CreateSoundBox(cfg)
         for _,connection in ipairs(seekConnections) do if connection then connection:Disconnect() end end
     end)
     query:GetPropertyChangedSignal("Text"):Connect(refresh)
-    favorites.MouseButton1Click:Connect(function() favoritesOnly=not favoritesOnly; favorites.Text=favoritesOnly and "Favorites" or "All sounds"; refresh() end)
+    viewButton.MouseButton1Click:Connect(function() viewIndex=viewIndex%#views+1; refresh() end)
+    importPlaylist.MouseButton1Click:Connect(function()
+        local name=playlistName.Text:gsub("^%s+",""):gsub("%s+$","")
+        if name=="" then name="Imported" end
+        local imported=self:ImportSoundPlaylist(name,playlistIds.Text,"Custom")
+        if #imported>0 then viewIndex=4; query.Text=""; refresh(); importPlaylist.Text="Added "..#imported; task.delay(1.5,function() if importPlaylist.Parent then importPlaylist.Text="Add" end end)
+        else importPlaylist.Text="No IDs"; task.delay(1.5,function() if importPlaylist.Parent then importPlaylist.Text="Add" end end) end
+    end)
     refresh()
-    return {Gui=gui, Panel=panel, Search=query, Results=results, Close=closeGui, Play=function(id, ch, opts) return self:PlaySoundAsset(id,ch,opts) end, Stop=function(fade) return self:StopSound(fade) end, Seek=function(seconds) local sound=self._activeSound; if sound and sound.Parent then sound.TimePosition=math.clamp(tonumber(seconds) or 0,0,math.max(0,sound.TimeLength)); return true end return false end, GetPlayback=function() local sound=self._activeSound; return sound and sound.Parent and {Position=sound.TimePosition,Length=sound.TimeLength,Playing=sound.IsPlaying} or nil end}
+    return {Instance=panel,Gui=gui,Panel=panel,Search=query,Results=results,Close=closeGui,
+        Play=function(id,ch,opts) local options=type(opts)=="table" and table.clone(opts) or {}; options.Track=true; return self:PlaySoundAsset(id,ch,options) end,
+        Pause=function() return self:PauseSound() end,Resume=function() return self:ResumeSound() end,Stop=function(fade) return self:StopSound(fade) end,
+        Seek=function(seconds) local sound=self._activeSound or self._pausedSound; if sound and sound.Parent and sound.TimeLength>0 then sound.TimePosition=math.clamp(tonumber(seconds) or 0,0,math.max(0,sound.TimeLength)); return true end return false end,
+        SetLooped=function(_,value) looped=value==true; loop.Text=looped and "Loop: On" or "Loop: Off"; return looped end,
+        GetPlayback=function() local sound=self._activeSound or self._pausedSound; return sound and sound.Parent and {Position=sound.TimePosition,Length=sound.TimeLength,Playing=sound.IsPlaying,Paused=sound==self._pausedSound} or nil end}
 end
 
 function L:CreateSoundLibrary(cfg) return self:CreateSoundBox(cfg) end
@@ -2570,10 +2807,10 @@ function L:SetStreamerMode(on)
         if win and not win._destroyed then
             if on then
                 if not win._streamerSavedSize and win._main and win._main.Parent then win._streamerSavedSize=win._main.Size end
-                if win._statusL then win._statusL.Text="Streamer Mode" end
+                if win._statusL then win._statusL.Text=tostring(win._streamerStatusText or "Streamer Mode") end
                 if win._main and win._main.Parent then win._main.Size=UDim2.new(0,820,0,500) end
             else
-                if win._statusL then win._statusL.Text="User: "..LP.Name.." - "..lib.Executor end
+                if win._statusL then win._statusL.Text=tostring(win._statusBaseText or ("User: "..LP.Name.." - "..lib.Executor)) end
                 if win._main and win._main.Parent and win._streamerSavedSize then win._main.Size=win._streamerSavedSize end
                 win._streamerSavedSize=nil
             end
@@ -3105,7 +3342,7 @@ function L:CreateWindow(cfg)
     DragArea.AutoButtonColor = false
     DragArea.Parent = Main
     local Sidebar = Instance.new("Frame")
-    Sidebar.Size = UDim2.new(0,cfg.TabWidth or 170,1,-88)
+    Sidebar.Size = UDim2.new(0,cfg.TabWidth or 170,1,-96)
     Sidebar.Position = UDim2.new(0,8,0,58)
     Sidebar.BackgroundColor3 = C.Surface
     Sidebar.BorderSizePixel = 0
@@ -3131,7 +3368,7 @@ function L:CreateWindow(cfg)
     Tp.PaddingRight = UDim.new(0,6)
     Tp.Parent = TabsHolder
     local Content = Instance.new("Frame")
-    Content.Size = UDim2.new(1,-(cfg.TabWidth or 170)-20,1,-88)
+    Content.Size = UDim2.new(1,-(cfg.TabWidth or 170)-20,1,-96)
     Content.Position = UDim2.new(0,(cfg.TabWidth or 170)+16,0,58)
     Content.BackgroundTransparency = 1
     Content.Parent = Main
@@ -3150,7 +3387,8 @@ function L:CreateWindow(cfg)
     local StatusL = Instance.new("TextLabel")
     StatusL.Size = UDim2.new(0.6,0,1,0)
     StatusL.BackgroundTransparency = 1
-    StatusL.Text = "User: "..LP.Name.." - "..EXEC
+    local initialStatusText=cfg.StatusText~=nil and tostring(cfg.StatusText) or ("User: "..LP.Name.." - "..EXEC)
+    StatusL.Text = initialStatusText
     StatusL.Font = Enum.Font.Gotham
     StatusL.TextSize = 10
     StatusL.TextColor3 = C.TextFaint
@@ -3172,12 +3410,23 @@ function L:CreateWindow(cfg)
         _sizes=sizes, _uiscale=UIScaleObj, _gradient=Grad,
         _header=Header, _logo=Logo, _title=Title, _sub=Sub, _tagHolder=TagHolder, _mainStroke=Ms, _shadow=Shadow,
         _statusBar=StatusBar, _statusL=StatusL, _statusR=StatusR,
+        _statusBaseText=initialStatusText, _streamerStatusText=cfg.StreamerStatusText,
         _accentStrip=AccentStrip, _winFile=WinFile, _modeFile=modeFile,
         _allElements={}, _connections={}, _auxGuis={}, _destroyed=false,
         _minSize={Width=ClampNumber(cfg.MinWidth,420,320,1800),Height=ClampNumber(cfg.MinHeight,300,240,1200)}
     }, {__index=L})
     Win._window = Win
     Win.C = C
+    function Win:SetStatusText(text)
+        self._statusBaseText=tostring(text or "")
+        if self._statusL then
+            self._statusL.Text=self._lib.StreamerMode and tostring(self._streamerStatusText or "Streamer Mode") or self._statusBaseText
+        end
+        return self._statusBaseText
+    end
+    function Win:GetStatusText()
+        return self._statusBaseText or ""
+    end
     Win._fontPalette={Regular=self.CurrentFont,Bold=self.CurrentFontBold,Medium=self.CurrentFontMedium}
     function Win:SetTags(tags)
         for _,child in ipairs(TagHolder:GetChildren()) do if child~=TagLayout then child:Destroy() end end
@@ -3514,11 +3763,15 @@ function L:CreateWindow(cfg)
     BtnCompact.MouseButton1Click:Connect(function() self:PlaySound("click"); Win:SetMode("compact") end)
     BtnNormal.MouseButton1Click:Connect(function() self:PlaySound("click"); Win:SetMode("normal") end)
     BtnWide.MouseButton1Click:Connect(function() self:PlaySound("click"); Win:SetMode("wide") end)
-    BtnClose.MouseButton1Click:Connect(function()
+    local closingWindow=false
+    local function closeWindow()
+        if closingWindow or Win._destroyed then return end
+        closingWindow=true
         self:PlaySound("click")
         TweenService:Create(Main, T_INFO, {GroupTransparency=1}):Play()
         task.delay(0.35, function() Win:Destroy() end)
-    end)
+    end
+    BtnClose.MouseButton1Click:Connect(closeWindow)
     local dragging, dragStart, startPos, moved = false, nil, nil, false
     DragArea.InputBegan:Connect(function(i)
         if not Win._positionLocked and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) then
@@ -3577,6 +3830,10 @@ function L:CreateWindow(cfg)
     local toggleKeys = cfg.ToggleKeys or {Enum.KeyCode.RightControl}
     Win:_Connect(UIS.InputBegan,function(i,gp)
         if gp then return end
+        if i.KeyCode==Enum.KeyCode.Escape and cfg.CloseOnEscape~=false and not UIS:GetFocusedTextBox() then
+            closeWindow()
+            return
+        end
         for _, k in ipairs(toggleKeys) do
             if i.KeyCode == k then Win:Toggle() break end
         end
@@ -3620,6 +3877,13 @@ function L:CreateWindow(cfg)
     table.insert(self._allWindows, Win)
     Win._acrylicSize=ClampNumber(cfg.BlurSize,8,0,24)
     if cfg.Acrylic==true or cfg.Blur==true then Win:SetAcrylic(true) end
+    if cfg.AnimateLogo~=false and cfg.LogoAnimation~=false and not self:GetReducedMotion() then
+        local animation=type(cfg.AnimateLogo)=="string" and cfg.AnimateLogo
+            or type(cfg.LogoAnimation)=="string" and cfg.LogoAnimation
+            or "pulse"
+        Win._logoAnimationKind=animation
+        self:AnimateLogo(Win,animation)
+    end
     if self.StreamerMode then self:SetStreamerMode(true) end
     if self._hubIdleState and self._hubIdleState.locked then
         self._hubIdleState.hiddenWindows[Win]={WasHidden=false,Interactable=Win._main.Interactable}
@@ -4325,23 +4589,72 @@ function L:CreateTooltip(target, text, cfg)
     local c=(self.C or (win and win.C) or L.C)
     local parent=(win and win._overlay) or target.Parent
     local tip=Instance.new("TextLabel")
-    tip.Name="VNC_Tooltip"; tip.AutomaticSize=Enum.AutomaticSize.Y; tip.Size=UDim2.new(0,cfg.Width or 220,0,0)
-    tip.BackgroundColor3=c.Surface; tip.TextColor3=c.Text; tip.Font=Enum.Font[self.CurrentFont]
-    tip.TextSize=cfg.TextSize or 11; tip.TextWrapped=true; tip.Text=tostring(text or "")
+    tip.Name="VNC_Tooltip"; tip.AutomaticSize=Enum.AutomaticSize.Y; tip.Size=UDim2.new(0,ClampNumber(cfg.Width,220,80,500),0,0)
+    tip.BackgroundColor3=c.Surface; tip.TextColor3=SafeColor(cfg.TextColor,c.Text); tip.Font=Enum.Font[self.CurrentFont]; tip.BorderSizePixel=0; tip.TextXAlignment=Enum.TextXAlignment.Left
+    tip.BackgroundColor3=SafeColor(cfg.Color,c.Surface)
+    tip.TextSize=ClampNumber(cfg.TextSize,11,8,24); tip.TextWrapped=true; tip.Text=tostring(text or "")
     tip.Visible=false; tip.ZIndex=1500; tip.Parent=parent
     local pad=Instance.new("UIPadding"); pad.PaddingLeft=UDim.new(0,8); pad.PaddingRight=UDim.new(0,8); pad.PaddingTop=UDim.new(0,5); pad.PaddingBottom=UDim.new(0,5); pad.Parent=tip
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,6); corner.Parent=tip
-    local function show()
+    local stroke=Instance.new("UIStroke"); stroke.Color=c.Accent; stroke.Transparency=.35; stroke.Thickness=1; stroke.Parent=tip
+    local delaySeconds=ClampNumber(cfg.Delay,0.35,0,5)
+    local side=tostring(cfg.Side or cfg.Position or "Bottom"):lower()
+    local supportedSides={top=true,bottom=true,left=true,right=true}
+    if not supportedSides[side] then side="bottom" end
+    local generation=0; local hovering=false; local destroyed=false
+    local function positionTip()
         if not target.Parent then return end
         local pos=target.AbsolutePosition; local size=target.AbsoluteSize
-        local scale=win and math.max(win._uiscale.Scale,0.01) or 1
-        tip.Position=UDim2.fromOffset((pos.X-(win and win._main.AbsolutePosition.X or 0))/scale,(pos.Y-(win and win._main.AbsolutePosition.Y or 0)+size.Y)/scale+5)
-        tip.Visible=true
+        local cam=workspace.CurrentCamera
+        local viewport=cam and cam.ViewportSize or Vector2.new(1920,1080)
+        local tipSize=tip.AbsoluteSize
+        local gap=ClampNumber(cfg.Gap,6,0,40)
+        local x,y
+        if typeof(cfg.Position)=="UDim2" then
+            x=pos.X+cfg.Position.X.Offset; y=pos.Y+cfg.Position.Y.Offset
+        else
+            if side=="top" then x=pos.X+(size.X-tipSize.X)/2; y=pos.Y-tipSize.Y-gap
+            elseif side=="left" then x=pos.X-tipSize.X-gap; y=pos.Y+(size.Y-tipSize.Y)/2
+            elseif side=="right" then x=pos.X+size.X+gap; y=pos.Y+(size.Y-tipSize.Y)/2
+            else x=pos.X+(size.X-tipSize.X)/2; y=pos.Y+size.Y+gap end
+            if side=="top" and y<8 then y=pos.Y+size.Y+gap
+            elseif side=="bottom" and y+tipSize.Y>viewport.Y-8 then y=pos.Y-tipSize.Y-gap
+            elseif side=="left" and x<8 then x=pos.X+size.X+gap
+            elseif side=="right" and x+tipSize.X>viewport.X-8 then x=pos.X-tipSize.X-gap end
+        end
+        x=math.clamp(x,8,math.max(8,viewport.X-tipSize.X-8))
+        y=math.clamp(y,8,math.max(8,viewport.Y-tipSize.Y-8))
+        local origin=Vector2.zero
+        if parent:IsA("GuiObject") then origin=parent.AbsolutePosition end
+        local scale=win and win._uiscale and math.max(win._uiscale.Scale,0.01) or 1
+        tip.Position=UDim2.fromOffset((x-origin.X)/scale,(y-origin.Y)/scale)
     end
-    local function hide() tip.Visible=false end
+    local function showNow(token)
+        if destroyed or not hovering or token~=generation or not target.Parent then return end
+        tip.Visible=true
+        task.defer(function() if tip.Parent and tip.Visible then positionTip() end end)
+    end
+    local function show()
+        if destroyed then return end
+        hovering=true; generation+=1
+        local token=generation
+        if delaySeconds==0 then showNow(token)
+        else task.delay(delaySeconds,function() showNow(token) end) end
+    end
+    local function hide() hovering=false; generation+=1; tip.Visible=false end
     local entered=target.MouseEnter:Connect(show); local left=target.MouseLeave:Connect(hide)
-    local touched=target.InputBegan:Connect(function(input) if input.UserInputType==Enum.UserInputType.Touch then show(); task.delay(cfg.Duration or 2,hide) end end)
-    return {Instance=tip,Show=show,Hide=hide,Destroy=function() entered:Disconnect(); left:Disconnect(); touched:Disconnect(); tip:Destroy() end}
+    local touched=target.InputBegan:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.Touch then
+            hovering=true; generation+=1; local token=generation; showNow(token)
+            task.delay(ClampNumber(cfg.Duration,2,0.2,30),function() if token==generation then hide() end end)
+        end
+    end)
+    local targetDestroying=target.Destroying:Connect(function() destroyed=true; hide(); if tip.Parent then tip:Destroy() end end)
+    return {Instance=tip,Show=show,Hide=hide,Destroy=function()
+        destroyed=true; hide()
+        for _,connection in ipairs({entered,left,touched,targetDestroying}) do if connection then connection:Disconnect() end end
+        if tip.Parent then tip:Destroy() end
+    end}
 end
 
 function L:CreateBadge(parent, text, cfg)
@@ -4349,12 +4662,37 @@ function L:CreateBadge(parent, text, cfg)
     if typeof(parent)~="Instance" or not parent:IsA("GuiObject") then return nil end
     local label=Instance.new("TextLabel"); label.Name="VNC_Badge"
     label.AnchorPoint=Vector2.new(1,0); label.Position=cfg.Position or UDim2.new(1,-6,0,6)
-    label.Size=cfg.Size or UDim2.new(0,math.max(24,#tostring(text or "")*7+12),0,20)
+    local autoSize=cfg.Size==nil
+    label.Size=cfg.Size or UDim2.new(0,math.clamp(#tostring(text or "")*7+12,24,ClampNumber(cfg.MaxWidth,100,24,400)),0,20)
     label.BackgroundColor3=cfg.Color or self.C.Accent; label.TextColor3=cfg.TextColor or self.C.White
     label.Text=tostring(text or ""); label.Font=Enum.Font[self.CurrentFontBold]; label.TextSize=cfg.TextSize or 10
     label.BorderSizePixel=0; label.ZIndex=(parent.ZIndex or 1)+1; label.Parent=parent
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(1,0); corner.Parent=label
-    return {Instance=label,Set=function(_,value) label.Text=tostring(value); label.Size=UDim2.new(0,math.max(24,#label.Text*7+12),0,20) end,Destroy=function() label:Destroy() end}
+    local scale=Instance.new("UIScale"); scale.Scale=1; scale.Parent=label
+    local pulseToken=0
+    local function pulse()
+        if cfg.Animate==false or not label.Parent then return end
+        pulseToken+=1; local token=pulseToken
+        scale.Scale=0.88
+        local grow=TweenService:Create(scale,TweenInfo.new(.12,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{Scale=1.12})
+        grow:Play()
+        task.delay(.13,function()
+            if label.Parent and token==pulseToken then TweenService:Create(scale,TweenInfo.new(.14,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{Scale=1}):Play() end
+        end)
+    end
+    local autoHide=cfg.AutoHideZero~=false
+    local function setValue(value,animate)
+        label.Text=tostring(value==nil and "" or value)
+        local number=tonumber(value)
+        label.Visible=not (autoHide and number==0)
+        if autoSize then label.Size=UDim2.new(0,math.clamp(#label.Text*7+12,24,ClampNumber(cfg.MaxWidth,100,24,400)),0,20) end
+        if animate and label.Visible then pulse() end
+    end
+    setValue(text,false)
+    local handle={Instance=label,Set=function(_,value) setValue(value,true); return value end,
+        SetColor=function(_,color) if typeof(color)=="Color3" then label.BackgroundColor3=color; return true end return false end,
+        Destroy=function() pulseToken+=1; if label.Parent then label:Destroy() end end}
+    return handle
 end
 
 local function CreateChoiceControl(Sec,cfg,segmented)
@@ -4775,6 +5113,15 @@ function L:CreateSlider(cfg)
     Bar.BorderSizePixel = 0
     Bar.Parent = Wrapped
     local Bc = Instance.new("UICorner"); Bc.CornerRadius = UDim.new(1,0); Bc.Parent = Bar
+    local tickConfig=cfg.TickMarks or cfg.Ticks
+    local tickCount=tickConfig==true and 10 or math.floor(ClampNumber(tickConfig,0,0,100))
+    if tickCount>1 then
+        for tickIndex=1,tickCount-1 do
+            local tick=Instance.new("Frame"); tick.Name="SliderTick"; tick.AnchorPoint=Vector2.new(.5,.5)
+            tick.Size=UDim2.fromOffset(2,6); tick.Position=UDim2.new(tickIndex/tickCount,0,.5,0)
+            tick.BackgroundColor3=C.TextFaint; tick.BackgroundTransparency=.2; tick.BorderSizePixel=0; tick.ZIndex=2; tick.Parent=Bar
+        end
+    end
     local Fill = Instance.new("Frame")
     Fill.Size = UDim2.new((val-min)/(max-min),0,1,0)
     Fill.BackgroundColor3 = fillColor
@@ -4793,28 +5140,60 @@ function L:CreateSlider(cfg)
     Btn.Size = UDim2.new(1,0,1,0)
     Btn.BackgroundTransparency = 1
     Btn.Text = ""
+    Btn.Selectable=true
     Btn.Parent = Bar
     local dragging=false
+    local elementHandle
+    local defaultValue=val
+    local function applyValue(value,notify,animate)
+        val=ClampNumber(value,min,min,max)
+        if elementHandle then elementHandle.Value=val end
+        local t=(val-min)/(max-min)
+        ValL.Text=FormatControlNumber(val)..(cfg.Suffix or "")
+        if animate then
+            TweenService:Create(Fill,T_FAST,{Size=UDim2.new(t,0,1,0)}):Play()
+            TweenService:Create(Thumb,T_FAST,{Position=UDim2.new(t,-7,0.5,-7)}):Play()
+        else
+            Fill.Size=UDim2.new(t,0,1,0); Thumb.Position=UDim2.new(t,-7,0.5,-7)
+        end
+        if notify and cfg.Callback then pcall(cfg.Callback,val) end
+        if notify and cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
+    end
     local function SetFromClick(x)
         local abs = Bar.AbsolutePosition.X
         local sz = Bar.AbsoluteSize.X
         if sz<=0 then return end
         local t = math.clamp((x - abs) / sz, 0, 1)
-        val = min + (max - min) * t
-        if cfg.Round then val = math.floor(val + 0.5) end
-        ValL.Text = FormatControlNumber(val)..(cfg.Suffix or "")
-        TweenService:Create(Fill, T_FAST, {Size=UDim2.new(t,0,1,0)}):Play()
-        TweenService:Create(Thumb, T_FAST, {Position=UDim2.new(t,-7,0.5,-7)}):Play()
-        if cfg.Callback then pcall(cfg.Callback, val) end
-        if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
+        local nextValue=min+(max-min)*t
+        if cfg.Round then nextValue=math.floor(nextValue+.5) end
+        applyValue(nextValue,true,true)
     end
+    local lastThumbClick=0
     Btn.InputBegan:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            if i.UserInputType==Enum.UserInputType.MouseButton1 then
+                local thumbX=Bar.AbsolutePosition.X+((val-min)/(max-min))*Bar.AbsoluteSize.X
+                local nearThumb=math.abs(i.Position.X-thumbX)<=12
+                local now=os.clock()
+                if nearThumb and now-lastThumbClick<=.35 then
+                    lastThumbClick=0; dragging=false; applyValue(defaultValue,true,true); return
+                end
+                lastThumbClick=nearThumb and now or 0
+            end
             dragging=true
             SetFromClick(i.Position.X)
         end
     end)
     local pointerConnections={}
+    local keyboardConnection=UIS.InputBegan:Connect(function(input,processed)
+        if processed or UIS:GetFocusedTextBox() or GuiService.SelectedObject~=Btn then return end
+        local step=ClampNumber(cfg.Step,cfg.Round and 1 or (max-min)/100,0.000001,max-min)
+        if input.KeyCode==Enum.KeyCode.Left or input.KeyCode==Enum.KeyCode.Down then applyValue(val-step,true,true)
+        elseif input.KeyCode==Enum.KeyCode.Right or input.KeyCode==Enum.KeyCode.Up then applyValue(val+step,true,true)
+        elseif input.KeyCode==Enum.KeyCode.Home then applyValue(min,true,true)
+        elseif input.KeyCode==Enum.KeyCode.End then applyValue(max,true,true) end
+    end)
+    table.insert(pointerConnections,keyboardConnection)
     table.insert(pointerConnections,UIS.InputChanged:Connect(function(i)
         if (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch)
             and dragging and (i.UserInputType==Enum.UserInputType.Touch or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)) then
@@ -4826,25 +5205,17 @@ function L:CreateSlider(cfg)
     Wrapped.Destroying:Connect(disconnectPointer)
     if cfg.Flag then
         Sec._lib:RegisterState(cfg.Flag, function() return val end, function(v, silent)
-            val = ClampNumber(v,min,min,max)
-            local t = (val-min)/(max-min)
-            ValL.Text = FormatControlNumber(val)..(cfg.Suffix or "")
-            Fill.Size = UDim2.new(t,0,1,0)
-            Thumb.Position = UDim2.new(t,-7,0.5,-7)
-            if not silent and cfg.Callback then pcall(cfg.Callback, val) end
+            applyValue(v,not silent,false)
         end)
     end
     local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab, Value=val, _label=Lb}, ElementMethods)
+    elementHandle=Element
     Element:InitFavorite()
     function Element:Set(v)
-        val = ClampNumber(v,min,min,max)
-        local t = (val-min)/(max-min)
-        ValL.Text = FormatControlNumber(val)..(cfg.Suffix or "")
-        TweenService:Create(Fill, T_FAST, {Size=UDim2.new(t,0,1,0)}):Play()
-        TweenService:Create(Thumb, T_FAST, {Position=UDim2.new(t,-7,0.5,-7)}):Play()
-        if cfg.Callback then pcall(cfg.Callback, val) end
-        if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
+        applyValue(v,true,true)
     end
+    function Element:Reset() applyValue(defaultValue,true,true); return val end
+    function Element:Focus() GuiService.SelectedObject=Btn; return true end
     function Element:SetColor(c)
         if typeof(c)~="Color3" then return false end
         fillColor = c
@@ -5015,8 +5386,10 @@ function L:CreateInput(cfg)
     local Sec = self
     local C = Sec.C or Sec._window.C
     cfg = cfg or {}
+    local multiline=cfg.Multiline==true
+    local controlHeight=ClampNumber(cfg.Height,multiline and 130 or 70,60,500)
     local Wrapped = Instance.new("Frame")
-    Wrapped.Size = UDim2.new(1,0,0,70)
+    Wrapped.Size = UDim2.new(1,0,0,controlHeight)
     Wrapped.BackgroundColor3 = C.Card
     Wrapped.BorderSizePixel = 0
     Wrapped.Parent = Sec._inner or Sec._holder
@@ -5033,26 +5406,60 @@ function L:CreateInput(cfg)
     Lb.TextXAlignment = Enum.TextXAlignment.Left
     Lb.Parent = Wrapped
     local Box = Instance.new("TextBox")
-    Box.Size = UDim2.new(1,-32,0,32)
+    Box.Size = UDim2.new(1,-32,0,multiline and controlHeight-38 or 32)
     Box.Position = UDim2.new(0,16,0,30)
     Box.BackgroundColor3 = C.Surface
-    Box.Text = cfg.Default or ""
-    Box.PlaceholderText = cfg.Placeholder or "Type here..."
+    Box.Text = tostring(cfg.Default or "")
+    Box.PlaceholderText = tostring(cfg.Placeholder or "Type here...")
     Box.Font = Enum.Font[Sec._lib.CurrentFont]
     Box.TextSize = 12
     Box.TextColor3 = C.Text
     Box.PlaceholderColor3 = C.TextFaint
     Box.TextXAlignment = Enum.TextXAlignment.Left
+    Box.TextYAlignment = multiline and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center
+    Box.MultiLine=multiline
+    Box.TextWrapped=multiline
     Box.ClearTextOnFocus = false
     Box.Parent = Wrapped
     local Bc = Instance.new("UICorner"); Bc.CornerRadius = UDim.new(0,8); Bc.Parent = Box
     local Bs = Instance.new("UIStroke"); Bs.Color = C.Stroke; Bs.Thickness = 1; Bs.Transparency = 0.4; Bs.Parent = Box
     local Bp = Instance.new("UIPadding"); Bp.PaddingLeft = UDim.new(0,10); Bp.Parent = Box
+    local maxLength=math.floor(ClampNumber(cfg.MaxLength,4096,1,65536))
+    local function normalizeInput(value)
+        local result=tostring(value or "")
+        if type(cfg.Filter)=="function" then
+            local ok,filtered=pcall(cfg.Filter,result)
+            if ok and type(filtered)=="string" then result=filtered end
+        elseif type(cfg.Mask)=="function" then
+            local ok,filtered=pcall(cfg.Mask,result)
+            if ok and type(filtered)=="string" then result=filtered end
+        end
+        if #result>maxLength then result=result:sub(1,maxLength) end
+        return result
+    end
+    Box.Text=normalizeInput(Box.Text)
+    local normalizing=false
+    Box:GetPropertyChangedSignal("Text"):Connect(function()
+        if normalizing then return end
+        local normalized=normalizeInput(Box.Text)
+        if normalized~=Box.Text then normalizing=true; Box.Text=normalized; normalizing=false end
+    end)
     Box.Focused:Connect(function() TweenService:Create(Bs, T_OUT, {Color=C.Accent, Transparency=0}):Play() end)
     Box.FocusLost:Connect(function(enter)
         TweenService:Create(Bs, T_OUT, {Color=C.Stroke, Transparency=0.4}):Play()
-        if cfg.Callback then pcall(cfg.Callback, Box.Text, enter) end
-        if cfg.Flag then Sec._lib:_ScheduleConfigAutoSave() end
+        local valid,validationMessage=true,nil
+        if type(cfg.Validate)=="function" then
+            local ok,result,message=pcall(cfg.Validate,Box.Text)
+            valid=ok and result~=false
+            validationMessage=ok and message or result
+        elseif type(cfg.ValidationPattern)=="string" and cfg.ValidationPattern~="" then
+            local ok,result=pcall(string.match,Box.Text,cfg.ValidationPattern)
+            valid=ok and result~=nil
+        end
+        Bs.Color=valid and C.Stroke or C.Danger
+        if cfg.Callback then pcall(cfg.Callback, Box.Text, enter, valid, validationMessage) end
+        if enter and type(cfg.OnSubmit)=="function" then pcall(cfg.OnSubmit,Box.Text,valid,validationMessage) end
+        if cfg.Flag and valid then Sec._lib:_ScheduleConfigAutoSave() end
     end)
     if cfg.Flag then Sec._lib:RegisterState(cfg.Flag, function() return Box.Text end, function(v, silent) Box.Text=tostring(v or ""); if not silent and cfg.Callback then pcall(cfg.Callback,Box.Text,false) end end) end
     local Element = setmetatable({Instance=Wrapped, _lib=Sec._lib, _favoriteId=cfg.Flag or cfg.Name, _favoriteName=cfg.Name, _favoriteTab=Sec._tab, Box=Box, _label=Lb}, ElementMethods)
@@ -7511,19 +7918,83 @@ function L:CreateCarousel(cfg)
     local Sec=self; if not IsElementContainer(Sec) then return nil,"section or tab required" end
     cfg=type(cfg)=="table" and cfg or {}; local C=Sec.C or (Sec._window and Sec._window.C) or (Sec._lib and Sec._lib.C) or L.C; local images={}; if type(cfg.Images)=="table" then for _,imageId in ipairs(cfg.Images) do if (type(imageId)=="string" or type(imageId)=="number") and NormalizeIcon(imageId)~="" and #images<500 then table.insert(images,NormalizeIcon(imageId)) end end end; local index=#images>0 and math.floor(ClampNumber(cfg.Default,1,1,#images)) or 0
     local root=Instance.new("Frame"); root.Size=UDim2.new(1,0,0,ClampNumber(cfg.Height,180,80,800)); root.BackgroundColor3=C.Surface; root.BorderSizePixel=0; root.ClipsDescendants=true; root.Parent=Sec._inner or Sec._holder
-    local image=Instance.new("ImageLabel"); image.Size=UDim2.new(1,-16,1,-16); image.Position=UDim2.fromOffset(8,8); image.BackgroundTransparency=1; image.ScaleType=Enum.ScaleType.Fit; image.Image=images[index] or ""; image.Parent=root
-    local counter=Instance.new("TextLabel"); counter.Size=UDim2.fromOffset(64,20); counter.Position=UDim2.new(.5,-32,1,-25); counter.BackgroundColor3=C.Card; counter.TextColor3=C.Text; counter.Text="0 / 0"; counter.Font=Enum.Font[Sec._lib.CurrentFont]; counter.TextSize=10; counter.Parent=root
-    local function refresh(call) image.Image=images[index] or ""; counter.Text=tostring(index).." / "..tostring(#images); if call and cfg.Callback then pcall(cfg.Callback,images[index],index) end end
+    local image=Instance.new("ImageLabel"); image.Size=UDim2.new(1,-16,1,-16); image.Position=UDim2.fromOffset(8,8); image.BackgroundTransparency=1; image.ScaleType=Enum.ScaleType.Fit; image.Active=true; image.Image=images[index] or ""; image.Parent=root
+    local counter=Instance.new("TextLabel"); counter.Size=UDim2.fromOffset(64,20); counter.Position=UDim2.new(1,-72,0,8); counter.BackgroundColor3=C.Card; counter.TextColor3=C.Text; counter.Text="0 / 0"; counter.Font=Enum.Font[Sec._lib.CurrentFont]; counter.TextSize=10; counter.Parent=root
     local prev=Instance.new("TextButton"); prev.Size=UDim2.fromOffset(32,32); prev.Position=UDim2.new(0,8,.5,-16); prev.Text="‹"; prev.BackgroundColor3=C.Card; prev.TextColor3=C.Text; prev.Parent=root
     local nextButton=Instance.new("TextButton"); nextButton.Size=UDim2.fromOffset(32,32); nextButton.Position=UDim2.new(1,-40,.5,-16); nextButton.Text="›"; nextButton.BackgroundColor3=C.Card; nextButton.TextColor3=C.Text; nextButton.Parent=root
+    local dotHolder=Instance.new("Frame"); dotHolder.Name="Indicators"; dotHolder.Size=UDim2.new(1,-104,0,18); dotHolder.Position=UDim2.new(0,52,1,-23); dotHolder.BackgroundTransparency=1; dotHolder.Parent=root
+    local dotLayout=Instance.new("UIListLayout"); dotLayout.FillDirection=Enum.FillDirection.Horizontal; dotLayout.HorizontalAlignment=Enum.HorizontalAlignment.Center; dotLayout.VerticalAlignment=Enum.VerticalAlignment.Center; dotLayout.Padding=UDim.new(0,5); dotLayout.Parent=dotHolder
+    local dotButtons={}; local dotCount=0; local dotStart=1
+    local function rebuildDots()
+        for _,button in ipairs(dotButtons) do button:Destroy() end
+        table.clear(dotButtons)
+        dotCount=math.min(#images,12)
+        for slot=1,dotCount do
+            local dotSlot=slot
+            local button=Instance.new("TextButton"); button.Name="Indicator"; button.Size=UDim2.fromOffset(12,16); button.BackgroundTransparency=1; button.Text="•"; button.TextSize=14; button.TextColor3=C.TextFaint; button.Parent=dotHolder
+            button.MouseButton1Click:Connect(function()
+                if #images==0 then return end
+                index=math.clamp(dotStart+dotSlot-1,1,#images)
+                refresh(true)
+            end)
+            table.insert(dotButtons,button)
+        end
+    end
+    local zoomed=false
+    local function setZoom(value)
+        zoomed=value==true
+        image.Size=zoomed and UDim2.new(1.65,0,1.65,0) or UDim2.new(1,-16,1,-16)
+        image.Position=zoomed and UDim2.new(-.325,0,-.325,0) or UDim2.fromOffset(8,8)
+        return zoomed
+    end
+    local function refresh(call)
+        image.Image=images[index] or ""; counter.Text=tostring(index).." / "..tostring(#images)
+        if dotCount~=#images and dotCount~=(#images>12 and 12 or #images) then rebuildDots() end
+        dotStart=math.max(1,math.min(index-math.floor(dotCount/2),#images-dotCount+1))
+        for slot,button in ipairs(dotButtons) do
+            local selected=dotStart+slot-1==index
+            button.TextColor3=selected and C.Accent or C.TextFaint
+            button.Text="•"
+        end
+        if call and cfg.Callback then pcall(cfg.Callback,images[index],index) end
+    end
     local function go(delta) if #images==0 then return end; index=((index-1+delta)%#images)+1; refresh(true) end
     prev.MouseButton1Click:Connect(function() go(-1) end); nextButton.MouseButton1Click:Connect(function() go(1) end)
+    local active=true; local hovered=false; root.MouseEnter:Connect(function() hovered=true end); root.MouseLeave:Connect(function() hovered=false end)
+    local touchStart=nil; local lastImageTap=0
+    image.InputBegan:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.Touch then touchStart=input.Position
+        elseif input.UserInputType==Enum.UserInputType.MouseButton1 then
+            local now=os.clock()
+            if now-lastImageTap<=.32 and lastImageTap>0 then setZoom(not zoomed) end
+            lastImageTap=now
+        end
+    end)
+    image.InputEnded:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.Touch and touchStart then
+            local delta=input.Position.X-touchStart.X; touchStart=nil
+            if math.abs(delta)>40 then go(delta<0 and 1 or -1)
+            elseif cfg.TouchZoom then setZoom(not zoomed) end
+        end
+    end)
+    if cfg.AutoPlay==true then
+        local interval=ClampNumber(cfg.AutoPlayInterval,4,.5,60)
+        task.spawn(function()
+            while active and root.Parent do
+                local deadline=os.clock()+interval
+                while active and root.Parent and os.clock()<deadline do task.wait(math.min(.2,deadline-os.clock())) end
+                if active and root.Parent and not hovered and #images>1 then go(1) end
+            end
+        end)
+    end
     local element=setmetatable({Instance=root,_lib=Sec._lib,_favoriteId=cfg.Flag or cfg.Name,_favoriteName=cfg.Name,_favoriteTab=Sec._tab},ElementMethods); element:InitFavorite()
-    function element:SetImages(list) if type(list)~="table" then return false end; images={}; for _,imageId in ipairs(list) do if (type(imageId)=="string" or type(imageId)=="number") and NormalizeIcon(imageId)~="" and #images<500 then table.insert(images,NormalizeIcon(imageId)) end end; index=#images>0 and 1 or 0; refresh(false); return true end
+    function element:SetImages(list) if not root.Parent or type(list)~="table" then return false end; images={}; for _,imageId in ipairs(list) do if (type(imageId)=="string" or type(imageId)=="number") and NormalizeIcon(imageId)~="" and #images<500 then table.insert(images,NormalizeIcon(imageId)) end end; index=#images>0 and 1 or 0; rebuildDots(); setZoom(false); refresh(false); return true end
     function element:GoTo(i) i=tonumber(i); if not i or i~=i or i==math.huge or i==-math.huge or #images==0 then return false end; index=math.clamp(math.floor(i),1,#images); refresh(true); return true end
+    function element:Zoom(value) return setZoom(value==nil and not zoomed or value) end
     function element:Get() return index,images[index] end
-    function element:Destroy() root:Destroy() end
-    Sec:_AddElement(root); refresh(false); return element
+    function element:Destroy() active=false; if root.Parent then root:Destroy() end end
+    root.Destroying:Connect(function() active=false end)
+    Sec:_AddElement(root); rebuildDots(); refresh(false); return element
 end
 
 function L:ExportPalette(name)
@@ -7705,7 +8176,15 @@ function L:EnableHoverSpotlight(window,cfg)
     local size=ClampNumber(cfg.Size,220,60,600); local color=SafeColor(cfg.Color,win.C.Accent); local opacity=ClampNumber(cfg.Opacity,.12,0,.35)
     local spot=Instance.new("Frame"); spot.Name="VNCSpotlight"; spot.Size=UDim2.new(1,0,1,0); spot.BackgroundTransparency=1; spot.BorderSizePixel=0; spot.Active=false; spot.ZIndex=2; spot.Parent=win._main
     local rings={}
-    for i=1,7 do local diameter=size*(1+(i-1)*.32); local ring=Instance.new("Frame"); ring.Size=UDim2.fromOffset(diameter,diameter); ring.AnchorPoint=Vector2.new(.5,.5); ring.BackgroundColor3=color; ring.BackgroundTransparency=math.clamp(1-opacity*(1-(i-1)/8),.7,1); ring.BorderSizePixel=0; ring.Active=false; ring.ZIndex=2; ring.Parent=spot; local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(1,0); c.Parent=ring; table.insert(rings,ring) end
+    for i=1,18 do
+        local t=(i-1)/17
+        local diameter=size*(1+t*1.05)
+        local ring=Instance.new("Frame"); ring.Size=UDim2.fromOffset(diameter,diameter); ring.AnchorPoint=Vector2.new(.5,.5)
+        ring.BackgroundColor3=color; ring.BackgroundTransparency=1-opacity*((1-t)^2); ring.BorderSizePixel=0
+        ring.Active=false; ring.ZIndex=2; ring.Parent=spot
+        local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(1,0); c.Parent=ring
+        table.insert(rings,ring)
+    end
     local conn=win:_Connect(UIS.InputChanged,function(input)
         if input.UserInputType~=Enum.UserInputType.MouseMovement or not win._main.Parent then return end
         local pos=win._main.AbsolutePosition; local size2=win._main.AbsoluteSize
@@ -8280,18 +8759,43 @@ function L:CreateSoundSettings(cfg)
     local section=self; cfg=type(cfg)=="table" and cfg or {}; local lib=section._lib or section; local win=section._window
     if not IsElementContainer(section) then return nil,"section or tab required" end
     if not win then return nil,"window required" end
-    local C=section.C or (win and win.C) or lib.C or L.C; local root=Instance.new("Frame"); root.Name="SoundSettings"; root.Size=UDim2.new(1,0,0,112); root.BackgroundColor3=C.Card; root.BorderSizePixel=0
+    local C=section.C or (win and win.C) or lib.C or L.C; local root=Instance.new("Frame"); root.Name="SoundSettings"; root.Size=UDim2.new(1,0,0,330); root.BackgroundColor3=C.Card; root.BorderSizePixel=0
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,9); corner.Parent=root
+    local stroke=Instance.new("UIStroke"); stroke.Color=C.Stroke; stroke.Transparency=.45; stroke.Parent=root
     local title=Instance.new("TextLabel"); title.Size=UDim2.new(1,-16,0,20); title.Position=UDim2.fromOffset(8,4); title.BackgroundTransparency=1; title.Text=cfg.Name or "Hub sounds"; title.TextColor3=C.Text; title.Font=Enum.Font[lib.CurrentFontBold]; title.TextSize=11; title.TextXAlignment=Enum.TextXAlignment.Left; title.Parent=root
-    local enabled=Instance.new("TextButton"); enabled.Size=UDim2.fromOffset(92,26); enabled.Position=UDim2.fromOffset(8,29); enabled.BackgroundColor3=C.Surface; enabled.TextColor3=C.Text; enabled.Font=Enum.Font[lib.CurrentFont]; enabled.TextSize=10; enabled.Parent=root
-    local silent=Instance.new("TextButton"); silent.Size=UDim2.fromOffset(78,26); silent.Position=UDim2.fromOffset(106,29); silent.BackgroundColor3=C.Surface; silent.TextColor3=C.Text; silent.Font=Enum.Font[lib.CurrentFont]; silent.TextSize=10; silent.Parent=root
-    local volumeLabel=Instance.new("TextLabel"); volumeLabel.Size=UDim2.fromOffset(76,22); volumeLabel.Position=UDim2.new(1,-84,0,31); volumeLabel.BackgroundTransparency=1; volumeLabel.TextColor3=C.TextDim; volumeLabel.Font=Enum.Font[lib.CurrentFont]; volumeLabel.TextSize=10; volumeLabel.Parent=root
-    local volumeBar=Instance.new("Frame"); volumeBar.Size=UDim2.new(1,-16,0,10); volumeBar.Position=UDim2.fromOffset(8,64); volumeBar.BackgroundColor3=C.Surface; volumeBar.BorderSizePixel=0; volumeBar.Parent=root
+    local enabled=Instance.new("TextButton"); enabled.Size=UDim2.new(.31,-10,0,26); enabled.Position=UDim2.fromOffset(8,29); enabled.BackgroundColor3=C.Surface; enabled.TextColor3=C.Text; enabled.Font=Enum.Font[lib.CurrentFont]; enabled.TextSize=10; enabled.Parent=root
+    local silent=Instance.new("TextButton"); silent.Size=UDim2.new(.29,-10,0,26); silent.Position=UDim2.new(.35,0,0,29); silent.BackgroundColor3=C.Surface; silent.TextColor3=C.Text; silent.Font=Enum.Font[lib.CurrentFont]; silent.TextSize=10; silent.Parent=root
+    local ducking=Instance.new("TextButton"); ducking.Size=UDim2.new(.29,-10,0,26); ducking.Position=UDim2.new(.66,0,0,29); ducking.BackgroundColor3=C.Surface; ducking.TextColor3=C.Text; ducking.Font=Enum.Font[lib.CurrentFont]; ducking.TextSize=10; ducking.Parent=root
+    local volumeLabel=Instance.new("TextLabel"); volumeLabel.Size=UDim2.fromOffset(76,16); volumeLabel.Position=UDim2.new(1,-84,0,56); volumeLabel.BackgroundTransparency=1; volumeLabel.TextColor3=C.TextDim; volumeLabel.Font=Enum.Font[lib.CurrentFont]; volumeLabel.TextSize=10; volumeLabel.Parent=root
+    local volumeBar=Instance.new("Frame"); volumeBar.Size=UDim2.new(1,-16,0,8); volumeBar.Position=UDim2.fromOffset(8,78); volumeBar.BackgroundColor3=C.Surface; volumeBar.BorderSizePixel=0; volumeBar.Parent=root
     local fill=Instance.new("Frame"); fill.Size=UDim2.new(ClampNumber(lib.Sounds.volume,.5,0,1),0,1,0); fill.BackgroundColor3=C.Accent; fill.BorderSizePixel=0; fill.Parent=volumeBar
     local volumeHit=Instance.new("TextButton"); volumeHit.Size=UDim2.new(1,0,1,12); volumeHit.Position=UDim2.new(0,0,.5,-6); volumeHit.BackgroundTransparency=1; volumeHit.Text=""; volumeHit.Parent=volumeBar
     local channels=GetSoundChannelNames(lib.Sounds); local channelIndex=table.find(channels,"UI") or 1
-    local channel=Instance.new("TextButton"); channel.Size=UDim2.fromOffset(142,26); channel.Position=UDim2.fromOffset(8,78); channel.BackgroundColor3=C.Surface; channel.TextColor3=C.Text; channel.Font=Enum.Font[lib.CurrentFont]; channel.TextSize=10; channel.Parent=root
-    local mixLabel=Instance.new("TextButton"); mixLabel.Size=UDim2.new(1,-166,0,26); mixLabel.Position=UDim2.fromOffset(158,78); mixLabel.BackgroundTransparency=1; mixLabel.TextColor3=C.TextDim; mixLabel.Font=Enum.Font[lib.CurrentFont]; mixLabel.TextSize=10; mixLabel.TextXAlignment=Enum.TextXAlignment.Left; mixLabel.Parent=root
+    local channel=Instance.new("TextButton"); channel.Size=UDim2.new(.48,-12,0,26); channel.Position=UDim2.fromOffset(8,94); channel.BackgroundColor3=C.Surface; channel.TextColor3=C.Text; channel.Font=Enum.Font[lib.CurrentFont]; channel.TextSize=10; channel.Parent=root
+    local mixLabel=Instance.new("TextButton"); mixLabel.Size=UDim2.new(.52,-48,0,26); mixLabel.Position=UDim2.new(.48,0,0,94); mixLabel.BackgroundTransparency=1; mixLabel.TextColor3=C.TextDim; mixLabel.Font=Enum.Font[lib.CurrentFont]; mixLabel.TextSize=10; mixLabel.TextXAlignment=Enum.TextXAlignment.Left; mixLabel.Parent=root
+    local addChannel=Instance.new("TextButton"); addChannel.Size=UDim2.fromOffset(28,26); addChannel.Position=UDim2.new(1,-36,0,94); addChannel.BackgroundColor3=C.Surface; addChannel.TextColor3=C.Accent; addChannel.Font=Enum.Font[lib.CurrentFontBold]; addChannel.TextSize=16; addChannel.Text="+"; addChannel.Parent=root
+    local slotNames=table.clone(DefaultSoundSlots); local slotIndex=1
+    local slotTitle=Instance.new("TextLabel"); slotTitle.Size=UDim2.new(1,-16,0,18); slotTitle.Position=UDim2.fromOffset(8,124); slotTitle.BackgroundTransparency=1; slotTitle.Text="Sound assets by UI event"; slotTitle.TextColor3=C.Text; slotTitle.Font=Enum.Font[lib.CurrentFontMedium]; slotTitle.TextSize=10; slotTitle.TextXAlignment=Enum.TextXAlignment.Left; slotTitle.Parent=root
+    local slotPicker=Instance.new("TextButton"); slotPicker.Size=UDim2.fromOffset(86,28); slotPicker.Position=UDim2.fromOffset(8,146); slotPicker.BackgroundColor3=C.Surface; slotPicker.TextColor3=C.Text; slotPicker.Font=Enum.Font[lib.CurrentFont]; slotPicker.TextSize=10; slotPicker.Parent=root
+    local slotAsset=Instance.new("TextBox"); slotAsset.Size=UDim2.new(1,-150,0,28); slotAsset.Position=UDim2.fromOffset(102,146); slotAsset.BackgroundColor3=C.Surface; slotAsset.TextColor3=C.Text; slotAsset.PlaceholderColor3=C.TextFaint; slotAsset.PlaceholderText="Asset ID or blank to mute this slot"; slotAsset.Font=Enum.Font[lib.CurrentFont]; slotAsset.TextSize=10; slotAsset.ClearTextOnFocus=false; slotAsset.Parent=root
+    local slotSave=Instance.new("TextButton"); slotSave.Size=UDim2.fromOffset(38,28); slotSave.Position=UDim2.new(1,-40,0,146); slotSave.BackgroundColor3=C.AccentSoft; slotSave.TextColor3=C.White; slotSave.Text="Set"; slotSave.Font=Enum.Font[lib.CurrentFontBold]; slotSave.TextSize=10; slotSave.Parent=root
+    local slotTest=Instance.new("TextButton"); slotTest.Size=UDim2.fromOffset(50,24); slotTest.Position=UDim2.new(1,-60,0,180); slotTest.BackgroundColor3=C.Surface; slotTest.TextColor3=C.TextDim; slotTest.Text="Test"; slotTest.Font=Enum.Font[lib.CurrentFont]; slotTest.TextSize=9; slotTest.Parent=root
+    local slotStatus=Instance.new("TextLabel"); slotStatus.Size=UDim2.new(1,-72,0,24); slotStatus.Position=UDim2.fromOffset(8,180); slotStatus.BackgroundTransparency=1; slotStatus.TextColor3=C.TextFaint; slotStatus.Text=""; slotStatus.Font=Enum.Font[lib.CurrentFont]; slotStatus.TextSize=9; slotStatus.TextXAlignment=Enum.TextXAlignment.Left; slotStatus.Parent=root
+    local historyTitle=Instance.new("TextLabel"); historyTitle.Size=UDim2.new(1,-16,0,18); historyTitle.Position=UDim2.fromOffset(8,206); historyTitle.BackgroundTransparency=1; historyTitle.Text="Recent playback"; historyTitle.TextColor3=C.Text; historyTitle.Font=Enum.Font[lib.CurrentFontMedium]; historyTitle.TextSize=10; historyTitle.TextXAlignment=Enum.TextXAlignment.Left; historyTitle.Parent=root
+    local history=Instance.new("ScrollingFrame"); history.Size=UDim2.new(1,-16,0,50); history.Position=UDim2.fromOffset(8,226); history.BackgroundColor3=C.Surface; history.BorderSizePixel=0; history.ScrollBarThickness=3; history.AutomaticCanvasSize=Enum.AutomaticSize.Y; history.CanvasSize=UDim2.new(); history.Parent=root
+    local historyLayout=Instance.new("UIListLayout"); historyLayout.Padding=UDim.new(0,2); historyLayout.Parent=history
+    local playlistName=Instance.new("TextBox"); playlistName.Size=UDim2.new(.24,-8,0,26); playlistName.Position=UDim2.fromOffset(8,282); playlistName.BackgroundColor3=C.Surface; playlistName.TextColor3=C.Text; playlistName.PlaceholderColor3=C.TextFaint; playlistName.PlaceholderText="Playlist"; playlistName.Font=Enum.Font[lib.CurrentFont]; playlistName.TextSize=9; playlistName.ClearTextOnFocus=false; playlistName.Parent=root
+    local playlistIds=Instance.new("TextBox"); playlistIds.Size=UDim2.new(.56,-8,0,26); playlistIds.Position=UDim2.new(.24,2,0,282); playlistIds.BackgroundColor3=C.Surface; playlistIds.TextColor3=C.Text; playlistIds.PlaceholderColor3=C.TextFaint; playlistIds.PlaceholderText="Paste sound IDs"; playlistIds.Font=Enum.Font[lib.CurrentFont]; playlistIds.TextSize=9; playlistIds.ClearTextOnFocus=false; playlistIds.Parent=root
+    local playlistImport=Instance.new("TextButton"); playlistImport.Size=UDim2.new(.16,-4,0,26); playlistImport.Position=UDim2.new(.82,0,0,282); playlistImport.BackgroundColor3=C.Surface; playlistImport.TextColor3=C.Text; playlistImport.Text="Import"; playlistImport.Font=Enum.Font[lib.CurrentFontBold]; playlistImport.TextSize=9; playlistImport.Parent=root
+    local displayedSlot
+    local function refreshSlot()
+        local slot=slotNames[slotIndex] or slotNames[1]
+        if displayedSlot~=slot then
+            displayedSlot=slot
+            slotPicker.Text=slot
+            slotAsset.Text=tostring(lib.Sounds[slot] or "")
+        end
+    end
     local function refreshChannels()
         local selected=channels[channelIndex]
         channels=GetSoundChannelNames(lib.Sounds)
@@ -8300,14 +8804,31 @@ function L:CreateSoundSettings(cfg)
     local function refresh()
         refreshChannels()
         enabled.Text="Sounds: "..(lib.Sounds.enabled and "On" or "Off"); silent.Text="Mute: "..(lib.Sounds.silent and "On" or "Off")
+        ducking.Text="Ducking: "..(lib.Sounds.ducking.enabled and "On" or "Off")
         local vol=ClampNumber(lib.Sounds.volume,0.5,0,1); fill.Size=UDim2.new(vol,0,1,0); volumeLabel.Text=string.format("Volume %d%%",math.floor(vol*100+.5))
         local selectedChannel=channels[channelIndex] or "UI"
         channel.Text="Channel: "..selectedChannel; mixLabel.Text=string.format("Mix: %d%%",math.floor(ClampNumber((lib.Sounds.channels or {})[selectedChannel],1,0,1)*100+.5))
+        refreshSlot()
+    end
+    local function refreshHistory()
+        for _,child in ipairs(history:GetChildren()) do if child~=historyLayout then child:Destroy() end end
+        local entries=lib:GetSoundHistory(5)
+        if #entries==0 then
+            local empty=Instance.new("TextLabel"); empty.Size=UDim2.new(1,-8,0,22); empty.BackgroundTransparency=1; empty.Text="No sounds have played yet"; empty.TextColor3=C.TextFaint; empty.Font=Enum.Font[lib.CurrentFont]; empty.TextSize=9; empty.Parent=history
+        else
+            for _,entry in ipairs(entries) do
+                local selectedEntry=entry
+                local row=Instance.new("TextButton"); row.Size=UDim2.new(1,-4,0,18); row.BackgroundTransparency=1; row.TextXAlignment=Enum.TextXAlignment.Left; row.TextColor3=C.TextDim; row.Font=Enum.Font[lib.CurrentFont]; row.TextSize=9
+                row.Text=tostring(selectedEntry.slot or selectedEntry.channel or "Sound").."  ·  "..tostring(selectedEntry.id or "")
+                row.Parent=history
+                row.MouseButton1Click:Connect(function() if selectedEntry.id then lib:PlaySoundAsset(selectedEntry.id,selectedEntry.channel or "Music") end end)
+            end
+        end
     end
     local function emitSettingsChanged()
         lib:Emit("SoundSettingsChanged",{
             Silent=lib.Sounds.silent,Enabled=lib.Sounds.enabled,Volume=lib.Sounds.volume,
-            Channels=table.clone(lib.Sounds.channels or {})
+            Channels=table.clone(lib.Sounds.channels or {}),Ducking=lib.Sounds.ducking.enabled
         })
     end
     local function setVolume(x)
@@ -8317,7 +8838,13 @@ function L:CreateSoundSettings(cfg)
     end
     enabled.MouseButton1Click:Connect(function() lib.Sounds.enabled=not lib.Sounds.enabled; if not lib.Sounds.enabled then lib:StopSound(.15) end; emitSettingsChanged() end)
     silent.MouseButton1Click:Connect(function() lib:SetSoundSilent(not lib.Sounds.silent) end)
+    ducking.MouseButton1Click:Connect(function() lib:SetSoundDucking(not lib.Sounds.ducking.enabled) end)
     channel.MouseButton1Click:Connect(function() channelIndex=channelIndex%#channels+1; refresh() end)
+    addChannel.MouseButton1Click:Connect(function()
+        local index=1; local name
+        repeat name="Custom "..index; index+=1 until lib.Sounds.channels[name]==nil
+        lib:SetSoundChannelVolume(name,1); refreshChannels(); channelIndex=table.find(channels,name) or 1; refresh()
+    end)
     mixLabel.MouseButton1Click:Connect(function()
         local current=ClampNumber((lib.Sounds.channels or {})[channels[channelIndex]],1,0,1)
         local levels={0,.25,.5,.75,1}; local nextLevel=levels[1]
@@ -8326,11 +8853,33 @@ function L:CreateSoundSettings(cfg)
     end)
     local dragging=false; local connections={}
     table.insert(connections,lib:On("SoundSettingsChanged",function() if root.Parent then refresh() end end))
+    table.insert(connections,lib:On("SoundPlayed",function() if root.Parent then refreshHistory() end end))
     table.insert(connections,volumeHit.InputBegan:Connect(function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=true; setVolume(input.Position.X) end end))
     table.insert(connections,win:_Connect(UIS.InputChanged,function(input) if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then setVolume(input.Position.X) end end))
     table.insert(connections,win:_Connect(UIS.InputEnded,function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=false end end))
-    section:_AddElement(root); refresh()
-    local handle={Instance=root,Refresh=refresh,SetVolume=function(_,value) lib.Sounds.volume=ClampNumber(value,0,0,1); emitSettingsChanged() end}
+    slotPicker.MouseButton1Click:Connect(function() slotIndex=slotIndex%#slotNames+1; displayedSlot=nil; refreshSlot() end)
+    slotSave.MouseButton1Click:Connect(function()
+        displayedSlot=nil
+        local ok,message=lib:SetSoundSlot(slotNames[slotIndex],slotAsset.Text)
+        slotStatus.Text=ok and "Sound slot updated" or tostring(message)
+        slotStatus.TextColor3=ok and C.Success or C.Danger
+    end)
+    slotTest.MouseButton1Click:Connect(function()
+        local slot=slotNames[slotIndex]
+        local ok,message=lib:PlaySound(slot,"UI")
+        slotStatus.Text=ok and "Playing test sound" or tostring(message)
+        slotStatus.TextColor3=ok and C.Success or C.Warning
+    end)
+    playlistImport.MouseButton1Click:Connect(function()
+        local name=playlistName.Text:gsub("^%s+",""):gsub("%s+$","")
+        if name=="" then name="Imported" end
+        local imported=lib:ImportSoundPlaylist(name,playlistIds.Text,"Custom")
+        playlistImport.Text=#imported>0 and ("+"..#imported) or "No IDs"
+        task.delay(1.5,function() if playlistImport.Parent then playlistImport.Text="Import" end end)
+    end)
+    section:_AddElement(root); refresh(); refreshHistory()
+    local handle={Instance=root,Refresh=function() refresh(); refreshHistory() end,SetVolume=function(_,value) lib.Sounds.volume=ClampNumber(value,0,0,1); emitSettingsChanged() end,
+        SetSlot=function(_,slot,id) return lib:SetSoundSlot(slot,id) end}
     root.Destroying:Connect(function() for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end end)
     function handle:Destroy() for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end; if root.Parent then root:Destroy() end end
     return handle
