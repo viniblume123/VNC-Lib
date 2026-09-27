@@ -1,8 +1,10 @@
 local L = {}
 L.__index = L
-L.Version = "6.3.0"
+L.Version = "6.3.1"
 L._iconAnimationHandles = {}
 L._iconAnimationByImage = setmetatable({}, {__mode="k"})
+local SplashGui = nil
+local SplashToken = 0
 
 local function TrackIconAnimation(lib,image,handle)
     local previous=lib._iconAnimationByImage[image]
@@ -29,6 +31,7 @@ local SG = game:GetService("StarterGui")
 local SS = game:GetService("SoundService")
 local VR = game:GetService("VRService")
 local GuiService = game:GetService("GuiService")
+local Debris = game:GetService("Debris")
 
 local REQ = (syn and syn.request) or (http and http.request) or http_request or request
 local ISF = isfile
@@ -62,23 +65,29 @@ local T_INFO = TweenInfo.new(0.3, S.Quart, D.Out)
 local function HttpGet(url)
     if REQ then
         local ok, res = pcall(REQ, {Url=url, Method="GET"})
-        if ok and type(res)=="table" and res.Body and res.Body~="" and (res.StatusCode == nil or (res.StatusCode >= 200 and res.StatusCode < 300)) then return res.Body end
+        local status=type(res)=="table" and tonumber(res.StatusCode) or nil
+        if ok and type(res)=="table" and type(res.Body)=="string" and res.Body~="" and (res.StatusCode==nil or (status and status>=200 and status<300)) then return res.Body end
     end
     local ok, res = pcall(function() return game:HttpGet(url) end)
-    if ok and res and res~="" then return res end
+    if ok and type(res)=="string" and res~="" then return res end
     return nil
 end
 
 local function HttpPost(url, body, headers)
     if REQ then
         local ok, res = pcall(REQ, {Url=url, Method="POST", Body=body, Headers=headers or {["Content-Type"]="application/json"}})
-        if ok and type(res)=="table" and res.Body then return res.Body end
+        local status=type(res)=="table" and tonumber(res.StatusCode) or nil
+        if ok and type(res)=="table" and type(res.Body)=="string" and res.Body~="" and (res.StatusCode==nil or (status and status>=200 and status<300)) then return res.Body end
     end
+    local ok, res = pcall(function() return game:HttpPost(url, body) end)
+    if ok and type(res)=="string" and res~="" then return res end
     return nil
 end
 
 local function JsonRead(file, def)
-    if not ISF or not ISF(file) then return def end
+    if not ISF then return def end
+    local existsOk,exists=pcall(ISF,file)
+    if not existsOk or not exists then return def end
     local ok, c = pcall(RF, file)
     if not ok or not c then return def end
     local ok2, d = pcall(HS.JSONDecode, HS, c)
@@ -90,8 +99,9 @@ local function JsonWrite(file, data)
     if not WF then return false, "writefile is unavailable" end
     local encodedOk, encoded = pcall(HS.JSONEncode, HS, data)
     if not encodedOk then return false, tostring(encoded) end
-    local writeOk, writeErr = pcall(WF, file, encoded)
-    if not writeOk then return false, tostring(writeErr) end
+    local writeOk, writeResult = pcall(WF, file, encoded)
+    if not writeOk then return false, tostring(writeResult) end
+    if writeResult==false then return false,"writefile reported failure" end
     return true
 end
 
@@ -110,24 +120,34 @@ local function ColorToHex(c)
 end
 
 local function FormatControlNumber(value, maxDigits)
-    maxDigits = maxDigits or 3
+    maxDigits=tonumber(maxDigits) or 3
+    if maxDigits~=maxDigits or maxDigits==math.huge or maxDigits==-math.huge then maxDigits=3 end
+    maxDigits=math.floor(math.clamp(maxDigits,0,8))
     local n = tonumber(value) or 0
-    if n ~= n then n = 0 end
+    if n ~= n or n == math.huge or n == -math.huge then n = 0 end
     local sign = n < 0 and "-" or ""
     local a = math.abs(n)
+    if maxDigits==0 then local rounded=math.floor(a+0.5); return (rounded==0 and "" or sign)..tostring(rounded) end
     if a < 1 then
-        local t = string.format("%.2f", a):gsub("0+$", ""):gsub("%.$", "")
-        return sign .. (t == "" and "0" or t)
+        local t = string.format("%."..maxDigits.."f", a):gsub("0+$", ""):gsub("%.$", "")
+        if t=="" then return "0" end
+        return sign .. t
     end
     local whole = tostring(math.floor(a))
     if a == math.floor(a) then return sign .. whole end
-    local formatted=string.format("%.2f",a):gsub("0+$",""):gsub("%.$","")
-    return sign .. formatted
+    local formatted=string.format("%."..maxDigits.."f",a):gsub("0+$",""):gsub("%.$","")
+    return (formatted=="0" and "" or sign)..formatted
 end
 
 local function ClampNumber(value, fallback, minimum, maximum)
     local number=tonumber(value)
-    if not number or number~=number or number==math.huge or number==-math.huge then number=fallback end
+    minimum=tonumber(minimum) or -math.huge
+    maximum=tonumber(maximum) or math.huge
+    if minimum>maximum then minimum,maximum=maximum,minimum end
+    if not number or number~=number or number==math.huge or number==-math.huge then number=tonumber(fallback) end
+    if not number or number~=number or number==math.huge or number==-math.huge then
+        number=minimum~=-math.huge and minimum or (maximum~=math.huge and maximum or 0)
+    end
     return math.clamp(number,minimum,maximum)
 end
 
@@ -233,7 +253,10 @@ local function GetHui()
 end
 
 local function ResolveWindow(owner,requested)
-    if requested then return type(requested)=="table" and requested or nil end
+    if requested then
+        if type(requested)=="table" and typeof(requested._main)=="Instance" and requested._main:IsA("GuiObject") and requested._lib then return requested end
+        return nil
+    end
     if type(owner)=="table" and owner._main and owner._lib then return owner end
     if type(owner)~="table" then return nil end
     local lib=owner and (owner._lib or owner)
@@ -246,6 +269,7 @@ local function RemoveGuiReference(list,gui)
     local index=table.find(list,gui); if index then table.remove(list,index) end
 end
 local function TrackAuxGui(lib,win,gui)
+    if typeof(gui)~="Instance" or not gui:IsA("ScreenGui") then return false end
     local rootLib=type(lib)=="table" and (lib._lib or lib) or nil
     local ownerWindow=win or ResolveWindow(lib)
     if rootLib then rootLib._auxGuis=rootLib._auxGuis or {}; table.insert(rootLib._auxGuis,gui) end
@@ -254,6 +278,7 @@ local function TrackAuxGui(lib,win,gui)
         RemoveGuiReference(rootLib and rootLib._auxGuis,gui)
         RemoveGuiReference(ownerWindow and ownerWindow._auxGuis,gui)
     end)
+    return true
 end
 local function DestroyAuxGui(lib,win,gui)
     local rootLib=type(lib)=="table" and (lib._lib or lib) or nil
@@ -277,7 +302,7 @@ L.Favorites = JsonRead("library_favorites.json", {})
 L._favoriteItems = {}
 L.NotificationHistory = {}
 L._stateFile = "library_state.json"
-L._startedAt = os.clock()
+L._startedAt = os.time()
 L.Config = {AutoSave = true, SaveDelay = 0.75, AutoSaveConfig = false, AutoSaveConfigName = nil, AutoSaveConfigDelay = 0.75, Transparency = 0, ReducedMotion = false}
 L.ConfigHistory = {Undo={},Redo={},Limit=50}
 
@@ -296,7 +321,7 @@ function L:_DisconnectAll()
 end
 
 function L:_ScheduleConfigAutoSave()
-    if self._loadingConfig then return end
+    if self._destroyed or self._loadingConfig then return end
     if self.Macros and self.Macros._recording and not self.Macros._playing then
         local current=self:CaptureConfig()
         local previous=self.Macros._lastRecordedState or {values={}}
@@ -313,7 +338,7 @@ function L:_ScheduleConfigAutoSave()
     if not self.Config.AutoSaveConfig or not self.Config.AutoSaveConfigName then return end
     self._configSaveToken = (self._configSaveToken or 0) + 1
     local token = self._configSaveToken
-    task.delay(self.Config.AutoSaveConfigDelay or 0.75, function()
+    task.delay(ClampNumber(self.Config.AutoSaveConfigDelay,0.75,0.1,60), function()
         if self._destroyed or token ~= self._configSaveToken then return end
         pcall(function() self:OverwriteConfig(self.Config.AutoSaveConfigName) end)
     end)
@@ -347,22 +372,37 @@ function L:Emit(eventName, ...)
     return #event
 end
 function L:Debounce(key, interval, callback, ...)
-    if type(callback) ~= "function" then return false end
+    if key==nil or type(callback) ~= "function" then return false end
     local now=os.clock()
     self._debounce=self._debounce or {}
+    for existing,expires in pairs(self._debounce) do if type(expires)~="number" or expires<=now then self._debounce[existing]=nil end end
     if (self._debounce[key] or 0)>now then return false end
-    self._debounce[key]=now+math.max(0,tonumber(interval) or 0.25)
+    local entries,oldestKey,oldestExpiry=0,nil,math.huge
+    for existing,expires in pairs(self._debounce) do entries+=1; if expires<oldestExpiry then oldestKey,oldestExpiry=existing,expires end end
+    if entries>=256 and oldestKey~=nil then self._debounce[oldestKey]=nil end
+    self._debounce[key]=now+ClampNumber(interval,0.25,0,86400)
     local ok,err=pcall(callback,...)
     if not ok then warn("[VNC-Lib] Debounced callback failed: "..tostring(err)); return false end
     return true
 end
 function L:CachedRequest(url, ttl)
+    if type(url)~="string" or url=="" then return nil,false end
     self._requestCache=self._requestCache or {}
     local now=os.clock()
+    for cachedUrl,entry in pairs(self._requestCache) do
+        if type(entry)~="table" or type(entry.Expires)~="number" or entry.Expires<=now then self._requestCache[cachedUrl]=nil end
+    end
     local cached=self._requestCache[url]
     if cached and cached.Expires>now then return cached.Body,true end
     local body=HttpGet(url)
-    if body then self._requestCache[url]={Body=body,Expires=now+math.max(0,tonumber(ttl) or 30)} end
+    if body then
+        if not cached then
+            local entries,oldestUrl,oldestExpiry=0,nil,math.huge
+            for cachedUrl,entry in pairs(self._requestCache) do entries+=1; if entry.Expires<oldestExpiry then oldestUrl,oldestExpiry=cachedUrl,entry.Expires end end
+            if entries>=128 and oldestUrl then self._requestCache[oldestUrl]=nil end
+        end
+        self._requestCache[url]={Body=body,Expires=now+ClampNumber(ttl,30,0,86400)}
+    end
     return body,false
 end
 function L:SetFavorite(id, enabled)
@@ -374,18 +414,29 @@ function L:SetFavorite(id, enabled)
     return self.Favorites[id]==true
 end
 function L:IsFavorite(id) return self.Favorites[tostring(id or "")] == true end
+local function NormalizeSoundId(id)
+    if type(id)~="string" and type(id)~="number" then return nil end
+    local text=tostring(id):gsub("^%s+",""):gsub("%s+$","")
+    local digits=text:match("^(%d+)$") or text:match("^rbxassetid://(%d+)$")
+    if not digits or #digits>20 or tonumber(digits)==0 then return nil end
+    return "rbxassetid://"..digits
+end
+
 function L:IsSoundFavorite(id)
     local key=tostring(id or "")
-    return key~="" and type(self.Sounds.favorites)=="table" and self.Sounds.favorites[key]==key or false
+    if key=="" or type(self.Sounds.favorites)~="table" then return false end
+    local normalized=NormalizeSoundId(key) or key
+    local value=self.Sounds.favorites[key] or self.Sounds.favorites[normalized]
+    return value==true or value==key or value==normalized
 end
 function L:GetFavorites()
     local out={}; for id,enabled in pairs(self.Favorites) do if enabled then table.insert(out,id) end end; table.sort(out); return out
 end
 function L:RegisterSound(name, id, category)
-    if type(name)~="string" or name=="" or not id then return false end
+    if type(name)~="string" or name:gsub("%s","")=="" then return false,"sound name required" end
+    local soundId=NormalizeSoundId(id)
+    if not soundId then return false,"sound id must be a numeric asset id or rbxassetid:// URI" end
     if type(self.Sounds.library)~="table" then self.Sounds.library={} end
-    local soundId=tostring(id)
-    if soundId:match("^%d+$") then soundId="rbxassetid://"..soundId end
     self.Sounds.library[name]={Name=name,Id=soundId,Category=category or "General"}
     return true
 end
@@ -489,12 +540,15 @@ function L:LoadState(file, silent)
 end
 function L:SetAutoSave(enabled, delay)
     self.Config.AutoSave = enabled ~= false
-    if delay then self.Config.SaveDelay = math.max(0.1, tonumber(delay) or 0.75) end
+    if delay then self.Config.SaveDelay = ClampNumber(delay,0.75,0.1,60) end
 end
 function L:Destroy()
     if self._destroyed then return end
     self._destroyed = true
+    SplashToken+=1
+    if SplashGui then pcall(function() SplashGui:Destroy() end); SplashGui=nil end
     if self._updateCheck then self._updateCheck.Active=false end
+    self._updateCheck=nil
     if self._idleState then self._idleState.enabled=false end
     if self._hubIdleState then self._hubIdleState.enabled=false; self._hubIdleState.onLock=nil; self._hubIdleState.onResume=nil; self:_RestoreHubIdle() end
     if self.Macros then
@@ -502,8 +556,12 @@ function L:Destroy()
         self.Macros._playing=false; self.Macros._playPending=false; self.Macros._playToken=(self.Macros._playToken or 0)+1; self.Macros._asyncToken=(self.Macros._asyncToken or 0)+1
     end
     for _,handle in ipairs(table.clone(self._iconAnimationHandles or {})) do if handle and handle.Stop then pcall(function() handle:Stop() end) end end
+    pcall(function() self:UnbindUndoRedo() end)
+    if self._easterConnection then pcall(function() self._easterConnection:Disconnect() end); self._easterConnection=nil end
     pcall(function() self:SaveState() end)
     self:SetAutoSave(false)
+    for _,binding in ipairs(table.clone(self._globalBindings or {})) do if binding and binding.Destroy then pcall(function() binding:Destroy() end) end end
+    self._globalBindings={}
     self:_DisconnectAll()
     for _, bindings in pairs(self._events or {}) do
         for _, binding in ipairs(bindings) do binding.Connected=false end
@@ -511,17 +569,28 @@ function L:Destroy()
     table.clear(self._events or {})
     table.clear(self._debounce or {})
     table.clear(self._requestCache or {})
+    table.clear(self.NotificationHistory or {})
     pcall(function() self:StopSound(0) end)
+    for sound in pairs(self._activeSoundInstances or {}) do pcall(function() sound:Stop(); sound:Destroy() end) end
+    self._activeSoundInstances=nil
     table.clear(self._activeWatchers or {})
     if self.WidgetGui then pcall(function() self.WidgetGui:Destroy() end); self.WidgetGui=nil end
+    table.clear(self.Widgets or {})
     for _, gui in ipairs(table.clone(self._auxGuis or {})) do if gui and gui.Parent then pcall(function() gui:Destroy() end) end end
     self._auxGuis = {}
+    self._notifyGui=nil; self._notifyContainer=nil; self._snackGui=nil; self._snackContainer=nil
     local windows=table.clone(self._allWindows or {})
     for _, w in ipairs(windows) do
         if w and not w._destroyed then pcall(function() w:Destroy() end) end
     end
     self._allWindows = {}
     self._window = nil
+    table.clear(self._state or {})
+    table.clear(self._favoriteItems or {})
+    table.clear(self._animatedIcons or {})
+    table.clear(self.ConfigHistory.Undo or {}); table.clear(self.ConfigHistory.Redo or {})
+    self._lastHistorySnapshot=nil
+    self._undoRedoBindings=nil
 end
 function L:SetAccent(color)
     if typeof(color) ~= "Color3" then return false end
@@ -536,7 +605,13 @@ end
 function L:GetThemeSnapshot() local out={}; for k,v in pairs(self.C) do out[k]=v end; return out end
 function L:SetTransparency(value)
     value=math.clamp(tonumber(value) or 0,0,0.45); self.Config=self.Config or {}; self.Config.Transparency=value
-    for _, win in ipairs(self._allWindows or {}) do if win and not win._destroyed then win:_ApplyTheme(nil, self.C) end end
+    for _, win in ipairs(self._allWindows or {}) do
+        if win and not win._destroyed then
+            local old=ClonePalette(win.C)
+            win:_ApplyTheme(old,self.C)
+            win._accentTargetsDirty=true
+        end
+    end
     return value
 end
 function L:SetReducedMotion(enabled) self.Config=self.Config or {}; self.Config.ReducedMotion=enabled==true; return self.Config.ReducedMotion end
@@ -625,6 +700,8 @@ L.Palettes = {
 
 L.Palettes.Aurora = { Bg=Color3.fromRGB(20,27,38), Surface=Color3.fromRGB(27,36,49), Card=Color3.fromRGB(37,48,64), CardHover=Color3.fromRGB(48,62,82), CardActive=Color3.fromRGB(44,58,78), Stroke=Color3.fromRGB(69,88,112), StrokeHot=Color3.fromRGB(94,220,255), Text=Color3.fromRGB(246,252,255), TextDim=Color3.fromRGB(200,218,232), TextFaint=Color3.fromRGB(137,161,180), Accent=Color3.fromRGB(76,211,255), AccentSoft=Color3.fromRGB(39,117,150), Success=Color3.fromRGB(84,231,164), SuccessBg=Color3.fromRGB(29,87,63), Danger=Color3.fromRGB(255,102,128), DangerBg=Color3.fromRGB(101,39,54), Warning=Color3.fromRGB(255,190,91), WarningBg=Color3.fromRGB(100,72,35), Info=Color3.fromRGB(105,164,255), InfoBg=Color3.fromRGB(38,68,112), Overlay=Color3.fromRGB(2,7,13), White=Color3.fromRGB(255,255,255) }
 L.Palettes.Slate = { Bg=Color3.fromRGB(31,35,43), Surface=Color3.fromRGB(39,44,54), Card=Color3.fromRGB(51,57,69), CardHover=Color3.fromRGB(63,70,84), CardActive=Color3.fromRGB(59,67,82), Stroke=Color3.fromRGB(82,91,108), StrokeHot=Color3.fromRGB(168,184,255), Text=Color3.fromRGB(249,250,253), TextDim=Color3.fromRGB(217,221,231), TextFaint=Color3.fromRGB(157,165,181), Accent=Color3.fromRGB(140,155,255), AccentSoft=Color3.fromRGB(84,95,173), Success=Color3.fromRGB(91,220,151), SuccessBg=Color3.fromRGB(39,86,64), Danger=Color3.fromRGB(255,111,130), DangerBg=Color3.fromRGB(99,42,53), Warning=Color3.fromRGB(255,191,99), WarningBg=Color3.fromRGB(102,75,39), Info=Color3.fromRGB(105,181,255), InfoBg=Color3.fromRGB(39,73,111), Overlay=Color3.fromRGB(8,10,14), White=Color3.fromRGB(255,255,255) }
+local BuiltinPaletteNames={}
+for name in pairs(L.Palettes) do BuiltinPaletteNames[name]=true end
 L.Palettes.Light = { Bg=Color3.fromRGB(242,245,250), Surface=Color3.fromRGB(250,251,253), Card=Color3.fromRGB(255,255,255), CardHover=Color3.fromRGB(244,247,252), CardActive=Color3.fromRGB(235,240,250), Stroke=Color3.fromRGB(211,218,231), StrokeHot=Color3.fromRGB(102,116,255), Text=Color3.fromRGB(25,29,38), TextDim=Color3.fromRGB(73,80,96), TextFaint=Color3.fromRGB(118,127,146), Accent=Color3.fromRGB(91,105,240), AccentSoft=Color3.fromRGB(70,82,180), Success=Color3.fromRGB(35,155,91), SuccessBg=Color3.fromRGB(224,246,234), Danger=Color3.fromRGB(214,68,86), DangerBg=Color3.fromRGB(252,230,233), Warning=Color3.fromRGB(194,126,27), WarningBg=Color3.fromRGB(252,242,220), Info=Color3.fromRGB(48,125,205), InfoBg=Color3.fromRGB(225,239,253), Overlay=Color3.fromRGB(30,35,45), White=Color3.fromRGB(255,255,255) }
 L.Palettes.Graphite = { Bg=Color3.fromRGB(36,38,43), Surface=Color3.fromRGB(45,48,54), Card=Color3.fromRGB(56,60,68), CardHover=Color3.fromRGB(70,75,84), CardActive=Color3.fromRGB(64,69,79), Stroke=Color3.fromRGB(92,98,110), StrokeHot=Color3.fromRGB(155,168,255), Text=Color3.fromRGB(250,251,253), TextDim=Color3.fromRGB(216,220,228), TextFaint=Color3.fromRGB(161,167,180), Accent=Color3.fromRGB(135,148,255), AccentSoft=Color3.fromRGB(82,94,180), Success=Color3.fromRGB(91,220,151), SuccessBg=Color3.fromRGB(39,86,64), Danger=Color3.fromRGB(246,104,124), DangerBg=Color3.fromRGB(99,41,54), Warning=Color3.fromRGB(247,184,94), WarningBg=Color3.fromRGB(101,74,38), Info=Color3.fromRGB(106,179,246), InfoBg=Color3.fromRGB(39,75,112), Overlay=Color3.fromRGB(9,10,13), White=Color3.fromRGB(255,255,255) }
 
@@ -674,8 +751,13 @@ L.Icons = {
 }
 
 function L:RegisterIcon(name, id)
+    if type(name)~="string" or name:gsub("%s","")=="" then return false,"icon name required" end
+    if type(id)~="string" and type(id)~="number" then return false,"icon id must be a string or number" end
+    id=tostring(id)
+    if id=="" then return false,"icon id cannot be empty" end
     self.Icons[name] = id
     for _, win in ipairs(self._allWindows or {}) do if win and not win._destroyed then win:_RefreshIcons() end end
+    return true
 end
 
 L.Sounds = {
@@ -703,8 +785,9 @@ function L:SetSounds(cfg)
     self.Sounds.transitionHooks = type(self.Sounds.transitionHooks)=="table" and self.Sounds.transitionHooks or {}
     self.Sounds.library=type(self.Sounds.library)=="table" and self.Sounds.library or {}
     for name,entry in pairs(self.Sounds.library) do
-        if type(name)~="string" or type(entry)~="table" or not entry.Id then self.Sounds.library[name]=nil
-        else entry.Name=tostring(entry.Name or name); entry.Category=tostring(entry.Category or "General"); entry.Id=tostring(entry.Id) end
+        local normalized=type(entry)=="table" and NormalizeSoundId(entry.Id)
+        if type(name)~="string" or type(entry)~="table" or not normalized then self.Sounds.library[name]=nil
+        else entry.Name=tostring(entry.Name or name); entry.Category=tostring(entry.Category or "General"); entry.Id=normalized end
     end
 end
 
@@ -712,12 +795,14 @@ function L:SetSoundChannelVolume(channel, volume)
     if type(channel)~="string" or channel=="" then return false,"channel name required" end
     if type(self.Sounds.channels)~="table" then self.Sounds.channels={} end
     self.Sounds.channels[channel] = ClampNumber(volume,1,0,1)
+    self:Emit("SoundSettingsChanged",{Silent=self.Sounds.silent,Enabled=self.Sounds.enabled,Volume=self.Sounds.volume,Channel=channel,ChannelVolume=self.Sounds.channels[channel]})
     return self.Sounds.channels[channel]
 end
 
 function L:SetSoundSilent(silent)
     self.Sounds.silent = silent == true
     if self.Sounds.silent then self:StopSound(0.15) end
+    self:Emit("SoundSettingsChanged",{Silent=self.Sounds.silent,Enabled=self.Sounds.enabled,Volume=self.Sounds.volume})
     return self.Sounds.silent
 end
 
@@ -726,21 +811,26 @@ function L:SetSoundFavorite(id, enabled)
     local key = tostring(id)
     if key=="" then return false end
     if type(self.Sounds.favorites)~="table" then self.Sounds.favorites={} end
-    local previous=self.Sounds.favorites[key]
-    self.Sounds.favorites[key] = enabled ~= false and key or nil
-    if previous~=self.Sounds.favorites[key] then JsonWrite("library_sound_favorites.json",self.Sounds.favorites) end
-    return self.Sounds.favorites[key] ~= nil
+    local normalized=NormalizeSoundId(key) or key
+    local previous=self.Sounds.favorites[normalized]
+    self.Sounds.favorites[normalized] = enabled ~= false and true or nil
+    if key~=normalized then self.Sounds.favorites[key]=nil end
+    if previous~=(self.Sounds.favorites[normalized]==true) then JsonWrite("library_sound_favorites.json",self.Sounds.favorites) end
+    return self.Sounds.favorites[normalized]==true
 end
 
 function L:ImportSoundPlaylist(name, ids, category)
     name = tostring(name or "Playlist")
     local list = {}
     if type(ids) == "string" then
-        for id in ids:gmatch("%d+") do table.insert(list, "rbxassetid://"..id) end
+        for token in ids:gmatch("[^,%s;]+") do
+            local id=NormalizeSoundId(token)
+            if id then table.insert(list,id) end
+        end
     elseif type(ids) == "table" then
         for _, id in ipairs(ids) do
-            local text = tostring(id)
-            if text:match("%d+") then table.insert(list, text:find("rbxassetid://",1,true) and text or ("rbxassetid://"..text)) end
+            local normalized=NormalizeSoundId(id)
+            if normalized then table.insert(list,normalized) end
         end
     end
     self.Sounds.playlists = self.Sounds.playlists or {}
@@ -776,18 +866,26 @@ function L:StopSound(fadeDuration)
     return true
 end
 
-function L:PlaySound(slot, channel, options)
-    if self._destroyed or self.Sounds.silent or not self.Sounds.enabled then return end
-    local id = self.Sounds[slot]
-    if type(id)~="string" or id == "" then return false end
+function L:_PlaySoundId(id, slot, channel, options)
+    if self._destroyed then return false,"library is destroyed" end
+    if self.Sounds.silent or not self.Sounds.enabled then return false,"sound playback is disabled" end
+    if type(id)~="string" or id == "" then return false,"sound id is empty" end
+    options=type(options)=="table" and options or {}
     channel = channel or ((slot == "click" or slot == "hover" or slot == "open" or slot == "close") and "UI") or "Effects"
-    pcall(function()
+    self._activeSoundInstances=self._activeSoundInstances or setmetatable({}, {__mode="k"})
+    local activeCount=0
+    for existing in pairs(self._activeSoundInstances) do
+        if existing and existing.Parent then activeCount+=1 else self._activeSoundInstances[existing]=nil end
+    end
+    if activeCount>=32 then return false,"active sound limit reached" end
+    local ok,sound=pcall(function()
         local s = Instance.new("Sound")
         s.SoundId = id
         local targetVolume = math.clamp((tonumber(self.Sounds.volume) or 0.5) * ((self.Sounds.channels or {})[channel] or 1), 0, 1)
         s.Volume = options and tonumber(options.FadeIn) and tonumber(options.FadeIn)>0 and 0 or targetVolume
         if options and options.Pitch then s.PlaybackSpeed = math.clamp(tonumber(options.Pitch) or 1, 0.5, 2) end
         s.Parent = SS
+        self._activeSoundInstances[s]=true
         self.Sounds.history = self.Sounds.history or {}
         table.insert(self.Sounds.history, 1, {id=id, slot=slot, channel=channel, time=os.time()})
         while #self.Sounds.history > 50 do table.remove(self.Sounds.history) end
@@ -798,24 +896,38 @@ function L:PlaySound(slot, channel, options)
         s:Play()
         if options and tonumber(options.FadeIn) and tonumber(options.FadeIn)>0 then TweenService:Create(s,TweenInfo.new(math.clamp(tonumber(options.FadeIn),0.05,10)),{Volume=targetVolume}):Play() end
         s.Ended:Connect(function() if self._activeSound == s then self._activeSound=nil end; s:Destroy() end)
+        s.Destroying:Connect(function() self._activeSoundInstances[s]=nil; if self._activeSound==s then self._activeSound=nil end end)
         task.delay(120, function() if s and s.Parent then s:Destroy() end end)
+        return s
     end)
+    if not ok then return false,tostring(sound) end
+    return sound~=nil
+end
+
+function L:PlaySound(slot, channel, options)
+    if type(slot)~="string" then return false,"sound slot must be a string" end
+    local id=self.Sounds[slot]
+    return self:_PlaySoundId(NormalizeSoundId(id) or id,slot,channel,options)
 end
 
 function L:PlaySoundAsset(id, channel, options)
-    if not id then return false end
-    options = options or {}
-    local soundId = tostring(id)
-    if soundId:match("^%d+$") then soundId = "rbxassetid://"..soundId end
-    local slot = "__customSound"
-    self.Sounds[slot] = soundId
-    self:PlaySound(slot, channel or "Music", options)
-    return true
+    local soundId=NormalizeSoundId(id)
+    if not soundId then return false,"sound id must be a numeric asset id or rbxassetid:// URI" end
+    return self:_PlaySoundId(soundId,nil,channel or "Music",options)
 end
 
 function L:SetTransitionSound(name, soundId)
+    if type(name)~="string" or name:gsub("%s","")=="" then return false,"transition name required" end
+    local normalized=NormalizeSoundId(soundId)
+    if not normalized then return false,"sound id must be a numeric asset id or rbxassetid:// URI" end
     self.Sounds.transitionHooks = self.Sounds.transitionHooks or {}
-    self.Sounds.transitionHooks[tostring(name)] = soundId
+    self.Sounds.transitionHooks[name] = normalized
+    return true
+end
+
+function L:RemoveTransitionSound(name)
+    if type(name)~="string" or type(self.Sounds.transitionHooks)~="table" or self.Sounds.transitionHooks[name]==nil then return false end
+    self.Sounds.transitionHooks[name]=nil
     return true
 end
 
@@ -852,6 +964,10 @@ function L:CreateSoundBox(cfg)
     local play=makeText("TextButton",panel,UDim2.new(0,72,0,32),UDim2.new(0,92,0,84),"Play",theme.AccentSoft)
     local stop=makeText("TextButton",panel,UDim2.new(0,72,0,32),UDim2.new(0,172,0,84),"Fade stop",theme.Card)
     local silent=makeText("TextButton",panel,UDim2.new(0,92,0,32),UDim2.new(0,252,0,84),"Silent: "..(self.Sounds.silent and "on" or "off"),theme.Card)
+    local silentSubscription=self:On("SoundSettingsChanged",function(state)
+        if gui.Parent then silent.Text="Silent: "..(state and state.Silent and "on" or "off") end
+    end)
+    gui.Destroying:Connect(function() if silentSubscription then silentSubscription:Disconnect() end end)
     local channel=makeText("TextButton",panel,UDim2.new(0,180,0,30),UDim2.new(0,12,0,124),"Channel: Music",theme.Card)
     local channelVolume=makeText("TextBox",panel,UDim2.new(0,72,0,30),UDim2.new(1,-84,0,124),tostring((self.Sounds.channels or {}).Music or 1),theme.Card)
     channelVolume.PlaceholderText="Mix"; channelVolume.ClearTextOnFocus=false
@@ -1042,7 +1158,10 @@ end
 function L:SetCustomTheme(t)
     if type(t) ~= "table" then return false end
     local merged = ClonePalette(self.Palettes.Dark)
-    for k, v in pairs(t) do merged[k] = v end
+    for k, v in pairs(t) do
+        if merged[k]==nil or typeof(v)~="Color3" then return false,"palette entries must use known Color3 keys" end
+        merged[k] = v
+    end
     local old = ClonePalette(self.C)
     ReplacePaletteInPlace(self.C, NormalizePalette(merged))
     self._themeNormalized = true
@@ -1051,6 +1170,18 @@ function L:SetCustomTheme(t)
     self.ThemeBase = "Custom"
     self.ThemeHue = 0
     for _, win in ipairs(self._allWindows or {}) do if win and not win._destroyed then win:_ApplyTheme(old, self.C) end end
+    return true
+end
+
+function L:RemoveTheme(name)
+    if type(name)~="string" or BuiltinPaletteNames[name] or self.Palettes[name]==nil then return false end
+    local saved=JsonRead("library_custom_palettes.json",{})
+    if type(saved)~="table" then saved={} end
+    saved[name]=nil
+    local ok=JsonWrite("library_custom_palettes.json",saved)
+    if not ok then return false,"could not update the saved palettes file" end
+    self.Palettes[name]=nil
+    if self.Theme==name then self:SetTheme("Dark") end
     return true
 end
 
@@ -1429,14 +1560,27 @@ end
 
 L.License = {_data=nil, _file="library_license.json"}
 
+local function NormalizeLicenseData(data)
+    local defaults={key="",plan="free",expires=0,hwid=""}
+    if type(data)~="table" then data={} end
+    for key,value in pairs(defaults) do if data[key]==nil then data[key]=value end end
+    local expires=tonumber(data.expires)
+    data.expires=(expires and expires==expires and expires~=math.huge and expires~=-math.huge) and expires or 0
+    for _,key in ipairs({"key","plan","hwid"}) do if type(data[key])~="string" then data[key]=tostring(data[key] or defaults[key]) end end
+    return data
+end
+
 function L:LoadLicense()
-    self.License._data = JsonRead(self.License._file, {key="", plan="free", expires=0, hwid=""})
+    self.License._data = NormalizeLicenseData(JsonRead(self.License._file, {key="", plan="free", expires=0, hwid=""}))
     return self.License._data
 end
 
 function L:SaveLicense(data)
-    for k, v in pairs(data) do self.License._data[k] = v end
-    JsonWrite(self.License._file, self.License._data)
+    if type(data)~="table" then return false,"license data must be a table" end
+    local stored=NormalizeLicenseData(type(self.License._data)=="table" and self.License._data or JsonRead(self.License._file,{key="",plan="free",expires=0,hwid=""}))
+    for k,v in pairs(data) do stored[k]=v end
+    self.License._data=NormalizeLicenseData(stored)
+    return JsonWrite(self.License._file,self.License._data)
 end
 
 function L:GetLicensePlan()
@@ -1459,9 +1603,6 @@ function L:HasPlan(planName)
     local h = {free=0, basic=1, pro=2, premium=3, lifetime=99}
     return (h[cur] or 0) >= (h[planName] or 0)
 end
-
-local SplashGui = nil
-local SplashToken = 0
 
 function L:ShowSplash(cfg)
     cfg = cfg or {}
@@ -1601,18 +1742,18 @@ local function EnsureNotify(lib)
 end
 
 function L:Notify(cfg)
-    cfg = cfg or {}
+    cfg = type(cfg)=="table" and cfg or {}
     local lib=self._lib or self
     local notifyContainer=EnsureNotify(lib)
-    local title = cfg.Title or "Notificacao"
-    local text = cfg.Text or cfg.Content or ""
-    local dur = cfg.Duration or 4
+    local title = tostring(cfg.Title or "Notificacao")
+    local text = tostring(cfg.Text or cfg.Content or "")
+    local dur = ClampNumber(cfg.Duration,4,0.1,120)
     local kind = cfg.Type or "info"
     lib.NotificationHistory=lib.NotificationHistory or {}
     table.insert(lib.NotificationHistory,1,{Title=title,Text=text,Type=kind,Time=os.time()})
     while #lib.NotificationHistory>100 do table.remove(lib.NotificationHistory) end
     if kind=="success" and lib.Config.AutoConfetti then local win=self._window or lib._window; if win and not win._destroyed then pcall(function() lib:PlayEffect("Confetti",win._main,{Count=28}) end) end end
-    local img = cfg.Image
+    local img = type(cfg.Image)=="string" and cfg.Image~="" and cfg.Image or nil
     local C = self.C
     local col
     if kind == "success" then col = C.Success
@@ -1681,11 +1822,12 @@ function L:Notify(cfg)
     Cb.TextSize = 12
     Cb.AutoButtonColor = false
     Cb.Parent = Card
+    local removed=false
     local function Remove()
-        if not Card.Parent then return end
+        if removed or not Card.Parent then return end
+        removed=true
         TweenService:Create(Card, T_INFO, {GroupTransparency=1}):Play()
-        TweenService:Create(Card, T_INFO, {Size=UDim2.new(0,0,0,0)}):Play()
-        task.delay(0.3, function() if Card.Parent then Card:Destroy() end end)
+        task.delay(0.24, function() if Card.Parent then Card:Destroy() end end)
     end
     Cb.MouseButton1Click:Connect(Remove)
     TweenService:Create(Card, T_OUT, {GroupTransparency=0}):Play()
@@ -1694,7 +1836,17 @@ function L:Notify(cfg)
 end
 
 function L:GetNotificationHistory() local lib=self._lib or self; return table.clone(lib.NotificationHistory or {}) end
-function L:ClearNotificationHistory() local lib=self._lib or self; table.clear(lib.NotificationHistory or {}); return true end
+function L:ClearNotificationHistory()
+    local lib=self._lib or self
+    table.clear(lib.NotificationHistory or {})
+    local old=lib._notificationHistoryGui
+    if old and old.Parent then
+        old:Destroy()
+        lib._notificationHistoryGui=nil
+        lib:ShowNotificationHistory()
+    end
+    return true
+end
 function L:ShowNotificationHistory()
     local lib=self._lib or self
     local items={}
@@ -1704,6 +1856,8 @@ function L:ShowNotificationHistory()
     if #items==0 then items={{Name="No notifications recorded",Tab="History",Callback=function() end}} end
     local search=lib:CreateGlobalSearch({Items=items,Placeholder="Search notification history..."})
     if not search then return nil,"Open a library window before showing notification history." end
+    lib._notificationHistoryGui=search
+    search.Destroying:Connect(function() if lib._notificationHistoryGui==search then lib._notificationHistoryGui=nil end end)
     return search
 end
 
@@ -1731,12 +1885,12 @@ local function EnsureSnack(lib)
 end
 
 function L:Snackbar(cfg)
-    cfg = cfg or {}
+    cfg = type(cfg)=="table" and cfg or {}
     local snackContainer=EnsureSnack(self._lib or self)
-    local text = cfg.Text or ""
+    local text = tostring(cfg.Text or "")
     local kind = cfg.Type or "info"
-    local dur = cfg.Duration or 3
-    local action = cfg.Action
+    local dur = ClampNumber(cfg.Duration,3,0.1,120)
+    local action = type(cfg.Action)=="table" and cfg.Action or nil
     local C = self.C
     local col
     if kind == "success" then col = C.Success
@@ -1791,10 +1945,10 @@ function L:Snackbar(cfg)
 end
 
 function L:Toast(cfg)
-    cfg = cfg or {}
-    local text = cfg.Text or ""
+    cfg = type(cfg)=="table" and cfg or {}
+    local text = tostring(cfg.Text or "")
     local kind = cfg.Type or "success"
-    local dur = cfg.Duration or 2
+    local dur = ClampNumber(cfg.Duration,2,0.1,120)
     local C = self.C
     local col
     if kind == "success" then col = C.Success
@@ -1868,15 +2022,28 @@ local function EnsureWidgets()
     L.WidgetGui.Parent = GetHui()
 end
 
+local function ReflowAutoWidgets(lib)
+    local widgets={}
+    for _,widget in pairs(lib.Widgets or {}) do
+        if widget and widget._autoPosition and widget._card and widget._card.Parent then table.insert(widgets,widget) end
+    end
+    table.sort(widgets,function(a,b) return (a._layoutOrder or 0)<(b._layoutOrder or 0) end)
+    for index,widget in ipairs(widgets) do widget._card.Position=UDim2.new(0,20,0,20+(index-1)*54) end
+end
+
 function L:AddWidget(cfg)
-    cfg = cfg or {}
+    cfg = type(cfg)=="table" and cfg or {}
+    local lib=self._lib or self
     EnsureWidgets()
     local C = self.C
+    local widgetColor=SafeColor(cfg.Color,C.Accent)
     local key = cfg.Id or HS:GenerateGUID(false)
-    if self.Widgets[key] then return self.Widgets[key] end
+    if lib.Widgets[key] then return lib.Widgets[key] end
+    local autoPosition=typeof(cfg.Position)~="UDim2"
+    lib._widgetOrder=(lib._widgetOrder or 0)+1
     local Card = Instance.new("Frame")
-    Card.Size = UDim2.new(0, cfg.Width or 140, 0, 46)
-    Card.Position = cfg.Position or UDim2.new(0, 20, 0, 20 + #self.Widgets * 54)
+    Card.Size = UDim2.new(0, math.floor(ClampNumber(cfg.Width,140,80,600)), 0, 46)
+    Card.Position = autoPosition and UDim2.new(0,20,0,20) or cfg.Position
     Card.BackgroundColor3 = C.Surface
     Card.BackgroundTransparency = 0.1
     Card.BorderSizePixel = 0
@@ -1886,7 +2053,7 @@ function L:AddWidget(cfg)
     local Icon = Instance.new("Frame")
     Icon.Size = UDim2.new(0,24,0,24)
     Icon.Position = UDim2.new(0,10,0.5,-12)
-    Icon.BackgroundColor3 = cfg.Color or C.Accent
+    Icon.BackgroundColor3 = widgetColor
     Icon.BackgroundTransparency = 0.85
     Icon.BorderSizePixel = 0
     Icon.Parent = Card
@@ -1894,16 +2061,16 @@ function L:AddWidget(cfg)
     local IT = Instance.new("TextLabel")
     IT.Size = UDim2.new(1,0,1,0)
     IT.BackgroundTransparency = 1
-    IT.Text = cfg.Icon or "o"
+    IT.Text = tostring(cfg.Icon or "o")
     IT.Font = Enum.Font.GothamBold
     IT.TextSize = 12
-    IT.TextColor3 = cfg.Color or C.Accent
+    IT.TextColor3 = widgetColor
     IT.Parent = Icon
     local Lb = Instance.new("TextLabel")
     Lb.Size = UDim2.new(1,-46,0,14)
     Lb.Position = UDim2.new(0,42,0,8)
     Lb.BackgroundTransparency = 1
-    Lb.Text = cfg.Name or "Widget"
+    Lb.Text = tostring(cfg.Name or "Widget")
     Lb.Font = Enum.Font[self.CurrentFont]
     Lb.TextSize = 10
     Lb.TextColor3 = C.TextFaint
@@ -1913,13 +2080,13 @@ function L:AddWidget(cfg)
     Val.Size = UDim2.new(1,-46,0,20)
     Val.Position = UDim2.new(0,42,0,20)
     Val.BackgroundTransparency = 1
-    Val.Text = cfg.Default or "-"
+    Val.Text = tostring(cfg.Default or "-")
     Val.Font = Enum.Font[self.CurrentFontBold]
     Val.TextSize = 14
     Val.TextColor3 = C.Text
     Val.TextXAlignment = Enum.TextXAlignment.Left
     Val.Parent = Card
-    local W = {_card=Card, _value=Val, _id=key, _cfg=cfg, Instance=Card}
+    local W = {_card=Card, _value=Val, _id=key, _cfg=cfg, _autoPosition=autoPosition, _layoutOrder=lib._widgetOrder, Instance=Card}
     function W:Set(v) Val.Text = tostring(v) end
     function W:Update()
         if cfg.OnUpdate then
@@ -1927,13 +2094,15 @@ function L:AddWidget(cfg)
             if ok then self:Set(res) end
         end
     end
-    function W:Destroy() Card:Destroy(); L.Widgets[key] = nil end
-    self.Widgets[key] = W
+    function W:Destroy() if Card.Parent then Card:Destroy() end; lib.Widgets[key] = nil; ReflowAutoWidgets(lib) end
+    lib.Widgets[key] = W
+    ReflowAutoWidgets(lib)
     if cfg.OnUpdate then
+        local interval=ClampNumber(cfg.Interval,1,0.1,3600)
         task.spawn(function()
-            while Card.Parent do
+            while Card.Parent and not lib._destroyed do
                 W:Update()
-                task.wait(cfg.Interval or 1)
+                task.wait(interval)
             end
         end)
     end
@@ -2014,102 +2183,126 @@ L.Transitions.List = {
 }
 
 function L:PlayEffect(name, parent, cfg)
-    if self:GetReducedMotion() then return false end
-    local def = self.Effects.List[name]
-    if not def then return end
-    cfg = cfg or {}
-    local color = cfg.Color or def.color
-    local count = cfg.Count or 20
-    local is3D = cfg.World3D or false
-    for i = 1, count do
-        task.spawn(function()
-            task.wait(math.random() * 0.15)
-            local sz = math.random(def.minS, def.maxS) / 100
+    if self._destroyed or self:GetReducedMotion() then return false end
+    local def=self.Effects.List[name]
+    if type(def)~="table" then return false,"unknown effect" end
+    cfg=type(cfg)=="table" and cfg or {}
+    local color=typeof(cfg.Color)=="Color3" and cfg.Color or def.color
+    if typeof(color)~="Color3" then color=self.C.Accent end
+    local count=math.floor(ClampNumber(cfg.Count,20,1,200))
+    local duration=ClampNumber(cfg.Duration,def.dur or 1,0.05,30)
+    local minSize=math.floor(ClampNumber(def.minS,4,1,500))
+    local maxSize=math.floor(ClampNumber(def.maxS,minSize,1,500))
+    if maxSize<minSize then minSize,maxSize=maxSize,minSize end
+    local sizeOverride=cfg.Size~=nil and math.floor(ClampNumber(cfg.Size,minSize,1,500)) or nil
+    local is3D=cfg.World3D==true
+    if is3D and (typeof(parent)~="Instance" or not parent:IsA("BasePart")) then return false,"World3D effects require a BasePart" end
+    if not is3D and (typeof(parent)~="Instance" or not parent:IsA("GuiObject")) then return false,"2D effects require a GuiObject" end
+    local zIndex=math.floor(ClampNumber(cfg.ZIndex,500,1,10000))
+    local from=typeof(cfg.From)=="UDim2" and cfg.From or nil
+    local toY=ClampNumber(cfg.ToY,-0.1,-4,4)
+    task.spawn(function()
+        for index=1,count do
+            if self._destroyed or not parent.Parent then return end
+            local size=sizeOverride or math.random(minSize,maxSize)
             if is3D then
-                if not parent or not parent.CFrame then return end
-                local p = Instance.new("Part")
-                p.Size = Vector3.new(sz, sz, sz)
-                p.Shape = Enum.PartType.Ball
-                p.Material = Enum.Material.Neon
-                p.Color = color
-                p.CanCollide = false
-                p.Anchored = false
-                p.CFrame = parent.CFrame * CFrame.new((math.random()-0.5)*4, math.random()*3, (math.random()-0.5)*4)
-                p.Parent = workspace
-                p.AssemblyLinearVelocity = Vector3.new((math.random()-0.5)*8, math.random(8,15), (math.random()-0.5)*8)
-                task.delay(def.dur + 0.1, function() if p and p.Parent then p:Destroy() end end)
+                local part=Instance.new("Part")
+                part.Size=Vector3.new(size/100,size/100,size/100)
+                part.Shape=Enum.PartType.Ball; part.Material=Enum.Material.Neon; part.Color=color
+                part.CanCollide=false; part.Anchored=false
+                part.CFrame=parent.CFrame*CFrame.new((math.random()-0.5)*4,math.random()*3,(math.random()-0.5)*4)
+                part.Parent=workspace
+                part.AssemblyLinearVelocity=Vector3.new((math.random()-0.5)*8,math.random(8,15),(math.random()-0.5)*8)
+                Debris:AddItem(part,duration+0.1)
             else
-                if not parent or not parent.Parent then return end
-                local f = Instance.new("Frame")
-                f.Size = UDim2.new(0, sz, 0, sz)
-                f.Position = cfg.From or UDim2.new(math.random(), 0, 0.8, 0)
-                f.BackgroundColor3 = color
-                f.BorderSizePixel = 0
-                f.ZIndex = 500
-                f.Parent = parent
-                local fc = Instance.new("UICorner")
-                fc.CornerRadius = UDim.new(1, 0)
-                fc.Parent = f
-                local tY = cfg.ToY or -0.1
-                local tX = cfg.ToX or (f.Position.X.Scale + (math.random()-0.5)*0.3)
-                TweenService:Create(f, TweenInfo.new(def.dur, S.Quart, D.Out), {
-                    Position = UDim2.new(tX, 0, tY, 0),
-                    BackgroundTransparency = 1,
-                    Size = UDim2.new(0, sz*0.3, 0, sz*0.3)
+                local particle=Instance.new("Frame")
+                particle.Size=UDim2.fromOffset(size,size)
+                particle.Position=from or UDim2.new(math.random(),0,0.8,0)
+                particle.BackgroundColor3=color; particle.BorderSizePixel=0; particle.ZIndex=zIndex; particle.Parent=parent
+                local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(1,0); corner.Parent=particle
+                local toX=cfg.ToX~=nil and ClampNumber(cfg.ToX,particle.Position.X.Scale,-4,4) or (particle.Position.X.Scale+(math.random()-0.5)*0.3)
+                TweenService:Create(particle,TweenInfo.new(duration,S.Quart,D.Out),{
+                    Position=UDim2.new(toX,0,toY,0),BackgroundTransparency=1,Size=UDim2.fromOffset(size*0.3,size*0.3)
                 }):Play()
-                task.delay(def.dur + 0.2, function() if f.Parent then f:Destroy() end end)
+                Debris:AddItem(particle,duration+0.2)
             end
-        end)
-    end
+            if index%20==0 and index<count then task.wait() end
+        end
+    end)
+    return true
 end
 
-function L:PlayTransition(name, target, direction)
-    local def = self.Transitions.List[name]
-    if not def or not target then return end
-    local hook = self.Sounds and self.Sounds.transitionHooks and self.Sounds.transitionHooks[name]
-    if hook and hook ~= "" then self:PlaySoundAsset(hook, "Transitions") end
+function L:RefreshTransitionHome(target)
+    if typeof(target)~="Instance" or not target:IsA("GuiObject") then return false,"GuiObject required" end
+    local active=self._activeTransitions and self._activeTransitions[target]
+    if active then for _,tween in ipairs(active.Tweens) do pcall(function() tween:Cancel() end) end end
+    self._activeTransitions=self._activeTransitions or setmetatable({}, {__mode="k"})
+    self._activeTransitions[target]=nil
+    target:SetAttribute("__HomePos",target.Position)
+    target:SetAttribute("__HomeSize",target.Size)
+    target:SetAttribute("__HomeDirty",false)
+    return true
+end
+
+function L:PlayTransition(name, target, direction, cfg)
+    local def=self.Transitions.List[name]
+    if type(def)~="table" or typeof(target)~="Instance" or not target:IsA("GuiObject") then return false end
+    direction=direction=="out" and "out" or "in"
+    cfg=type(cfg)=="table" and cfg or {}
+    local hook=self.Sounds and self.Sounds.transitionHooks and self.Sounds.transitionHooks[name]
+    if hook and hook~="" then self:PlaySoundAsset(hook,"Transitions") end
+    self._activeTransitions=self._activeTransitions or setmetatable({}, {__mode="k"})
+    local previous=self._activeTransitions[target]
+    if previous then for _,tween in ipairs(previous.Tweens) do pcall(function() tween:Cancel() end) end end
+    local entry={Tweens={}}
+    self._activeTransitions[target]=entry
+    local home=target:GetAttribute("__HomePos")
+    local homeSize=target:GetAttribute("__HomeSize")
+    if not previous or not home or not homeSize or target:GetAttribute("__HomeDirty")==true then
+        home=cfg.HomePosition or target.Position; homeSize=cfg.HomeSize or target.Size
+        target:SetAttribute("__HomePos",home); target:SetAttribute("__HomeSize",homeSize); target:SetAttribute("__HomeDirty",false)
+    end
+    if typeof(home)~="UDim2" then home=target.Position end
+    if typeof(homeSize)~="UDim2" then homeSize=target.Size end
     if self:GetReducedMotion() then
-        target.Position = target:GetAttribute("__HomePos") or target.Position
-        target.Size = target:GetAttribute("__HomeSize") or target.Size
-        target.Rotation = 0
-        if target:IsA("CanvasGroup") then target.GroupTransparency = direction == "in" and 0 or 1 end
+        target.Position=home; target.Size=homeSize; target.Rotation=0
+        if target:IsA("CanvasGroup") then target.GroupTransparency=direction=="in" and 0 or 1 end
+        self._activeTransitions[target]=nil
         return true
     end
-    if not target:GetAttribute("__HomePos") then
-        target:SetAttribute("__HomePos", target.Position)
-        target:SetAttribute("__HomeSize", target.Size)
+    local duration=ClampNumber(cfg.Duration,def.dur or 0.4,0.05,30)
+    local style=typeof(def.style)=="EnumItem" and def.style.EnumType==Enum.EasingStyle and def.style or S.Quart
+    local easingDirection=typeof(def.dir)=="EnumItem" and def.dir.EnumType==Enum.EasingDirection and def.dir or D.Out
+    local function tween(properties,info)
+        local created=TweenService:Create(target,info,properties)
+        table.insert(entry.Tweens,created); created:Play()
     end
-    local home = target:GetAttribute("__HomePos")
-    local homeSize = target:GetAttribute("__HomeSize")
-    if direction == "in" then
-        target.Position = home
-        target.Size = homeSize
-        target.Rotation = 0
-        if target:IsA("CanvasGroup") then target.GroupTransparency = 1 end
-        local sp, ss, sr = home, homeSize, 0
-        if def.offset then sp = UDim2.new(home.X.Scale+def.offset.X.Scale, home.X.Offset, home.Y.Scale+def.offset.Y.Scale, home.Y.Offset) end
-        if def.scale then ss = UDim2.new(homeSize.X.Scale+def.scale.X.Scale, homeSize.X.Offset, homeSize.Y.Scale+def.scale.Y.Scale, homeSize.Y.Offset) end
-        if def.rotation then sr = def.rotation end
-        target.Position = sp; target.Size = ss; target.Rotation = sr
-        local info = TweenInfo.new(def.dur, def.style, def.dir)
-        TweenService:Create(target, info, {Position=home, Size=homeSize, Rotation=0}):Play()
-        if target:IsA("CanvasGroup") then TweenService:Create(target, info, {GroupTransparency=0}):Play() end
+    local offset=typeof(cfg.Offset)=="UDim2" and cfg.Offset or def.offset
+    local scale=typeof(cfg.Scale)=="UDim2" and cfg.Scale or def.scale
+    local rotation=ClampNumber(cfg.Rotation,ClampNumber(def.rotation,0,-3600,3600),-3600,3600)
+    if direction=="in" then
+        target.Position=home; target.Size=homeSize; target.Rotation=0
+        if target:IsA("CanvasGroup") then target.GroupTransparency=1 end
+        local startPosition,startSize=home,homeSize
+        if typeof(offset)=="UDim2" then startPosition=UDim2.new(home.X.Scale+offset.X.Scale,home.X.Offset+offset.X.Offset,home.Y.Scale+offset.Y.Scale,home.Y.Offset+offset.Y.Offset) end
+        if typeof(scale)=="UDim2" then startSize=UDim2.new(homeSize.X.Scale+scale.X.Scale,homeSize.X.Offset+scale.X.Offset,homeSize.Y.Scale+scale.Y.Scale,homeSize.Y.Offset+scale.Y.Offset) end
+        target.Position=startPosition; target.Size=startSize; target.Rotation=rotation
+        local info=TweenInfo.new(duration,style,easingDirection)
+        tween({Position=home,Size=homeSize,Rotation=0},info)
+        if target:IsA("CanvasGroup") then tween({GroupTransparency=0},info) end
     else
-        local ep, es, er = home, homeSize, 0
-        if def.offset then ep = UDim2.new(home.X.Scale+def.offset.X.Scale, home.X.Offset, home.Y.Scale+def.offset.Y.Scale, home.Y.Offset) end
-        if def.scale then es = UDim2.new(homeSize.X.Scale+def.scale.X.Scale, homeSize.X.Offset, homeSize.Y.Scale+def.scale.Y.Scale, homeSize.Y.Offset) end
-        if def.rotation then er = def.rotation end
-        local info = TweenInfo.new(def.dur*0.8, def.style, D.In)
-        TweenService:Create(target, info, {Position=ep, Size=es, Rotation=er}):Play()
-        if target:IsA("CanvasGroup") then TweenService:Create(target, info, {GroupTransparency=1}):Play() end
-        task.delay(def.dur+0.3, function()
-            if target and target.Parent then
-                target.Position = home
-                target.Size = homeSize
-                target.Rotation = 0
-            end
-        end)
+        local endPosition,endSize=home,homeSize
+        if typeof(offset)=="UDim2" then endPosition=UDim2.new(home.X.Scale+offset.X.Scale,home.X.Offset+offset.X.Offset,home.Y.Scale+offset.Y.Scale,home.Y.Offset+offset.Y.Offset) end
+        if typeof(scale)=="UDim2" then endSize=UDim2.new(homeSize.X.Scale+scale.X.Scale,homeSize.X.Offset+scale.X.Offset,homeSize.Y.Scale+scale.Y.Scale,homeSize.Y.Offset+scale.Y.Offset) end
+        local info=TweenInfo.new(duration*0.8,style,D.In)
+        tween({Position=endPosition,Size=endSize,Rotation=rotation},info)
+        if target:IsA("CanvasGroup") then tween({GroupTransparency=1},info) end
     end
+    task.delay(duration+0.35,function()
+        if self._activeTransitions[target]~=entry then return end
+        if direction=="out" and target.Parent then target.Position=home; target.Size=homeSize; target.Rotation=0 end
+        self._activeTransitions[target]=nil
+    end)
     return true
 end
 
@@ -2120,17 +2313,24 @@ L.TransitionKits = {
 }
 
 function L:PlayTransitionCombo(transitionName, effectNames, target, direction, cfg)
-    cfg = cfg or {}
-    if not target then return false end
-    local ok = self:PlayTransition(transitionName, target, direction or "in")
+    cfg = type(cfg)=="table" and cfg or {}
+    if typeof(target)~="Instance" or not target:IsA("GuiObject") then return false end
+    local ok = self:PlayTransition(transitionName,target,direction or "in",cfg.TransitionConfig)
+    if ok~=true then return false end
     local names = type(effectNames) == "table" and effectNames or {}
-    for i=1,math.min(#names,3) do
+    local maxEffects=math.floor(ClampNumber(cfg.MaxEffects,3,0,20))
+    local stagger=ClampNumber(cfg.Stagger,0.08,0,2)
+    for i=1,math.min(#names,maxEffects) do
         local name = names[i]
-        task.delay((tonumber(cfg.Stagger) or 0.08) * (i-1), function()
-            if target.Parent then self:PlayEffect(name,target,cfg.EffectConfig or {}) end
+        local effectConfigs=type(cfg.EffectConfigs)=="table" and cfg.EffectConfigs or {}
+        local effectCfg=effectConfigs[i] or effectConfigs[name] or cfg.EffectConfig
+        task.delay(stagger * (i-1), function()
+            if target.Parent then
+                self:PlayEffect(name,target,type(effectCfg)=="table" and effectCfg or {})
+            end
         end)
     end
-    return ok ~= nil
+    return true
 end
 
 function L:PlayTransitionKit(name, target, direction, cfg)
@@ -2139,8 +2339,51 @@ function L:PlayTransitionKit(name, target, direction, cfg)
     return self:PlayTransitionCombo(kit.Transition,kit.Effects,target,direction,cfg)
 end
 
-function L:RegisterEffect(name, def) self.Effects.List[name] = def end
-function L:RegisterTransition(name, def) self.Transitions.List[name] = def end
+function L:GetEffectNames()
+    local names={}; for name in pairs(self.Effects.List or {}) do table.insert(names,name) end; table.sort(names); return names
+end
+function L:GetTransitionNames()
+    local names={}; for name in pairs(self.Transitions.List or {}) do table.insert(names,name) end; table.sort(names); return names
+end
+function L:RegisterEffect(name,def)
+    if type(name)~="string" or name:gsub("%s","")=="" or type(def)~="table" then return false,"effect name and definition required" end
+    local copy=table.clone(def)
+    copy.minS=math.floor(ClampNumber(copy.minS,4,1,500)); copy.maxS=math.floor(ClampNumber(copy.maxS,copy.minS,1,500))
+    if copy.maxS<copy.minS then copy.minS,copy.maxS=copy.maxS,copy.minS end
+    copy.dur=ClampNumber(copy.dur,1,0.05,30)
+    if copy.color~=nil and typeof(copy.color)~="Color3" then return false,"effect color must be a Color3" end
+    self.Effects.List[name]=copy
+    return true
+end
+function L:RegisterEffectCategory(name,list)
+    if type(name)~="string" or name:gsub("%s","")=="" or type(list)~="table" then return false,"category name and effect list required" end
+    local categories={}; for _,effectName in ipairs(list) do if type(effectName)=="string" and self.Effects.List[effectName] then table.insert(categories,effectName) end end
+    self.Effects.Categories=self.Effects.Categories or {}; self.Effects.Categories[name]=categories
+    return true
+end
+function L:RemoveEffect(name)
+    if not self.Effects.List[name] then return false end
+    self.Effects.List[name]=nil
+    for _,category in pairs(self.Effects.Categories or {}) do for i=#category,1,-1 do if category[i]==name then table.remove(category,i) end end end
+    return true
+end
+function L:RegisterTransition(name,def)
+    if type(name)~="string" or name:gsub("%s","")=="" or type(def)~="table" then return false,"transition name and definition required" end
+    local copy=table.clone(def); copy.dur=ClampNumber(copy.dur,0.4,0.05,30)
+    if copy.offset~=nil and typeof(copy.offset)~="UDim2" then return false,"transition offset must be UDim2" end
+    if copy.scale~=nil and typeof(copy.scale)~="UDim2" then return false,"transition scale must be UDim2" end
+    if copy.rotation~=nil and not tonumber(copy.rotation) then return false,"transition rotation must be numeric" end
+    copy.rotation=ClampNumber(copy.rotation,0,-3600,3600)
+    if copy.style~=nil and (typeof(copy.style)~="EnumItem" or copy.style.EnumType~=Enum.EasingStyle) then return false,"transition style must be an EasingStyle" end
+    if copy.dir~=nil and (typeof(copy.dir)~="EnumItem" or copy.dir.EnumType~=Enum.EasingDirection) then return false,"transition direction must be an EasingDirection" end
+    self.Transitions.List[name]=copy
+    return true
+end
+function L:RemoveTransition(name)
+    if not self.Transitions.List[name] then return false end
+    self.Transitions.List[name]=nil
+    return true
+end
 
 L.UIScale = JsonRead("library_uiscale.json", {global=1, per={}})
 
@@ -2164,19 +2407,24 @@ end
 L.StreamerMode = false
 
 function L:SetStreamerMode(on)
-    self.StreamerMode = on
-    if self._window then
-        if on then
-            self._window._statusL.Text = "Streamer Mode"
-            self._window._main.Size = UDim2.new(0, 820, 0, 500)
-        else
-            self._window._statusL.Text = "User: "..LP.Name.." - "..self.Executor
-            self._window:SetMode(self._window._mode or "normal")
-        end
-        for _, tab in ipairs(self._window._tabs) do
-            tab._btnLabel.TextSize = on and 14 or 12
+    local lib=self._lib or self
+    on=on==true
+    lib.StreamerMode=on
+    for _,win in ipairs(lib._allWindows or {}) do
+        if win and not win._destroyed then
+            if on then
+                if not win._streamerSavedSize and win._main and win._main.Parent then win._streamerSavedSize=win._main.Size end
+                if win._statusL then win._statusL.Text="Streamer Mode" end
+                if win._main and win._main.Parent then win._main.Size=UDim2.new(0,820,0,500) end
+            else
+                if win._statusL then win._statusL.Text="User: "..LP.Name.." - "..lib.Executor end
+                if win._main and win._main.Parent and win._streamerSavedSize then win._main.Size=win._streamerSavedSize end
+                win._streamerSavedSize=nil
+            end
+            for _,tab in ipairs(win._tabs or {}) do if tab._btnLabel then tab._btnLabel.TextSize=on and 14 or 12 end end
         end
     end
+    return on
 end
 
 L.Platform = {mode=nil, device=nil}
@@ -2193,7 +2441,7 @@ end
 function L:_AskPlatform()
     local C = self.C
     local result = self.Platform.device or "pc"
-    local done = false
+local done = false
     local gui = Instance.new("ScreenGui")
     gui.Name = "LibraryPlatform_"..tostring(math.random(1,999999))
     gui.ResetOnSpawn = false
@@ -2202,6 +2450,7 @@ function L:_AskPlatform()
     if PROT then pcall(PROT, gui) end
     gui.Parent = GetHui()
     TrackAuxGui(self,ResolveWindow(self),gui)
+    gui.Destroying:Connect(function() done=true end)
     local Bg = Instance.new("Frame")
     Bg.Size = UDim2.new(1,0,1,0)
     Bg.BackgroundColor3 = C.Overlay
@@ -2262,7 +2511,10 @@ function L:_AskPlatform()
     end
     MakeChoice("PC", "pc", 0, C.Info, C.InfoBg)
     MakeChoice("Mobile", "mobile", 0.5, C.Success, C.SuccessBg)
-    while not done do task.wait(0.1) end
+    local deadline=os.clock()+ClampNumber(self.Platform and self.Platform.PromptTimeout,300,1,900)
+    while not done and gui.Parent and not self._destroyed and os.clock()<deadline do task.wait(0.1) end
+    if not done then done=true; if gui.Parent then gui:Destroy() end end
+    if not result or self._destroyed then return nil end
     self.Platform.mode = result
     self.Platform.isMobileMode = result == "mobile"
     return result
@@ -2273,11 +2525,13 @@ function L:_SetupPlatform()
     local saved = JsonRead("library_platform.json", {mode=""}).mode or ""
     if saved == "" then
         local chosen = self:_AskPlatform()
+        if not chosen then return false end
         JsonWrite("library_platform.json", {mode=chosen})
     else
         self.Platform.mode = saved
         self.Platform.isMobileMode = saved == "mobile"
     end
+    return true
 end
 
 function L:_RunKeyFlow()
@@ -2305,6 +2559,7 @@ function L:_RunKeyFlow()
     if PROT then pcall(PROT, gui) end
     gui.Parent = GetHui()
     TrackAuxGui(self,ResolveWindow(self),gui)
+    gui.Destroying:Connect(function() done=true end)
     local Bg = Instance.new("Frame")
     Bg.Size = UDim2.new(1,0,1,0)
     Bg.BackgroundColor3 = C.Overlay
@@ -2419,57 +2674,55 @@ function L:_RunKeyFlow()
             SL.TextColor3 = C.Warning
         end
     end)
+    local validating,lastAttempt=false,0
     Btn.MouseButton1Click:Connect(function()
+        if validating or done or not gui.Parent or self._destroyed then return end
+        local now=os.clock()
+        if now-lastAttempt<1 then return end
+        lastAttempt=now
         self:PlaySound("click")
-        local key = InputB.Text
-        if key == "" then
-            SL.Text = "Enter a key"
-            SL.TextColor3 = C.Danger
-            return
-        end
-        local ok = false
-        local reason = ""
-        if cfg.UseHubKey then
-            ok = true
-        elseif cfg.RemoteValidate then
-            SL.Text = "Validando..."
-            SL.TextColor3 = C.Warning
-            local body = HS:JSONEncode({key=key, hwid=hashedHwid, userId=LP.UserId, userName=LP.Name, executor=self.Executor, script=cfg.ScriptId or "library"})
-            local url = cfg.RemoteValidate .. "?key=" .. HS:UrlEncode(key) .. "&hwid=" .. HS:UrlEncode(hashedHwid)
-            local resBody = HttpPost(url, body)
-            if resBody then
-                local ok2, parsed = pcall(HS.JSONDecode, HS, resBody)
-                if ok2 and type(parsed) == "table" then
-                    ok = parsed.valid == true or parsed.success == true
-                    reason = parsed.reason or parsed.error or ""
+        local key=InputB.Text
+        if key=="" then SL.Text="Enter a key"; SL.TextColor3=C.Danger; return end
+        validating=true; Btn.Active=false; Btn.Text="Validating..."
+        task.spawn(function()
+            local ok,reason=false,""
+            local callOk,callErr=pcall(function()
+                if cfg.UseHubKey then
+                    ok=true
+                elseif cfg.RemoteValidate then
+                    SL.Text="Validando..."; SL.TextColor3=C.Warning
+                    local body=HS:JSONEncode({key=key,hwid=hashedHwid,userId=LP.UserId,userName=LP.Name,executor=self.Executor,script=cfg.ScriptId or "library"})
+                    local url=cfg.RemoteValidate.."?key="..HS:UrlEncode(key).."&hwid="..HS:UrlEncode(hashedHwid)
+                    local resBody=HttpPost(url,body)
+                    if resBody then
+                        local ok2,parsed=pcall(HS.JSONDecode,HS,resBody)
+                        if ok2 and type(parsed)=="table" then ok=parsed.valid==true or parsed.success==true; reason=tostring(parsed.reason or parsed.error or "") end
+                    end
+                elseif cfg.Validate then
+                    local valid,result=pcall(cfg.Validate,key,hashedHwid)
+                    ok=valid and result==true
+                else
+                    ok=key~=""
                 end
-            end
-        elseif cfg.Validate then
-            local succ, res = pcall(cfg.Validate, key, hashedHwid)
-            ok = succ and res
-        else
-            ok = key ~= ""
-        end
-        if cfg.Webhook and cfg.Webhook.Enabled then
-            task.spawn(function() self.Webhook:LogKeyAttempt(cfg.Webhook.Url, key, hashedHwid, ok) end)
-        end
-        if ok then
-            JsonWrite(file, {key=key, hwid=hashedHwid})
-            SL.Text = "Key validada!"
-            SL.TextColor3 = C.Success
-            self:PlaySound("success")
-            task.delay(0.5, function()
-                if gui then gui:Destroy() end
-                done = true
-                success = true
             end)
-        else
-            SL.Text = reason ~= "" and ("Invalida: "..reason) or "Key invalida"
-            SL.TextColor3 = C.Danger
-            self:PlaySound("error")
-        end
+            if not callOk then reason=tostring(callErr) end
+            if not gui.Parent or self._destroyed then return end
+            if cfg.Webhook and cfg.Webhook.Enabled then
+                task.spawn(function() pcall(function() self.Webhook:LogKeyAttempt(cfg.Webhook.Url,key,hashedHwid,ok) end) end)
+            end
+            validating=false; Btn.Active=true; Btn.Text="Validar"
+            if ok then
+                JsonWrite(file,{key=key,hwid=hashedHwid})
+                SL.Text="Key validada!"; SL.TextColor3=C.Success; self:PlaySound("success")
+                task.delay(0.5,function() if gui.Parent then gui:Destroy() end; done=true; success=true end)
+            else
+                SL.Text=reason~="" and ("Invalida: "..reason) or "Key invalida"; SL.TextColor3=C.Danger; self:PlaySound("error")
+            end
+        end)
     end)
-    while not done do task.wait(0.1) end
+    local deadline=os.clock()+ClampNumber(cfg.Timeout,300,1,900)
+    while not done and gui.Parent and not self._destroyed and os.clock()<deadline do task.wait(0.1) end
+    if not done then done=true; if gui.Parent then gui:Destroy() end end
     return success
 end
 
@@ -2498,9 +2751,12 @@ end
 
 function L:CreateWindow(cfg)
     cfg = cfg or {}
+    if self._destroyed then return nil,"library is destroyed" end
     if cfg.Splash then
         self:ShowSplash(cfg.Splash)
-        while SplashGui and SplashGui.Parent do task.wait(0.05) end
+        local splashDeadline=os.clock()+ClampNumber(type(cfg.Splash)=="table" and cfg.Splash.Timeout,60,0.1,900)
+        while SplashGui and SplashGui.Parent and not self._destroyed and os.clock()<splashDeadline do task.wait(0.05) end
+        if self._destroyed then return nil,"library is destroyed" end
     end
     if cfg.Theme and self.Palettes[cfg.Theme] then self:SetTheme(cfg.Theme) end
     if cfg.AnimatedTheme then self:SetAnimatedTheme(cfg.AnimatedTheme) end
@@ -2512,7 +2768,7 @@ function L:CreateWindow(cfg)
         self:SetBlocklist(cfg.Blocklist)
         if not self.Blocklist:RunCheck() then return end
     end
-    if cfg.AskPlatform == true then self:_SetupPlatform() end
+    if cfg.AskPlatform == true and not self:_SetupPlatform() then return nil,"platform selection cancelled" end
     if cfg.Key and cfg.Key.Enabled then
         if not self:_RunKeyFlow() then return end
     end
@@ -2781,10 +3037,12 @@ function L:CreateWindow(cfg)
         self._statusR.TextColor3 = c.TextFaint
         local root = self._main
         if old then
+            local ownThemeFrames={}
+            for _,tab in ipairs(self._tabs) do if tab._ownTheme and tab._frame then ownThemeFrames[tab._frame]=true end end
             local function hasOwnThemeAncestor(obj)
                 local node=obj
                 while node and node~=root do
-                    for _,tab in ipairs(self._tabs) do if tab._ownTheme and node==tab._frame then return true end end
+                    if ownThemeFrames[node] then return true end
                     node=node.Parent
                 end
                 return false
@@ -2859,11 +3117,30 @@ function L:CreateWindow(cfg)
             self._accentTargets=targets
             self._accentTargetsDirty=false
         end
-        for _, target in ipairs(self._accentTargets) do
-            if target.Object and target.Object.Parent then target.Object[target.Property]=target.Role=="soft" and newSoft or newAccent end
+        for i=#self._accentTargets,1,-1 do
+            local target=self._accentTargets[i]
+            if not target.Object or not target.Object.Parent or not target.Object:IsDescendantOf(self._main) then
+                table.remove(self._accentTargets,i)
+            else
+                target.Object[target.Property]=target.Role=="soft" and newSoft or newAccent
+            end
         end
     end
     Win:_Connect(Main.DescendantAdded,function() Win._accentTargetsDirty=true end)
+    local accentPruneQueued=false
+    Win:_Connect(Main.DescendantRemoving,function()
+        Win._accentTargetsDirty=true
+        if accentPruneQueued then return end
+        accentPruneQueued=true
+        task.defer(function()
+            accentPruneQueued=false
+            if Win._destroyed then return end
+            for i=#(Win._accentTargets or {}),1,-1 do
+                local object=Win._accentTargets[i].Object
+                if not object or not object.Parent or not object:IsDescendantOf(Main) then table.remove(Win._accentTargets,i) end
+            end
+        end)
+    end)
     function Win:_ApplyFont()
         local f, fb, fm = self._lib.CurrentFont, self._lib.CurrentFontBold, self._lib.CurrentFontMedium
         local previous=self._fontPalette or {Regular=f,Bold=fb,Medium=fm}
@@ -3020,12 +3297,16 @@ function L:CreateWindow(cfg)
             self._lib._window=nil
             for i=#wins,1,-1 do if wins[i] and not wins[i]._destroyed then self._lib._window=wins[i]; break end end
         end
+        table.clear(self._tabs or {})
+        table.clear(self._allElements or {})
+        table.clear(self._accentTargets or {})
+        self._active=nil
     end
     Main.GroupTransparency = 0
     self._window=Win
-    self._destroyed=false
     self._allWindows = self._allWindows or {}
     table.insert(self._allWindows, Win)
+    if self.StreamerMode then self:SetStreamerMode(true) end
     if self._hubIdleState and self._hubIdleState.locked then
         self._hubIdleState.hiddenWindows[Win]={WasHidden=false,Interactable=Win._main.Interactable}
         Win._main.Interactable=false
@@ -3207,6 +3488,7 @@ function L:CreateTab(name, icon)
         local old, oldSoft = self.C.Accent, self.C.AccentSoft
         self.C.Accent, self.C.StrokeHot = color, color
         self.C.AccentSoft = color:Lerp(Color3.new(0,0,0), 0.35)
+        if self._ownTheme then self._ownTheme=ClonePalette(self.C) end
         for _, obj in ipairs(Btn:GetDescendants()) do
             if obj:IsA("GuiObject") and obj.BackgroundColor3 == old then obj.BackgroundColor3 = color end
             if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.TextColor3 == old then obj.TextColor3 = color end
@@ -3232,10 +3514,14 @@ function L:CreateTab(name, icon)
         local paletteRef = self.C or Win.C
         local old = ClonePalette(paletteRef)
         local fresh = NormalizePalette(palette)
+        if self._ownAccent then
+            fresh.Accent=self._ownAccent
+            fresh.StrokeHot=self._ownAccent
+            fresh.AccentSoft=self._ownAccent:Lerp(Color3.new(0,0,0),0.35)
+        end
         ReplacePaletteInPlace(paletteRef,fresh)
         local new=paletteRef
         self._ownTheme, self.C = ClonePalette(fresh), paletteRef
-        if self._ownAccent then self.C.Accent=self._ownAccent; self.C.StrokeHot=self._ownAccent; self.C.AccentSoft=self._ownAccent:Lerp(Color3.new(0,0,0),0.35) end
         local function remap(root)
             for _, obj in ipairs(root:GetDescendants()) do
                 if obj:IsA("GuiObject") then for key,value in pairs(old) do if typeof(value)=="Color3" and obj.BackgroundColor3==value and new[key] then obj.BackgroundColor3=new[key]; break end end end
@@ -3655,11 +3941,27 @@ function L:BindGlobal(name,key,callback,modifiers)
         if control==(binding.Modifiers.Control==true) and shift==(binding.Modifiers.Shift==true) and alt==(binding.Modifiers.Alt==true) then pcall(callback,input,binding.Modifiers) end
     end)
     table.insert(self._connections,conn)
-    local handle={Name=name,Connection=conn}
+    self._globalBindings=self._globalBindings or {}
+    local handle={Name=tostring(name or ""),Connection=conn,_lib=self}
+    table.insert(self._globalBindings,handle)
     function handle:Set(newKey,newModifiers) binding.Key=newKey; binding.Modifiers=type(newModifiers)=="table" and table.clone(newModifiers) or {}; self.Key=binding.Key; self.Modifiers=binding.Modifiers; end
     handle.Key,handle.Modifiers=key,modifiers
-    function handle:Destroy() if self.Connection then self.Connection:Disconnect(); self.Connection=nil end end
+    function handle:Destroy()
+        if self.Connection then self.Connection:Disconnect(); self.Connection=nil end
+        local list=self._lib and self._lib._globalBindings
+        local index=list and table.find(list,self)
+        if index then table.remove(list,index) end
+        return true
+    end
     return handle
+end
+function L:UnbindGlobal(name)
+    local list=self._globalBindings or {}; local removed=0
+    for index=#list,1,-1 do
+        local binding=list[index]
+        if tostring(binding.Name)==tostring(name) then binding:Destroy(); removed+=1 end
+    end
+    return removed>0,removed
 end
 
 function L:CreateButton(cfg)
@@ -4990,6 +5292,7 @@ function L:CreateCommandPalette(cfg)
     local source=cfg or {}; cfg={}; for k,v in pairs(source) do cfg[k]=v end
     local win=self._window or (self._main and self)
     if win and win._commandPalette and win._commandPalette.Parent then win._commandPalette:Destroy() end
+    if win then win._commandPalette=nil end
     cfg.StartHidden = true
     cfg.Placeholder = cfg.Placeholder or "Search actions... (Ctrl+K)"
     cfg.Items=table.clone(cfg.Items or {})
@@ -5004,7 +5307,10 @@ function L:CreateCommandPalette(cfg)
         end
     end
     local gui=self:CreateGlobalSearch(cfg)
-    if win then win._commandPalette=gui end
+    if win and gui then
+        win._commandPalette=gui
+        gui.Destroying:Connect(function() if win._commandPalette==gui then win._commandPalette=nil end end)
+    end
     return gui
 end
 
@@ -5078,7 +5384,18 @@ function L:Prompt(cfg)
 end
 
 L.Profiles = {_list = {}, _current = nil, _folder = "library_profiles"}
-local function SafeProfileName(name) name=tostring(name or ""):gsub("[^%w%-%_ ]",""):gsub("%s+"," "):sub(1,48); return name~="" and name or nil end
+local function SafeProfileName(name)
+    name=tostring(name or ""):gsub("[%z\1-\31<>:\"/\\|%?%*]",""):gsub("%s+"," "):match("^%s*(.-)%s*$") or ""
+    if utf8 and type(utf8.offset)=="function" then
+        local ok,cut=pcall(utf8.offset,name,49)
+        if ok and cut then name=name:sub(1,cut-1) end
+    elseif #name>48 then
+        name=name:sub(1,48):gsub("[\128-\191]+$","")
+        local last=name:byte(-1)
+        if last and last>=192 and last<=244 then name=name:sub(1,-2) end
+    end
+    return name~="" and name or nil
+end
 
 function L:ListProfiles()
     local index=JsonRead("library_profiles_index.json",{names={}})
@@ -5145,14 +5462,18 @@ function L:ExportConfig(data)
     data = data or self:CaptureConfig()
     local sanitized=TrySanitizeForJson(data); if not sanitized then return nil,"config cannot be serialized" end
     local encodedOk,json=pcall(HS.JSONEncode,HS,sanitized); if not encodedOk then return nil,tostring(json) end
+    if #json>2*1024*1024 then return nil,"config exceeds the 2 MiB export limit" end
     local enc = self.Crypto.Base64Encode(json)
     if CLIP then pcall(CLIP, enc) end
     return enc
 end
 
 function L:ImportConfig(encoded, apply)
+    if type(encoded)~="string" then return nil,"encoded config must be a string" end
+    if #encoded>3*1024*1024 then return nil,"encoded config exceeds the 3 MiB import limit" end
     local ok, dec = pcall(self.Crypto.Base64Decode, encoded)
-    if not ok or not dec then return nil end
+    if not ok or type(dec)~="string" then return nil,"invalid base64 config" end
+    if #dec>2*1024*1024 then return nil,"decoded config exceeds the 2 MiB limit" end
     local ok2, parsed = pcall(HS.JSONDecode, HS, dec)
     if ok2 and type(parsed) == "table" and (parsed.values==nil or type(parsed.values)=="table") then
         if apply then
@@ -5227,7 +5548,7 @@ function L:SetAutoSaveConfig(name, enabled, delay)
     if not name then return false end
     self.Config.AutoSaveConfigName = name
     self.Config.AutoSaveConfig = enabled ~= false
-    if delay then self.Config.AutoSaveConfigDelay = math.max(0.1, tonumber(delay) or 0.75) end
+    if delay then self.Config.AutoSaveConfigDelay = ClampNumber(delay,0.75,0.1,60) end
     if self.Config.AutoSaveConfig and not self:OverwriteConfig(name) then
         self.Config.AutoSaveConfig=false; self.Config.AutoSaveConfigName=nil
         return false
@@ -5517,6 +5838,13 @@ function L:BindUndoRedo()
     self._undoRedoBindings={Undo=self:BindGlobal("Undo",Enum.KeyCode.Z,function() self:UndoConfig() end,{Control=true}),Redo=self:BindGlobal("Redo",Enum.KeyCode.Y,function() self:RedoConfig() end,{Control=true})}
     return self._undoRedoBindings
 end
+function L:UnbindUndoRedo()
+    local bindings=self._undoRedoBindings
+    if not bindings then return false end
+    for _,binding in pairs(bindings) do if binding and binding.Destroy then binding:Destroy() end end
+    self._undoRedoBindings=nil
+    return true
+end
 function L:CreateUndoRedoControls(parent)
     local win=ResolveWindow(self); if not win or win._destroyed then return nil end
     parent=parent or win._statusBar
@@ -5543,6 +5871,7 @@ function L:CreateColorSlider(cfg)
     local tc=Instance.new("UICorner"); tc.CornerRadius=UDim.new(1,0); tc.Parent=thumb
     local hit=Instance.new("TextButton"); hit.Size=UDim2.new(1,0,1,0); hit.BackgroundTransparency=1; hit.Text=""; hit.Parent=bar
     local dragging=false; local connections={}
+    table.insert(connections,lib:On("SoundSettingsChanged",function() if root.Parent then refresh() end end))
     local function set(v,silent,user)
         value=ClampNumber(v,0,0,1); thumb.Position=UDim2.new(value,0,.5,0)
         if not silent and cfg.Callback then pcall(cfg.Callback,Color3.fromHSV(value,1,1),value) end
@@ -5742,6 +6071,7 @@ function L:ImportPalette(encoded,name)
         end
     end
     local paletteName=tostring(name or data.name or "Imported"):gsub("[^%w_%- ]",""):sub(1,40); if paletteName=="" then return nil,"invalid palette name" end
+    if BuiltinPaletteNames[paletteName] then return nil,"palette name is reserved for a built-in theme" end
     self.Palettes[paletteName]=palette
     local saved={}; for key,color in pairs(palette) do if typeof(color)=="Color3" then saved[key]={math.floor(color.R*255+.5),math.floor(color.G*255+.5),math.floor(color.B*255+.5)} end end
     local all=JsonRead("library_custom_palettes.json",{}); if type(all)~="table" then all={} end; all[paletteName]=saved; JsonWrite("library_custom_palettes.json",all)
@@ -5751,7 +6081,7 @@ do
     local saved=JsonRead("library_custom_palettes.json",{})
     if type(saved)=="table" then
         for name,colors in pairs(saved) do
-            if type(name)=="string" and type(colors)=="table" then
+            if type(name)=="string" and type(colors)=="table" and not BuiltinPaletteNames[name] then
                 local palette=ClonePalette(L.Palettes.Dark)
                 for key,rgb in pairs(colors) do local r,g,b=type(rgb)=="table" and tonumber(rgb[1]),type(rgb)=="table" and tonumber(rgb[2]),type(rgb)=="table" and tonumber(rgb[3]); if palette[key]~=nil and type(rgb)=="table" and #rgb==3 and r and g and b then palette[key]=Color3.fromRGB(math.clamp(r,0,255),math.clamp(g,0,255),math.clamp(b,0,255)) end end
                 L.Palettes[name]=palette
@@ -5966,6 +6296,7 @@ function L:OpenThemeEditor()
     button("Salvar preset",.335,function()
         local name=lib:Prompt({Title="Preset name",Placeholder="My palette"}); if not name or name=="" then return end
         local safe=name:gsub("[^%w_%- ]",""):sub(1,40); if safe=="" then return end
+        if BuiltinPaletteNames[safe] then lib:Notify({Title="Preset name reserved",Text=safe,Type="warning"}); return end
         lib.Palettes[safe]=ClonePalette(working); local colors={}; for key,color in pairs(working) do if typeof(color)=="Color3" then colors[key]={math.floor(color.R*255+.5),math.floor(color.G*255+.5),math.floor(color.B*255+.5)} end end
         local saved=JsonRead("library_custom_palettes.json",{}); if type(saved)~="table" then saved={} end; saved[safe]=colors; JsonWrite("library_custom_palettes.json",saved); lib:Notify({Title="Preset saved",Text=safe,Type="success"})
     end)
@@ -6011,7 +6342,8 @@ function L:SetReadingModeAdvanced(enabled,window)
 end
 
 local function MakeSectionScroll(section,name,height)
-    local C=section.C or section._window.C
+    local win=section._window or ResolveWindow(section)
+    local C=section.C or (win and win.C) or L.C
     local root=Instance.new("Frame"); root.Name=name; root.Size=UDim2.new(1,0,0,ClampNumber(height,250,80,900)); root.BackgroundColor3=C.Surface; root.BorderSizePixel=0
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,9); corner.Parent=root
     local scroll=Instance.new("ScrollingFrame"); scroll.Size=UDim2.new(1,-12,1,-12); scroll.Position=UDim2.fromOffset(6,6); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4; scroll.ScrollBarImageColor3=C.Accent; scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(); scroll.Parent=root
@@ -6064,13 +6396,25 @@ function L:CreatePlayerList(cfg)
         local row=rows[player]; rows[player]=nil
         if row then row:Destroy() end
     end
+    local function sortRows()
+        local ordered={}
+        for player in pairs(rows) do table.insert(ordered,player) end
+        table.sort(ordered,function(a,b)
+            local an=tostring(a.DisplayName or a.Name):lower()
+            local bn=tostring(b.DisplayName or b.Name):lower()
+            if an==bn then return tostring(a.Name):lower()<tostring(b.Name):lower() end
+            return an<bn
+        end)
+        for index,player in ipairs(ordered) do local row=rows[player]; if row and row.Parent then row.LayoutOrder=index end end
+    end
     local function refresh()
         for _,player in ipairs(Players:GetPlayers()) do addPlayer(player) end
         for player in pairs(rows) do if player.Parent~=Players then removePlayer(player) end end
+        sortRows()
         return #Players:GetPlayers()
     end
-    table.insert(connections,win:_Connect(Players.PlayerAdded,addPlayer))
-    table.insert(connections,win:_Connect(Players.PlayerRemoving,removePlayer))
+    table.insert(connections,win:_Connect(Players.PlayerAdded,function(player) addPlayer(player); sortRows() end))
+    table.insert(connections,win:_Connect(Players.PlayerRemoving,function(player) removePlayer(player); sortRows() end))
     refresh()
     local handle={Instance=root,Rows=rows,Refresh=refresh}
     function handle:Destroy()
@@ -6214,13 +6558,13 @@ function L:CreateServerList(cfg)
     local moreButton=Instance.new("TextButton"); moreButton.Size=UDim2.fromOffset(56,26); moreButton.Position=UDim2.new(1,-62,0,5); moreButton.BackgroundColor3=C.Card; moreButton.TextColor3=C.Text; moreButton.Text="More"; moreButton.Font=Enum.Font[lib.CurrentFontBold]; moreButton.TextSize=10; moreButton.Parent=root
     local scroll=Instance.new("ScrollingFrame"); scroll.Size=UDim2.new(1,-12,1,-42); scroll.Position=UDim2.fromOffset(6,36); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4; scroll.ScrollBarImageColor3=C.Accent; scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(); scroll.Parent=root
     local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,5); layout.Parent=scroll
-    local connections={}; local cursor=nil; local nextCursor=nil; local requestToken=0; local destroyed=false
+    local connections={}; local nextCursor=nil; local requestToken=0; local destroyed=false
     root.Destroying:Connect(function() destroyed=true; requestToken+=1; for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end end)
     local function clearRows() for _,child in ipairs(scroll:GetChildren()) do if child~=layout then child:Destroy() end end end
     local function fetch(requestCursor,append)
         if destroyed then return false end
         requestToken+=1; local token=requestToken
-        if not append then cursor=nil; nextCursor=nil; clearRows() end
+        if not append then nextCursor=nil; clearRows() end
         status.Text="Loading public servers…"
         task.spawn(function()
             local url=string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=2&excludeFullGames=%s&limit=100",placeId,cfg.ExcludeFull==false and "false" or "true")
@@ -6231,7 +6575,6 @@ function L:CreateServerList(cfg)
             if body then ok,data=pcall(HS.JSONDecode,HS,body) end
             if not ok or type(data)~="table" or type(data.data)~="table" then status.Text="Server list unavailable (HTTP/API error)."; return end
             nextCursor=type(data.nextPageCursor)=="string" and data.nextPageCursor~="" and data.nextPageCursor or nil
-            cursor=nextCursor
             local displayed=0
             for _,server in ipairs(data.data) do
                 if type(server)=="table" and type(server.id)=="string" then
@@ -6283,22 +6626,38 @@ function L:CreateServerInfoPanel(cfg)
     local samples={}; local active=true; local interval=ClampNumber(cfg.RefreshSeconds,2,1,15)
     root.Destroying:Connect(function() active=false end)
     local function currentPing()
-        local ok,value=pcall(function() return Stats.Network.ServerStatsItem["Data Ping"]:GetValueString() end)
-        if not ok then return nil end
-        local number=tonumber(tostring(value):match("[%d%.]+"))
+        local item
+        local ok=pcall(function() item=Stats.Network.ServerStatsItem["Data Ping"] end)
+        if not ok or not item then return nil end
+        local valueOk,value=pcall(function() return item:GetValue() end)
+        local number=valueOk and tonumber(value) or nil
+        if not number then
+            local stringOk,stringValue=pcall(function() return item:GetValueString() end)
+            if stringOk then number=tonumber(tostring(stringValue):match("[%d%.]+")) end
+        end
         return number and number>=0 and number or nil
+    end
+    local function getUptime()
+        local uptime
+        if type(cfg.GetServerUptime)=="function" then local ok,value=pcall(cfg.GetServerUptime); if ok then uptime=tonumber(value) end end
+        if not uptime and cfg.ServerUptime~=nil then uptime=tonumber(cfg.ServerUptime) end
+        if uptime and (uptime~=uptime or uptime==math.huge or uptime==-math.huge or uptime<0) then uptime=nil end
+        local uptimeKind=uptime and "Server uptime" or "Session uptime"
+        if not uptime then local ok,value=pcall(function() return workspace.DistributedGameTime end); if ok then uptime=tonumber(value) end end
+        if not uptime or uptime~=uptime or uptime==math.huge or uptime==-math.huge or uptime<0 then uptime=0 end
+        return math.max(0,uptime or 0),uptimeKind
     end
     local function update()
         local ping=currentPing()
         if ping then table.insert(samples,ping); while #samples>30 do table.remove(samples,1) end end
         local sum=0; for _,value in ipairs(samples) do sum+=value end
         local average=#samples>0 and math.floor(sum/#samples+0.5) or nil
-        local uptime=math.max(0,os.clock()-(lib._startedAt or os.clock()))
+        local uptime,uptimeKind=getUptime()
         local region=tostring(cfg.Region or "unavailable")
-        label.Text=string.format("Players: %d/%d\nAverage ping: %s\nRegion: %s  ·  Uptime: %02d:%02d:%02d",#Players:GetPlayers(),tonumber(Players.MaxPlayers) or 0,average and (average.." ms") or "unavailable",region,math.floor(uptime/3600),math.floor(uptime/60)%60,math.floor(uptime)%60)
+        label.Text=string.format("Players: %d/%d\nAverage ping: %s\nRegion: %s  ·  %s: %02d:%02d:%02d",#Players:GetPlayers(),tonumber(Players.MaxPlayers) or 0,average and (average.." ms") or "unavailable",region,uptimeKind,math.floor(uptime/3600),math.floor(uptime/60)%60,math.floor(uptime)%60)
     end
     task.spawn(function() while active and root.Parent do update(); task.wait(interval) end end)
-    local handle={Instance=root,Update=update,Get=function() return {PlayerCount=#Players:GetPlayers(),MaxPlayers=tonumber(Players.MaxPlayers) or 0,AveragePing=#samples>0 and (function() local n=0; for _,v in ipairs(samples) do n+=v end; return n/#samples end)() or nil,Uptime=os.clock()-(lib._startedAt or os.clock()),Region=cfg.Region} end}
+    local handle={Instance=root,Update=update,Get=function() local uptime,uptimeKind=getUptime(); return {PlayerCount=#Players:GetPlayers(),MaxPlayers=tonumber(Players.MaxPlayers) or 0,AveragePing=#samples>0 and (function() local n=0; for _,v in ipairs(samples) do n+=v end; return n/#samples end)() or nil,Uptime=uptime,UptimeKind=uptimeKind,Region=cfg.Region} end}
     function handle:Destroy() active=false; if root.Parent then root:Destroy() end end
     return handle
 end
