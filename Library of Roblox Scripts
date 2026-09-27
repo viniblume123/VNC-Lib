@@ -1,6 +1,6 @@
 local L = {}
 L.__index = L
-L.Version = "6.3.3"
+L.Version = "6.3.4"
 L._iconAnimationHandles = {}
 L._iconAnimationByImage = setmetatable({}, {__mode="k"})
 local SplashGui = nil
@@ -273,11 +273,21 @@ local function TrackAuxGui(lib,win,gui)
     local rootLib=type(lib)=="table" and (lib._lib or lib) or nil
     local ownerWindow=win or ResolveWindow(lib)
     if rootLib then rootLib._auxGuis=rootLib._auxGuis or {}; table.insert(rootLib._auxGuis,gui) end
-    if ownerWindow then ownerWindow._auxGuis=ownerWindow._auxGuis or {}; table.insert(ownerWindow._auxGuis,gui) end
-    gui.Destroying:Connect(function()
+    if ownerWindow then
+        ownerWindow._auxGuis=ownerWindow._auxGuis or {}; table.insert(ownerWindow._auxGuis,gui)
+        ownerWindow._accentTargetsDirty=true
+        gui.DescendantAdded:Connect(function() ownerWindow._accentTargetsDirty=true end)
+    end
+    local removed=false
+    local function removeReferences()
+        if removed then return end
+        removed=true
         RemoveGuiReference(rootLib and rootLib._auxGuis,gui)
         RemoveGuiReference(ownerWindow and ownerWindow._auxGuis,gui)
-    end)
+        if ownerWindow then ownerWindow._accentTargetsDirty=true end
+    end
+    gui.Destroying:Connect(removeReferences)
+    gui.AncestryChanged:Connect(function(_,parent) if parent==nil then removeReferences() end end)
     return true
 end
 local function DestroyAuxGui(lib,win,gui)
@@ -302,7 +312,6 @@ L.Favorites = JsonRead("library_favorites.json", {})
 L._favoriteItems = {}
 L.NotificationHistory = {}
 L._stateFile = "library_state.json"
-L._startedAt = os.time()
 L.Config = {AutoSave = true, SaveDelay = 0.75, AutoSaveConfig = false, AutoSaveConfigName = nil, AutoSaveConfigDelay = 0.75, Transparency = 0, ReducedMotion = false}
 L.ConfigHistory = {Undo={},Redo={},Limit=50}
 
@@ -545,6 +554,8 @@ end
 function L:Destroy()
     if self._destroyed then return end
     self._destroyed = true
+    if self._antiIdleConnection then pcall(function() self._antiIdleConnection:Disconnect() end); self._antiIdleConnection=nil end
+    self._antiIdleEnabled=false
     SplashToken+=1
     if SplashGui then pcall(function() SplashGui:Destroy() end); SplashGui=nil end
     if self._updateCheck then self._updateCheck.Active=false end
@@ -611,9 +622,7 @@ function L:SetTransparency(value)
     value=math.clamp(tonumber(value) or 0,0,0.45); self.Config=self.Config or {}; self.Config.Transparency=value
     for _, win in ipairs(self._allWindows or {}) do
         if win and not win._destroyed then
-            local old=ClonePalette(win.C)
-            win:_ApplyTheme(old,self.C)
-            win._accentTargetsDirty=true
+            if type(win._ApplyTransparency)=="function" then win:_ApplyTransparency() end
         end
     end
     return value
@@ -623,11 +632,11 @@ function L:GetReducedMotion() return self.Config and self.Config.ReducedMotion==
 
 L.Palettes = {
     Dark = {
-        Bg=Color3.fromRGB(36,42,56), Surface=Color3.fromRGB(48,56,72),
-        Card=Color3.fromRGB(62,72,92), CardHover=Color3.fromRGB(78,90,114),
-        CardActive=Color3.fromRGB(70,82,104), Stroke=Color3.fromRGB(104,116,140),
+        Bg=Color3.fromRGB(43,50,66), Surface=Color3.fromRGB(56,66,84),
+        Card=Color3.fromRGB(70,82,104), CardHover=Color3.fromRGB(88,102,128),
+        CardActive=Color3.fromRGB(78,92,116), Stroke=Color3.fromRGB(128,142,168),
         StrokeHot=Color3.fromRGB(142,155,255), Text=Color3.fromRGB(255,255,255),
-        TextDim=Color3.fromRGB(232,236,247), TextFaint=Color3.fromRGB(190,199,220),
+        TextDim=Color3.fromRGB(242,244,250), TextFaint=Color3.fromRGB(214,222,238),
         Accent=Color3.fromRGB(128,140,255), AccentSoft=Color3.fromRGB(79,90,185),
         Success=Color3.fromRGB(91,224,148), SuccessBg=Color3.fromRGB(39,94,66),
         Danger=Color3.fromRGB(242,105,120), DangerBg=Color3.fromRGB(103,42,54),
@@ -708,6 +717,8 @@ local BuiltinPaletteNames={}
 for name in pairs(L.Palettes) do BuiltinPaletteNames[name]=true end
 L.Palettes.Light = { Bg=Color3.fromRGB(242,245,250), Surface=Color3.fromRGB(250,251,253), Card=Color3.fromRGB(255,255,255), CardHover=Color3.fromRGB(244,247,252), CardActive=Color3.fromRGB(235,240,250), Stroke=Color3.fromRGB(211,218,231), StrokeHot=Color3.fromRGB(102,116,255), Text=Color3.fromRGB(25,29,38), TextDim=Color3.fromRGB(73,80,96), TextFaint=Color3.fromRGB(118,127,146), Accent=Color3.fromRGB(91,105,240), AccentSoft=Color3.fromRGB(70,82,180), Success=Color3.fromRGB(35,155,91), SuccessBg=Color3.fromRGB(224,246,234), Danger=Color3.fromRGB(214,68,86), DangerBg=Color3.fromRGB(252,230,233), Warning=Color3.fromRGB(194,126,27), WarningBg=Color3.fromRGB(252,242,220), Info=Color3.fromRGB(48,125,205), InfoBg=Color3.fromRGB(225,239,253), Overlay=Color3.fromRGB(30,35,45), White=Color3.fromRGB(255,255,255) }
 L.Palettes.Graphite = { Bg=Color3.fromRGB(36,38,43), Surface=Color3.fromRGB(45,48,54), Card=Color3.fromRGB(56,60,68), CardHover=Color3.fromRGB(70,75,84), CardActive=Color3.fromRGB(64,69,79), Stroke=Color3.fromRGB(92,98,110), StrokeHot=Color3.fromRGB(155,168,255), Text=Color3.fromRGB(250,251,253), TextDim=Color3.fromRGB(216,220,228), TextFaint=Color3.fromRGB(161,167,180), Accent=Color3.fromRGB(135,148,255), AccentSoft=Color3.fromRGB(82,94,180), Success=Color3.fromRGB(91,220,151), SuccessBg=Color3.fromRGB(39,86,64), Danger=Color3.fromRGB(246,104,124), DangerBg=Color3.fromRGB(99,41,54), Warning=Color3.fromRGB(247,184,94), WarningBg=Color3.fromRGB(101,74,38), Info=Color3.fromRGB(106,179,246), InfoBg=Color3.fromRGB(39,75,112), Overlay=Color3.fromRGB(9,10,13), White=Color3.fromRGB(255,255,255) }
+BuiltinPaletteNames.Light=true
+BuiltinPaletteNames.Graphite=true
 
 L.Fonts = {
     "Gotham","GothamMedium","GothamBold","GothamBlack","GothamSemibold",
@@ -976,10 +987,29 @@ function L:CreateSoundBox(cfg)
     local panel = Instance.new("Frame")
     panel.Name = "SoundBox"
     panel.Size = UDim2.fromOffset(360, 430)
-    panel.Position = cfg.Position or UDim2.new(0.5,-180,0.5,-215)
+    if cfg.Position then
+        panel.Position=cfg.Position
+    else
+        panel.AnchorPoint=Vector2.new(0.5,0.5)
+        panel.Position=UDim2.new(0.5,0,0.5,0)
+    end
     panel.BackgroundColor3 = theme.Surface
     panel.BorderSizePixel = 0
     panel.Parent = gui
+    if not cfg.Position then
+        local camera=workspace.CurrentCamera
+        if camera then
+            local panelScale=Instance.new("UIScale"); panelScale.Parent=panel
+            local function fitPanel()
+                local viewport=camera.ViewportSize
+                local fit=math.min(1,(viewport.X-24)/360,(viewport.Y-24)/430)
+                panelScale.Scale=math.clamp(fit,0.4,1)
+            end
+            fitPanel()
+            local viewportConnection=camera:GetPropertyChangedSignal("ViewportSize"):Connect(fitPanel)
+            gui.Destroying:Connect(function() viewportConnection:Disconnect() end)
+        end
+    end
     local corner = Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,12); corner.Parent=panel
     local stroke = Instance.new("UIStroke"); stroke.Color=theme.Stroke; stroke.Parent=panel
     local function makeText(className, parent, size, pos, text, bg)
@@ -1017,13 +1047,13 @@ function L:CreateSoundBox(cfg)
     end
     channelSubscription=self:On("SoundSettingsChanged",function() if gui.Parent and refreshChannelOptions then refreshChannelOptions() end end)
     channel.MouseButton1Click:Connect(function() channelIndex=channelIndex%#channels+1; refreshChannelOptions() end)
-    channelVolume.FocusLost:Connect(function() self:SetSoundChannelVolume(channels[channelIndex],channelVolume.Text); refreshChannelOptions() end)
+    channelVolume.FocusLost:Connect(function() self:SetSoundChannelVolume(channels[channelIndex],channelVolume.Text) end)
     play.MouseButton1Click:Connect(function()
         local n=tonumber(pitch.Text) or 1
         self:PlaySoundAsset(asset.Text,channels[channelIndex],{Pitch=n,FadeIn=cfg.FadeIn or 0})
     end)
     stop.MouseButton1Click:Connect(function() self:StopSound(cfg.FadeOut or 0.35) end)
-    silent.MouseButton1Click:Connect(function() local state=self:SetSoundSilent(not self.Sounds.silent); silent.Text="Silent: "..(state and "on" or "off") end)
+    silent.MouseButton1Click:Connect(function() self:SetSoundSilent(not self.Sounds.silent) end)
     local close=makeText("TextButton",panel,UDim2.new(0,28,0,26),UDim2.new(1,-38,0,8),"×",theme.Card)
     local function closeGui()
         DestroyAuxGui(self,ownerWindow,gui)
@@ -1082,7 +1112,10 @@ function L:CreateSoundBox(cfg)
                 local length=math.max(sound.TimeLength,0); local position=math.clamp(sound.TimePosition,0,length)
                 seekFill.Size=UDim2.new(length>0 and position/length or 0,0,1,0)
                 playbackLabel.Text=string.format("%02d:%02d / %02d:%02d",math.floor(position/60),math.floor(position%60),math.floor(length/60),math.floor(length%60))
-            else seekFill.Size=UDim2.new(0,0,1,0); playbackLabel.Text="00:00 / 00:00" end
+                seekHit.Active=length>0 and sound.IsLoaded
+            else
+                seekFill.Size=UDim2.new(0,0,1,0); playbackLabel.Text="00:00 / 00:00"; seekHit.Active=false
+            end
             task.wait(0.2)
         end
     end)
@@ -1132,9 +1165,9 @@ function L:CreateWatermark(cfg)
     return handle
 end
 
-L.Theme = "Dark"
+L.Theme = "Light"
 L.C = {}
-for key,value in pairs(L.Palettes.Dark) do L.C[key]=value end
+for key,value in pairs(L.Palettes.Light) do L.C[key]=value end
 L.ThemeAnimated = false
 L.ThemeHue = 0
 
@@ -1163,10 +1196,41 @@ local function NormalizePalette(p)
     out.Card = lift(out.Card, 0.24)
     out.CardHover = lift(out.CardHover, 0.30)
     out.CardActive = lift(out.CardActive, 0.27)
-    out.Text = lift(out.Text, 0.92)
-    out.TextDim = lift(out.TextDim, 0.72)
-    out.TextFaint = lift(out.TextFaint, 0.52)
     out.Stroke = lift(out.Stroke, 0.28)
+
+    local function linearChannel(value)
+        if value <= 0.04045 then return value / 12.92 end
+        return ((value + 0.055) / 1.055) ^ 2.4
+    end
+    local function luminance(color)
+        return 0.2126 * linearChannel(color.R) + 0.7152 * linearChannel(color.G) + 0.0722 * linearChannel(color.B)
+    end
+    local backgrounds = {out.Bg, out.Surface, out.Card, out.CardHover, out.CardActive}
+    local function contrast(a, b)
+        local high, low = math.max(luminance(a), luminance(b)), math.min(luminance(a), luminance(b))
+        return (high + 0.05) / (low + 0.05)
+    end
+    local function minimumContrast(color)
+        local minimum = math.huge
+        for _, background in ipairs(backgrounds) do
+            if typeof(background) == "Color3" then minimum = math.min(minimum, contrast(color, background)) end
+        end
+        return minimum
+    end
+    local function ensureContrast(color, required)
+        if typeof(color) ~= "Color3" or minimumContrast(color) >= required then return color end
+        local black, white = Color3.new(0, 0, 0), Color3.new(1, 1, 1)
+        local target = minimumContrast(black) >= minimumContrast(white) and black or white
+        local low, high = 0, 1
+        for _ = 1, 16 do
+            local amount = (low + high) * 0.5
+            if minimumContrast(color:Lerp(target, amount)) >= required then high = amount else low = amount end
+        end
+        return color:Lerp(target, high)
+    end
+    out.Text = ensureContrast(out.Text, 4.5)
+    out.TextDim = ensureContrast(out.TextDim, 4.5)
+    out.TextFaint = ensureContrast(out.TextFaint, 4.5)
     return out
 end
 
@@ -1651,7 +1715,7 @@ function L:HasPlan(planName)
 end
 
 function L:ShowSplash(cfg)
-    cfg = cfg or {}
+    cfg = type(cfg)=="table" and cfg or {}
     local C = self.C
     SplashToken += 1
     local token=SplashToken
@@ -2488,7 +2552,7 @@ end
 function L:_AskPlatform()
     local C = self.C
     local result = self.Platform.device or "pc"
-local done = false
+    local done = false
     local gui = Instance.new("ScreenGui")
     gui.Name = "LibraryPlatform_"..tostring(math.random(1,999999))
     gui.ResetOnSpawn = false
@@ -2797,8 +2861,12 @@ local function SnapToEdge(Frame, File)
 end
 
 function L:CreateWindow(cfg)
-    cfg = cfg or {}
+    cfg = type(cfg)=="table" and cfg or {}
     if self._destroyed then return nil,"library is destroyed" end
+    if cfg.AntiIdle==true then
+        local antiIdleOk,antiIdleError=self:SetAntiIdle(true)
+        if not antiIdleOk then warn("[VNC-Lib] Anti-idle could not be enabled: "..tostring(antiIdleError)) end
+    end
     if cfg.Splash then
         self:ShowSplash(cfg.Splash)
         local splashDeadline=os.clock()+ClampNumber(type(cfg.Splash)=="table" and cfg.Splash.Timeout,60,0.1,900)
@@ -2824,13 +2892,16 @@ function L:CreateWindow(cfg)
     local C = self.C
     local WinFile = "library_window.json"
     local savedPos = JsonRead(WinFile, nil)
+    if type(savedPos) ~= "table" then savedPos = nil end
     local modeFile = "library_mode.json"
-    local savedMode = JsonRead(modeFile, {mode="normal"}).mode or "normal"
+    local savedModeData = JsonRead(modeFile, {mode="normal"})
+    local savedMode = type(savedModeData) == "table" and savedModeData.mode or "normal"
     local sizes = {
-        compact = {w = cfg.CompactWidth or 560, h = cfg.CompactHeight or 380},
-        normal = {w = cfg.Width or 720, h = cfg.Height or 500},
-        wide = {w = cfg.WideWidth or 980, h = cfg.WideHeight or 580}
+        compact = {w = ClampNumber(cfg.CompactWidth,560,320,1600), h = ClampNumber(cfg.CompactHeight,380,240,1200)},
+        normal = {w = ClampNumber(cfg.Width,720,420,1600), h = ClampNumber(cfg.Height,500,300,1200)},
+        wide = {w = ClampNumber(cfg.WideWidth,980,480,1800), h = ClampNumber(cfg.WideHeight,580,320,1400)}
     }
+    if type(savedMode) ~= "string" or not sizes[savedMode] then savedMode = "normal" end
     local function GetSize(m)
         local s = sizes[m] or sizes.normal
         return UDim2.new(0, s.w, 0, s.h)
@@ -2850,7 +2921,12 @@ function L:CreateWindow(cfg)
     Main.Name = "Main"
     Main.Size = GetSize(savedMode)
     if savedPos then
-        Main.Position = UDim2.new(savedPos.xs or 0.5, savedPos.x or -300, savedPos.ys or 0.5, savedPos.y or -200)
+        local function savedCoordinate(key, fallback, minimum, maximum)
+            local value=tonumber(savedPos[key])
+            if not value or value~=value or value==math.huge or value==-math.huge then return fallback end
+            return math.clamp(value,minimum,maximum)
+        end
+        Main.Position = UDim2.new(savedCoordinate("xs",0.5,-2,2),savedCoordinate("x",-300,-100000,100000),savedCoordinate("ys",0.5,-2,2),savedCoordinate("y",-200,-100000,100000))
     else
         Main.Position = UDim2.new(0.5, -sizes[savedMode].w/2, 0.5, -sizes[savedMode].h/2)
     end
@@ -3070,7 +3146,6 @@ function L:CreateWindow(cfg)
             end
         end
         self._main.BackgroundColor3 = c.Bg
-        self._main.BackgroundTransparency = self._lib.Config.Transparency or 0
         self._gradient.Color = ColorSequence.new(c.Bg, c.Surface)
         self._gradient.Transparency = NumberSequence.new(0.05)
         self._sidebar.BackgroundColor3 = c.Surface
@@ -3083,56 +3158,85 @@ function L:CreateWindow(cfg)
         self._statusL.TextColor3 = c.TextFaint
         self._statusR.TextColor3 = c.TextFaint
         local root = self._main
-        if old then
-            local ownThemeFrames={}
-            for _,tab in ipairs(self._tabs) do if tab._ownTheme and tab._frame then ownThemeFrames[tab._frame]=true end end
+        local themeRevision = (self._themeRevision or 0) + 1
+        self._themeRevision = themeRevision
+        local backgroundKeys = {"Bg","Surface","CardHover","CardActive","Card","AccentSoft","Accent","SuccessBg","DangerBg","WarningBg","InfoBg","Success","Danger","Warning","Info","Overlay","White"}
+        local textKeys = {"Text","TextDim","TextFaint","White","Accent","Success","Danger","Warning","Info"}
+        local strokeKeys = {"Stroke","StrokeHot","Accent","AccentSoft"}
+        local imageKeys = {"Accent","Text","TextDim","TextFaint","Success","Danger","Warning","Info","White"}
+        local function remapTree(tree, excludeOwnThemes)
+            if not tree or not tree.Parent then return end
+            local ownThemeFrames = {}
+            local ownAccentFrames = {}
+            if excludeOwnThemes then
+                for _,tab in ipairs(self._tabs) do
+                    if tab._ownTheme and tab._frame then ownThemeFrames[tab._frame]=true end
+                    if tab._ownAccent and tab._frame then ownAccentFrames[tab._frame]=true end
+                end
+            end
             local function hasOwnThemeAncestor(obj)
+                if not excludeOwnThemes then return false end
                 local node=obj
-                while node and node~=root do
+                while node and node~=tree do
                     if ownThemeFrames[node] then return true end
                     node=node.Parent
                 end
                 return false
             end
-            for _, obj in ipairs(root:GetDescendants()) do
-                if not hasOwnThemeAncestor(obj) then
-                    if obj:IsA("GuiObject") then
-                        local bg = obj.BackgroundColor3
-                        local mapped = nil
-                        for key, value in pairs(old) do
-                            if typeof(value) == "Color3" and bg == value and c[key] then mapped = c[key]; break end
-                        end
-                        if mapped then obj.BackgroundColor3 = mapped end
-                    end
-                    if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
-                        local tc = obj.TextColor3
-                        for key, value in pairs(old) do
-                            if typeof(value) == "Color3" and tc == value and c[key] then obj.TextColor3 = c[key]; break end
-                        end
-                    end
-                    if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
-                        local ic = obj.ImageColor3
-                        for key, value in pairs(old) do
-                            if typeof(value) == "Color3" and ic == value and c[key] then obj.ImageColor3 = c[key]; break end
-                        end
-                    end
-                    if obj:IsA("UIStroke") then
-                        local sc = obj.Color
-                        for key, value in pairs(old) do
-                            if typeof(value) == "Color3" and sc == value and c[key] then obj.Color = c[key]; break end
-                        end
+            local function hasOwnAccentAncestor(obj)
+                if not excludeOwnThemes then return false end
+                local node=obj
+                while node and node~=tree do
+                    if ownAccentFrames[node] then return true end
+                    node=node.Parent
+                end
+                return false
+            end
+            local function remapProperty(obj, property, keys, preserveAccent)
+                local current=obj[property]
+                for _,key in ipairs(keys) do
+                    local accentRole=key=="Accent" or key=="AccentSoft" or key=="StrokeHot"
+                    if not (preserveAccent and accentRole) and old[key]==current and typeof(c[key])=="Color3" then
+                        local goal=c[key]
+                        local ok,tween=pcall(function() return TweenService:Create(obj,TweenInfo.new(0),{[property]=goal}) end)
+                        if ok and tween then pcall(function() tween:Play() end) else pcall(function() obj[property]=goal end) end
+                        return
                     end
                 end
             end
-        end
-        for _, obj in ipairs(root:GetDescendants()) do
-            if obj:IsA("GuiObject") then
-                if obj:GetAttribute("__VNCBaseTransparency") == nil then obj:SetAttribute("__VNCBaseTransparency",obj.BackgroundTransparency) end
-                local base = obj:GetAttribute("__VNCBaseTransparency")
-                obj.BackgroundTransparency = math.clamp(base + (self._lib.Config.Transparency or 0) * (1-base),0,1)
+            for _,obj in ipairs(tree:GetDescendants()) do
+                if not hasOwnThemeAncestor(obj) then
+                    local preserveAccent=hasOwnAccentAncestor(obj)
+                    if obj:IsA("GuiObject") then remapProperty(obj,"BackgroundColor3",backgroundKeys,preserveAccent) end
+                    if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then remapProperty(obj,"TextColor3",textKeys,preserveAccent) end
+                    if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then remapProperty(obj,"ImageColor3",imageKeys,preserveAccent) end
+                    if obj:IsA("UIStroke") then remapProperty(obj,"Color",strokeKeys,preserveAccent) end
+                end
             end
         end
+        if old then
+            remapTree(root,true)
+            for _,gui in ipairs(self._auxGuis or {}) do remapTree(gui,false) end
+            task.delay(T_OUT.Time+0.04,function()
+                if not self._destroyed and self._themeRevision==themeRevision then
+                    remapTree(root,true)
+                    for _,gui in ipairs(self._auxGuis or {}) do remapTree(gui,false) end
+                end
+            end)
+        end
+        self:_ApplyTransparency()
         self._accentTargetsDirty = true
+    end
+    function Win:_ApplyTransparency()
+        local transparency=math.clamp(tonumber(self._lib.Config.Transparency) or 0,0,0.45)
+        self._main.BackgroundTransparency=transparency
+        for _,obj in ipairs(self._main:GetDescendants()) do
+            if obj:IsA("GuiObject") then
+                if obj:GetAttribute("__VNCBaseTransparency")==nil then obj:SetAttribute("__VNCBaseTransparency",obj.BackgroundTransparency) end
+                local base=obj:GetAttribute("__VNCBaseTransparency")
+                obj.BackgroundTransparency=math.clamp(base+transparency*(1-base),0,1)
+            end
+        end
     end
     function Win:_ApplyAccent(oldAccent, newAccent, newSoft, oldSoft)
         local c = self._lib.C
@@ -3148,6 +3252,16 @@ function L:CreateWindow(cfg)
         self._logo.BackgroundColor3 = newAccent
         if self._accentTargetsDirty or not self._accentTargets then
             local targets={}
+            local ownThemeFrames={}
+            for _,tab in ipairs(self._tabs) do if (tab._ownTheme or tab._ownAccent) and tab._frame then ownThemeFrames[tab._frame]=true end end
+            local function hasOwnThemeAncestor(obj)
+                local node=obj
+                while node and node~=self._main do
+                    if ownThemeFrames[node] then return true end
+                    node=node.Parent
+                end
+                return false
+            end
             local function add(obj,property,role)
                 local value=obj[property]
                 local matches=(role=="soft" and oldSoft and value==oldSoft) or (role=="accent" and value==oldAccent)
@@ -3155,18 +3269,31 @@ function L:CreateWindow(cfg)
                     table.insert(targets,{Object=obj,Property=property,Role=role})
                 end
             end
-            for _, obj in ipairs(self._main:GetDescendants()) do
-                if obj:IsA("GuiObject") then add(obj,"BackgroundColor3","accent"); add(obj,"BackgroundColor3","soft") end
-                if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then add(obj,"TextColor3","accent") end
-                if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then add(obj,"ImageColor3","accent") end
-                if obj:IsA("UIStroke") then add(obj,"Color","accent") end
+            local function scan(root,isWindowRoot)
+                if not root or not root.Parent then return end
+                for _,obj in ipairs(root:GetDescendants()) do
+                    if not (isWindowRoot and hasOwnThemeAncestor(obj)) then
+                        if obj:IsA("GuiObject") then add(obj,"BackgroundColor3","accent"); add(obj,"BackgroundColor3","soft") end
+                        if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then add(obj,"TextColor3","accent") end
+                        if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then add(obj,"ImageColor3","accent") end
+                        if obj:IsA("UIStroke") then add(obj,"Color","accent") end
+                    end
+                end
             end
+            scan(self._main,true)
+            for _,gui in ipairs(self._auxGuis or {}) do scan(gui,false) end
             self._accentTargets=targets
             self._accentTargetsDirty=false
         end
+        local function targetStillOwned(object)
+            if not object or not object.Parent then return false end
+            if object:IsDescendantOf(self._main) then return true end
+            for _,gui in ipairs(self._auxGuis or {}) do if gui and gui.Parent and object:IsDescendantOf(gui) then return true end end
+            return false
+        end
         for i=#self._accentTargets,1,-1 do
             local target=self._accentTargets[i]
-            if not target.Object or not target.Object.Parent or not target.Object:IsDescendantOf(self._main) then
+            if not targetStillOwned(target.Object) then
                 table.remove(self._accentTargets,i)
             else
                 target.Object[target.Property]=target.Role=="soft" and newSoft or newAccent
@@ -3191,18 +3318,22 @@ function L:CreateWindow(cfg)
     function Win:_ApplyFont()
         local f, fb, fm = self._lib.CurrentFont, self._lib.CurrentFontBold, self._lib.CurrentFontMedium
         local previous=self._fontPalette or {Regular=f,Bold=fb,Medium=fm}
-        for _, obj in ipairs(self._main:GetDescendants()) do
-            if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
-                local role=obj:GetAttribute("__VNCFontRole")
-                if not role then
-                    if obj.Font==Enum.Font[previous.Bold] then role="Bold"
-                    elseif obj.Font==Enum.Font[previous.Medium] then role="Medium"
-                    elseif obj.Font==Enum.Font[previous.Regular] then role="Regular" end
-                    if role then obj:SetAttribute("__VNCFontRole",role) end
+        local roots={self._main}
+        for _,gui in ipairs(self._auxGuis or {}) do if gui and gui.Parent then table.insert(roots,gui) end end
+        for _,root in ipairs(roots) do
+            for _, obj in ipairs(root:GetDescendants()) do
+                if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
+                    local role=obj:GetAttribute("__VNCFontRole")
+                    if not role then
+                        if obj.Font==Enum.Font[previous.Bold] then role="Bold"
+                        elseif obj.Font==Enum.Font[previous.Medium] then role="Medium"
+                        elseif obj.Font==Enum.Font[previous.Regular] then role="Regular" end
+                        if role then obj:SetAttribute("__VNCFontRole",role) end
+                    end
+                    if role=="Bold" then obj.Font=Enum.Font[fb]
+                    elseif role=="Medium" then obj.Font=Enum.Font[fm]
+                    elseif role=="Regular" then obj.Font=Enum.Font[f] end
                 end
-                if role=="Bold" then obj.Font=Enum.Font[fb]
-                elseif role=="Medium" then obj.Font=Enum.Font[fm]
-                elseif role=="Regular" then obj.Font=Enum.Font[f] end
             end
         end
         self._fontPalette={Regular=f,Bold=fb,Medium=fm}
@@ -3378,6 +3509,7 @@ function L:CreateTab(name, icon)
         icon = opts.Icon
         name = opts.Name or opts.Title or "Tab"
     end
+    name=tostring(name or "Tab")
     local Tab = setmetatable({
         _window=Win, _lib=Win._lib or self, _name=name, _sections={}, _elements={},
         _iconName=icon, C=ClonePalette(C), _ownTheme=nil, _ownAccent=nil
@@ -3542,23 +3674,28 @@ function L:CreateTab(name, icon)
         self.C.Accent, self.C.StrokeHot = color, color
         self.C.AccentSoft = color:Lerp(Color3.new(0,0,0), 0.35)
         if self._ownTheme then self._ownTheme=ClonePalette(self.C) end
+        local function applyColor(obj,property,value)
+            local ok=pcall(function() local tween=TweenService:Create(obj,TweenInfo.new(0),{[property]=value}); tween:Play() end)
+            if not ok then pcall(function() obj[property]=value end) end
+        end
         for _, obj in ipairs(Btn:GetDescendants()) do
-            if obj:IsA("GuiObject") and obj.BackgroundColor3 == old then obj.BackgroundColor3 = color end
-            if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.TextColor3 == old then obj.TextColor3 = color end
-            if (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) and obj.ImageColor3 == old then obj.ImageColor3 = color end
-            if obj:IsA("UIStroke") and obj.Color == old then obj.Color = color end
+            if obj:IsA("GuiObject") and obj.BackgroundColor3 == old then applyColor(obj,"BackgroundColor3",color) end
+            if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.TextColor3 == old then applyColor(obj,"TextColor3",color) end
+            if (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) and obj.ImageColor3 == old then applyColor(obj,"ImageColor3",color) end
+            if obj:IsA("UIStroke") and obj.Color == old then applyColor(obj,"Color",color) end
         end
         self._frame.ScrollBarImageColor3 = color
         ActiveGlow.BackgroundColor3 = color
         DragHandle.BackgroundColor3 = color
         for _, section in ipairs(self._sections) do section.C = self.C end
         for _, obj in ipairs(Frame:GetDescendants()) do
-            if obj:IsA("GuiObject") and obj.BackgroundColor3 == old then obj.BackgroundColor3=color end
-            if obj:IsA("GuiObject") and obj.BackgroundColor3 == oldSoft then obj.BackgroundColor3=self.C.AccentSoft end
-            if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.TextColor3 == old then obj.TextColor3=color end
-            if (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) and obj.ImageColor3 == old then obj.ImageColor3=color end
-            if obj:IsA("UIStroke") and obj.Color == old then obj.Color=color end
+            if obj:IsA("GuiObject") and obj.BackgroundColor3 == old then applyColor(obj,"BackgroundColor3",color) end
+            if obj:IsA("GuiObject") and obj.BackgroundColor3 == oldSoft then applyColor(obj,"BackgroundColor3",self.C.AccentSoft) end
+            if (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) and obj.TextColor3 == old then applyColor(obj,"TextColor3",color) end
+            if (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) and obj.ImageColor3 == old then applyColor(obj,"ImageColor3",color) end
+            if obj:IsA("UIStroke") and obj.Color == old then applyColor(obj,"Color",color) end
         end
+        Win._accentTargetsDirty=true
         return true
     end
     function Tab:SetTheme(themeName)
@@ -3576,14 +3713,35 @@ function L:CreateTab(name, icon)
         local new=paletteRef
         self._ownTheme, self.C = ClonePalette(fresh), paletteRef
         local function remap(root)
-            for _, obj in ipairs(root:GetDescendants()) do
-                if obj:IsA("GuiObject") then for key,value in pairs(old) do if typeof(value)=="Color3" and obj.BackgroundColor3==value and new[key] then obj.BackgroundColor3=new[key]; break end end end
-                if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then for key,value in pairs(old) do if typeof(value)=="Color3" and obj.TextColor3==value and new[key] then obj.TextColor3=new[key]; break end end end
-                if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then for key,value in pairs(old) do if typeof(value)=="Color3" and obj.ImageColor3==value and new[key] then obj.ImageColor3=new[key]; break end end end
-                if obj:IsA("UIStroke") then for key,value in pairs(old) do if typeof(value)=="Color3" and obj.Color==value and new[key] then obj.Color=new[key]; break end end end
+            local backgroundKeys={"Bg","Surface","CardHover","CardActive","Card","AccentSoft","Accent","SuccessBg","DangerBg","WarningBg","InfoBg","Success","Danger","Warning","Info","Overlay","White"}
+            local textKeys={"Text","TextDim","TextFaint","White","Accent","Success","Danger","Warning","Info"}
+            local strokeKeys={"Stroke","StrokeHot","Accent","AccentSoft"}
+            local imageKeys={"Accent","Text","TextDim","TextFaint","Success","Danger","Warning","Info","White"}
+            local function apply(obj,property,keys)
+                for _,key in ipairs(keys) do
+                    if old[key]==obj[property] and typeof(new[key])=="Color3" then
+                        local goal=new[key]
+                        local ok,tween=pcall(function() return TweenService:Create(obj,TweenInfo.new(0),{[property]=goal}) end)
+                        if ok and tween then pcall(function() tween:Play() end) else pcall(function() obj[property]=goal end) end
+                        return
+                    end
+                end
+            end
+            local objects={root}
+            for _,descendant in ipairs(root:GetDescendants()) do table.insert(objects,descendant) end
+            for _,obj in ipairs(objects) do
+                if obj:IsA("GuiObject") then apply(obj,"BackgroundColor3",backgroundKeys) end
+                if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then apply(obj,"TextColor3",textKeys) end
+                if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then apply(obj,"ImageColor3",imageKeys) end
+                if obj:IsA("UIStroke") then apply(obj,"Color",strokeKeys) end
             end
         end
         remap(Btn); remap(Frame)
+        self._themeRevision=(self._themeRevision or 0)+1
+        local themeRevision=self._themeRevision
+        task.delay(T_OUT.Time+0.04,function()
+            if not self._destroyed and self._themeRevision==themeRevision then remap(Btn); remap(Frame) end
+        end)
         self._frame.ScrollBarImageColor3 = new.Accent
         Btn.BackgroundColor3 = new.Card
         Bs.Color = new.Stroke
@@ -3592,6 +3750,7 @@ function L:CreateTab(name, icon)
         Lb.TextColor3 = new.TextDim
         if iconImg then iconImg.ImageColor3 = new.TextDim end
         for _, section in ipairs(self._sections) do section.C = new end
+        Win._accentTargetsDirty=true
         return true
     end
     function Tab:SetName(n) self._name = n; Lb.Text = n end
@@ -3613,10 +3772,12 @@ end
 
 function L:CreateSection(name)
     local Tab = self
+    if type(Tab)~="table" or not Tab._window or not Tab._frame then return nil,"tab required (call this method on a Tab)" end
     local Win = Tab._window
     local C = Tab.C or Win.C
     local opts = {}
     if type(name) == "table" then opts = name; name = opts.Name or opts.Title or "Section" end
+    name=tostring(name or "Section")
     local collapsible = opts.Collapsible ~= false
     local defaultCollapsed = opts.Collapsed or false
     local Sec = setmetatable({
@@ -3721,9 +3882,20 @@ function ElementMethods:SetFavorite(enabled)
     if enabled==nil then enabled=not lib:IsFavorite(id) end
     local state=lib:SetFavorite(id,enabled)
     lib._favoriteItems=lib._favoriteItems or {}
-    if state then lib._favoriteItems[id]={Name=self._favoriteName or tostring(id),Tab=self._favoriteTab}
-    else lib._favoriteItems[id]=nil end
     local root=self.Instance
+    if state then
+        local record={Name=self._favoriteName or tostring(id),Tab=self._favoriteTab,Element=self}
+        lib._favoriteItems[id]=record
+        if root and not self._favoriteCleanupConnection then
+            self._favoriteCleanupConnection=root.Destroying:Connect(function()
+                if lib._favoriteItems and lib._favoriteItems[id]==record then lib._favoriteItems[id]=nil end
+                self._favoriteCleanupConnection=nil
+            end)
+        end
+    else
+        lib._favoriteItems[id]=nil
+        if self._favoriteCleanupConnection then pcall(function() self._favoriteCleanupConnection:Disconnect() end); self._favoriteCleanupConnection=nil end
+    end
     if root and root.Parent then
         if not self._favoriteButton then
             local star=Instance.new("TextButton"); star.Name="FavoriteButton"; star.Size=UDim2.fromOffset(20,20); star.Position=UDim2.new(1,-24,0,3)
@@ -3802,9 +3974,9 @@ function L:_AddElement(a, b)
 end
 
 function L:CreateTooltip(target, text, cfg)
-    cfg=cfg or {}
-    target=type(target)=="table" and target.Instance or target
-    if not target or not target:IsA("GuiObject") then return nil end
+    cfg=type(cfg)=="table" and cfg or {}
+    if type(target)=="table" then target=target.Instance end
+    if typeof(target)~="Instance" or not target:IsA("GuiObject") then return nil end
     local win=self._window or self._tab and self._tab._window or self._window
     local c=(self.C or (win and win.C) or L.C)
     local parent=(win and win._overlay) or target.Parent
@@ -3829,8 +4001,8 @@ function L:CreateTooltip(target, text, cfg)
 end
 
 function L:CreateBadge(parent, text, cfg)
-    cfg=cfg or {}; parent=type(parent)=="table" and parent.Instance or parent
-    if not parent or not parent:IsA("GuiObject") then return nil end
+    cfg=type(cfg)=="table" and cfg or {}; if type(parent)=="table" then parent=parent.Instance end
+    if typeof(parent)~="Instance" or not parent:IsA("GuiObject") then return nil end
     local label=Instance.new("TextLabel"); label.Name="VNC_Badge"
     label.AnchorPoint=Vector2.new(1,0); label.Position=cfg.Position or UDim2.new(1,-6,0,6)
     label.Size=cfg.Size or UDim2.new(0,math.max(24,#tostring(text or "")*7+12),0,20)
@@ -5222,7 +5394,10 @@ end
 
 function L:CreateGlobalSearch(cfg)
     cfg = type(cfg)=="table" and cfg or {}
-    local Win = self._window
+    local lib=self._lib or self
+    local Win
+    if cfg.Window~=nil then Win=ResolveWindow(self,cfg.Window) else Win=ResolveWindow(self) end
+    if Win and Win._lib~=lib then return nil,"window belongs to another library" end
     if not Win or Win._destroyed then return nil end
     if cfg.StartHidden then
         local previous=Win._globalSearchPalette
@@ -5262,7 +5437,7 @@ function L:CreateGlobalSearch(cfg)
     Input.BackgroundTransparency = 1
     Input.Text = ""
     Input.PlaceholderText = cfg.Placeholder or "Search all tabs......"
-    Input.Font = Enum.Font[L.CurrentFont]
+    Input.Font = Enum.Font[lib.CurrentFont]
     Input.TextSize = 14
     Input.TextColor3 = C.Text
     Input.PlaceholderColor3 = C.TextFaint
@@ -5283,7 +5458,18 @@ function L:CreateGlobalSearch(cfg)
     local Rc = Instance.new("UICorner"); Rc.CornerRadius = UDim.new(0,12); Rc.Parent = Results
     local Rp = Instance.new("UIPadding"); Rp.PaddingTop = UDim.new(0,8); Rp.PaddingLeft = UDim.new(0,8); Rp.PaddingRight = UDim.new(0,8); Rp.Parent = Results
     local Rl = Instance.new("UIListLayout"); Rl.Padding = UDim.new(0,4); Rl.Parent = Results
-    local function Close() gui:Destroy() end
+    local persistent=cfg.StartHidden==true
+    local function Close()
+        if persistent then
+            if not gui.Parent then return end
+            gui.Enabled=false
+            Results.Visible=false
+            Input.Text=""
+            Input:ReleaseFocus()
+        elseif gui.Parent then
+            gui:Destroy()
+        end
+    end
     Overlay.MouseButton1Click:Connect(Close)
     local function Search()
         for _, c in ipairs(Results:GetChildren()) do
@@ -5315,7 +5501,7 @@ function L:CreateGlobalSearch(cfg)
                 Lb.Position = UDim2.new(0,10,0,0)
                 Lb.BackgroundTransparency = 1
                 Lb.Text = itemName
-                Lb.Font = Enum.Font[L.CurrentFontMedium]
+                Lb.Font = Enum.Font[lib.CurrentFontMedium]
                 Lb.TextSize = 12
                 Lb.TextColor3 = C.Text
                 Lb.TextXAlignment = Enum.TextXAlignment.Left
@@ -5325,7 +5511,7 @@ function L:CreateGlobalSearch(cfg)
                 Tb.Position = UDim2.new(1,-100,0,0)
                 Tb.BackgroundTransparency = 1
                 Tb.Text = itemTab
-                Tb.Font = Enum.Font[L.CurrentFont]
+                Tb.Font = Enum.Font[lib.CurrentFont]
                 Tb.TextSize = 10
                 Tb.TextColor3 = C.TextFaint
                 Tb.TextXAlignment = Enum.TextXAlignment.Right
@@ -5343,36 +5529,51 @@ function L:CreateGlobalSearch(cfg)
     if cfg.StartHidden then
         local ctrlKey = typeof(cfg.Modifier)=="EnumItem" and cfg.Modifier or Enum.KeyCode.LeftControl
         local paletteKey = typeof(cfg.Hotkey)=="EnumItem" and cfg.Hotkey or Enum.KeyCode.K
-        local hotkeyConnection=UIS.InputBegan:Connect(function(input, processed)
+        local hotkeyConnection
+        local cleaned=false
+        local function cleanupHotkey()
+            if cleaned then return end
+            cleaned=true
+            if hotkeyConnection then pcall(function() hotkeyConnection:Disconnect() end) end
+            if Win._globalSearchHotkey==hotkeyConnection then Win._globalSearchHotkey=nil end
+            if Win._globalSearchPalette==gui then Win._globalSearchPalette=nil end
+        end
+        hotkeyConnection=UIS.InputBegan:Connect(function(input, processed)
             if processed and input.KeyCode~=Enum.KeyCode.Escape then return end
             if input.KeyCode == paletteKey and (UIS:IsKeyDown(ctrlKey) or UIS:IsKeyDown(Enum.KeyCode.RightControl)) then
+                if not gui.Enabled then
+                    for _,otherWindow in ipairs(lib._allWindows or {}) do
+                        local other=otherWindow and otherWindow._globalSearchPalette
+                        if other and other~=gui and other.Parent then other.Enabled=false end
+                    end
+                end
                 gui.Enabled = not gui.Enabled
                 if gui.Enabled then Input:CaptureFocus() else Input:ReleaseFocus() end
             elseif input.KeyCode == Enum.KeyCode.Escape and gui.Enabled then
-                gui.Enabled = false
-                Input:ReleaseFocus()
+                Close()
             end
         end)
         Win._globalSearchHotkey=hotkeyConnection
         Win._globalSearchPalette=gui
-        gui.Destroying:Connect(function()
-            if hotkeyConnection then pcall(function() hotkeyConnection:Disconnect() end) end
-            if Win._globalSearchHotkey==hotkeyConnection then Win._globalSearchHotkey=nil end
-            if Win._globalSearchPalette==gui then Win._globalSearchPalette=nil end
-        end)
+        gui.Destroying:Connect(cleanupHotkey)
+        gui.AncestryChanged:Connect(function(_,parent) if parent==nil then cleanupHotkey() end end)
     end
     return gui
 end
 
 function L:CreateCommandPalette(cfg)
-    local source=cfg or {}; cfg={}; for k,v in pairs(source) do cfg[k]=v end
-    local win=self._window or (self._main and self)
+    local source=type(cfg)=="table" and cfg or {}; cfg={}; for k,v in pairs(source) do cfg[k]=v end
+    local lib=self._lib or self
+    local win
+    if cfg.Window~=nil then win=ResolveWindow(self,cfg.Window) else win=ResolveWindow(self) end
+    if win and win._lib~=lib then return nil,"window belongs to another library" end
+    if not win or win._destroyed then return nil,"window required" end
+    cfg.Window=win
     if win and win._commandPalette and win._commandPalette.Parent then win._commandPalette:Destroy() end
     if win then win._commandPalette=nil end
     cfg.StartHidden = true
     cfg.Placeholder = cfg.Placeholder or "Search actions... (Ctrl+K)"
-    cfg.Items=table.clone(cfg.Items or {})
-    local lib=self
+    cfg.Items=type(cfg.Items)=="table" and table.clone(cfg.Items) or {}
     if cfg.IncludeFavorites~=false then
         cfg.GetItems=function()
             local favorites={}
@@ -5382,7 +5583,7 @@ function L:CreateCommandPalette(cfg)
             return favorites
         end
     end
-    local gui=self:CreateGlobalSearch(cfg)
+    local gui=lib:CreateGlobalSearch(cfg)
     if win and gui then
         win._commandPalette=gui
         gui.Destroying:Connect(function() if win._commandPalette==gui then win._commandPalette=nil end end)
@@ -5627,7 +5828,7 @@ function L:SetAutoSaveConfig(name, enabled, delay)
     if delay then self.Config.AutoSaveConfigDelay = ClampNumber(delay,0.75,0.1,60) end
     if self.Config.AutoSaveConfig and not self:OverwriteConfig(name) then
         self.Config.AutoSaveConfig=false; self.Config.AutoSaveConfigName=nil
-        return false
+        return false,"failed to write the autosave configuration"
     end
     return true
 end
@@ -5846,6 +6047,31 @@ function L:_TouchHubIdle()
     if state.locked then self:_RestoreHubIdle() end
 end
 function L:_TouchIdle() self._idleState.lastAction=os.clock(); self:_TouchHubIdle() end
+function L:SetAntiIdle(enabled)
+    if self._destroyed then return false,"library is destroyed" end
+    if enabled~=true then
+        self._antiIdleEnabled=false
+        if self._antiIdleConnection then pcall(function() self._antiIdleConnection:Disconnect() end); self._antiIdleConnection=nil end
+        return true
+    end
+    if self._antiIdleConnection then self._antiIdleEnabled=true; return true end
+    local ok,connection=pcall(function()
+        return LP.Idled:Connect(function()
+            if self._destroyed or not self._antiIdleEnabled then return end
+            pcall(function()
+                local virtualUser=game:GetService("VirtualUser")
+                virtualUser:CaptureController()
+                virtualUser:ClickButton2(Vector2.new(0,0))
+            end)
+        end)
+    end)
+    if not ok or not connection then return false,"anti-idle is unavailable in this context" end
+    self._antiIdleConnection=connection
+    self._antiIdleEnabled=true
+    return true
+end
+function L:EnableAntiIdle() return self:SetAntiIdle(true) end
+function L:DisableAntiIdle() return self:SetAntiIdle(false) end
 function L:EnableAutoLogout(minutes,callback)
     if self._destroyed then return false,"library is destroyed" end
     minutes=tonumber(minutes) or 10; if minutes~=minutes or minutes<=0 then return false,"timeout must be positive" end
@@ -6354,7 +6580,11 @@ function L:OpenThemeEditor()
         working[key]=color; swatch.BackgroundColor3=color
         rBox.Text=tostring(math.floor(color.R*255+.5)); gBox.Text=tostring(math.floor(color.G*255+.5)); bBox.Text=tostring(math.floor(color.B*255+.5))
     end
-    for key,value in pairs(working) do if typeof(value)=="Color3" then
+    local colorKeys={}
+    for key,value in pairs(working) do if typeof(value)=="Color3" then table.insert(colorKeys,key) end end
+    table.sort(colorKeys)
+    for _,key in ipairs(colorKeys) do
+        local value=working[key]
         local row=Instance.new("Frame"); row.Size=UDim2.new(1,-6,0,32); row.BackgroundColor3=C.Card; row.BorderSizePixel=0; row.Parent=scroll
         local label=Instance.new("TextLabel"); label.Size=UDim2.new(0,94,1,0); label.Position=UDim2.fromOffset(8,0); label.BackgroundTransparency=1; label.Text=key; label.TextColor3=C.Text; label.Font=Enum.Font[lib.CurrentFont]; label.TextSize=10; label.TextXAlignment=Enum.TextXAlignment.Left; label.Parent=row
         local rgbBoxes={}
@@ -6373,7 +6603,7 @@ function L:OpenThemeEditor()
             working[key]=color; swatch.BackgroundColor3=color; box.Text=ColorToHex(color)
         end
         for _,rgbBox in ipairs(rgbBoxes) do rgbBox.FocusLost:Connect(updateRGB) end
-    end end
+    end
     local function close() DestroyAuxGui(lib,win,gui) end
     local closeButton=Instance.new("TextButton"); closeButton.Size=UDim2.fromOffset(28,26); closeButton.Position=UDim2.new(1,-38,0,8); closeButton.Text="×"; closeButton.BackgroundColor3=C.Card; closeButton.TextColor3=C.Text; closeButton.BorderSizePixel=0; closeButton.Parent=panel
     closeButton.MouseButton1Click:Connect(close)
@@ -6401,7 +6631,11 @@ function L:OpenTransitionEditor()
     local label=Instance.new("TextLabel"); label.Size=UDim2.new(1,0,1,0); label.BackgroundTransparency=1; label.Text="Preview"; label.TextColor3=C.White; label.Font=Enum.Font[lib.CurrentFontBold]; label.Parent=preview
     local list=Instance.new("ScrollingFrame"); list.Size=UDim2.new(1,-24,1,-136); list.Position=UDim2.fromOffset(12,128); list.BackgroundTransparency=1; list.BorderSizePixel=0; list.ScrollBarThickness=4; list.AutomaticCanvasSize=Enum.AutomaticSize.Y; list.CanvasSize=UDim2.new(); list.Parent=panel
     local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,4); layout.Parent=list; local busy=false
-    for name,def in pairs(lib.Transitions.List) do
+    local transitionNames={}
+    for name in pairs(lib.Transitions.List) do table.insert(transitionNames,name) end
+    table.sort(transitionNames)
+    for _,name in ipairs(transitionNames) do
+        local def=lib.Transitions.List[name]
         local row=Instance.new("Frame"); row.Size=UDim2.new(1,-4,0,34); row.BackgroundColor3=C.Card; row.BorderSizePixel=0; row.Parent=list
         local text=Instance.new("TextLabel"); text.Size=UDim2.new(1,-84,1,0); text.Position=UDim2.fromOffset(8,0); text.BackgroundTransparency=1; text.Text=tostring(name); text.TextColor3=C.Text; text.TextXAlignment=Enum.TextXAlignment.Left; text.Parent=row
         local test=Instance.new("TextButton"); test.Size=UDim2.fromOffset(66,26); test.Position=UDim2.new(1,-72,.5,-13); test.Text="Test"; test.BackgroundColor3=C.AccentSoft; test.TextColor3=C.White; test.Parent=row
@@ -6447,22 +6681,41 @@ function L:CreatePlayerList(cfg)
     local rows={}; local connections={}; local destroyed=false; local thumbnailQueue={}; local thumbnailWorkers=0
     local thumbnailConcurrency=math.floor(ClampNumber(cfg.ThumbnailConcurrency,3,1,6))
     root.Destroying:Connect(function() destroyed=true; table.clear(thumbnailQueue); for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end; table.clear(rows) end)
+    local function fetchThumbnail(userId)
+        local finished,requestOk,image=false,false,nil
+        local requestThread=task.spawn(function()
+            requestOk,image=pcall(function() return Players:GetUserThumbnailAsync(userId,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size48x48) end)
+            finished=true
+        end)
+        local deadline=os.clock()+ClampNumber(cfg.ThumbnailTimeout,5,1,30)
+        while not finished and not destroyed and os.clock()<deadline do task.wait(0.05) end
+        if not finished then
+            if requestThread then pcall(task.cancel,requestThread) end
+            return false,nil
+        end
+        return requestOk,image
+    end
+    local startThumbnailWorker
+    startThumbnailWorker=function()
+        if destroyed or #thumbnailQueue==0 or thumbnailWorkers>=thumbnailConcurrency then return end
+        thumbnailWorkers+=1
+        task.spawn(function()
+            while not destroyed do
+                local item=table.remove(thumbnailQueue,1)
+                if not item then break end
+                if rows[item.Player]==item.Row and item.Row.Parent then
+                    local ok,image=fetchThumbnail(item.Player.UserId)
+                    if ok and image and item.Avatar.Parent and rows[item.Player]==item.Row then item.Avatar.Image=image end
+                end
+                task.wait(0.05)
+            end
+            thumbnailWorkers=math.max(0,thumbnailWorkers-1)
+            if not destroyed and #thumbnailQueue>0 then startThumbnailWorker() end
+        end)
+    end
     local function queueThumbnail(player,row,avatar)
         table.insert(thumbnailQueue,{Player=player,Row=row,Avatar=avatar})
-        while thumbnailWorkers<thumbnailConcurrency do
-            thumbnailWorkers+=1
-            task.spawn(function()
-                while not destroyed and #thumbnailQueue>0 do
-                    local item=table.remove(thumbnailQueue,1)
-                    if item and rows[item.Player]==item.Row and item.Row.Parent then
-                        local ok,image=pcall(function() return Players:GetUserThumbnailAsync(item.Player.UserId,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size48x48) end)
-                        if ok and image and item.Avatar.Parent and rows[item.Player]==item.Row then item.Avatar.Image=image end
-                    end
-                    task.wait(0.05)
-                end
-                thumbnailWorkers-=1
-            end)
-        end
+        startThumbnailWorker()
     end
     local function actionButton(parent,text,x,width)
         local button=Instance.new("TextButton"); button.Size=UDim2.fromOffset(width or 42,30); button.Position=UDim2.new(1,x,0.5,-15); button.BackgroundColor3=C.Card; button.TextColor3=C.Text; button.Text=text; button.Font=Enum.Font[lib.CurrentFontBold]; button.TextSize=11; button.BorderSizePixel=0; button.AutoButtonColor=false; button.Parent=parent
@@ -6528,7 +6781,7 @@ function L:CreatePlayerList(cfg)
     local function refresh()
         for _,player in ipairs(Players:GetPlayers()) do addPlayer(player) end
         for player in pairs(rows) do if player.Parent~=Players then removePlayer(player) end end
-        sortRows()
+        scheduleSort()
         return #Players:GetPlayers()
     end
     table.insert(connections,win:_Connect(Players.PlayerAdded,function(player) addPlayer(player); scheduleSort() end))
@@ -6750,7 +7003,12 @@ function L:CreateServerInfoPanel(cfg)
     local label=Instance.new("TextLabel"); label.Size=UDim2.new(1,-20,1,-14); label.Position=UDim2.fromOffset(10,7); label.BackgroundTransparency=1; label.TextColor3=C.Text; label.Font=Enum.Font[lib.CurrentFont]; label.TextSize=11; label.TextWrapped=true; label.TextXAlignment=Enum.TextXAlignment.Left; label.TextYAlignment=Enum.TextYAlignment.Top; label.Parent=root
     section:_AddElement(root)
     local samples={}; local active=true; local interval=ClampNumber(cfg.RefreshSeconds,2,1,15)
-    root.Destroying:Connect(function() active=false end)
+    local playerCount=#Players:GetPlayers()
+    local playerConnections={
+        win:_Connect(Players.PlayerAdded,function() playerCount+=1 end),
+        win:_Connect(Players.PlayerRemoving,function() playerCount=math.max(0,playerCount-1) end)
+    }
+    root.Destroying:Connect(function() active=false; for _,connection in ipairs(playerConnections) do if connection then connection:Disconnect() end end end)
     local function currentPing()
         local item
         local ok=pcall(function() item=Stats.Network.ServerStatsItem["Data Ping"] end)
@@ -6780,10 +7038,10 @@ function L:CreateServerInfoPanel(cfg)
         local average=#samples>0 and math.floor(sum/#samples+0.5) or nil
         local uptime,uptimeKind=getUptime()
         local region=tostring(cfg.Region or "unavailable")
-        label.Text=string.format("Players: %d/%d\nAverage ping: %s\nRegion: %s  ·  %s: %02d:%02d:%02d",#Players:GetPlayers(),tonumber(Players.MaxPlayers) or 0,average and (average.." ms") or "unavailable",region,uptimeKind,math.floor(uptime/3600),math.floor(uptime/60)%60,math.floor(uptime)%60)
+        label.Text=string.format("Players: %d/%d\nAverage ping: %s\nRegion: %s  ·  %s: %02d:%02d:%02d",playerCount,tonumber(Players.MaxPlayers) or 0,average and (average.." ms") or "unavailable",region,uptimeKind,math.floor(uptime/3600),math.floor(uptime/60)%60,math.floor(uptime)%60)
     end
     task.spawn(function() while active and root.Parent do update(); task.wait(interval) end end)
-    local handle={Instance=root,Update=update,Get=function() local uptime,uptimeKind=getUptime(); return {PlayerCount=#Players:GetPlayers(),MaxPlayers=tonumber(Players.MaxPlayers) or 0,AveragePing=#samples>0 and (function() local n=0; for _,v in ipairs(samples) do n+=v end; return n/#samples end)() or nil,Uptime=uptime,UptimeKind=uptimeKind,Region=cfg.Region} end}
+    local handle={Instance=root,Update=update,Get=function() local uptime,uptimeKind=getUptime(); return {PlayerCount=playerCount,MaxPlayers=tonumber(Players.MaxPlayers) or 0,AveragePing=#samples>0 and (function() local n=0; for _,v in ipairs(samples) do n+=v end; return n/#samples end)() or nil,Uptime=uptime,UptimeKind=uptimeKind,Region=cfg.Region} end}
     function handle:Destroy() active=false; if root.Parent then root:Destroy() end end
     return handle
 end
@@ -6835,17 +7093,16 @@ function L:CreateSoundSettings(cfg)
     local function setVolume(x)
         if volumeBar.AbsoluteSize.X<=0 then return end
         lib.Sounds.volume=math.clamp((x-volumeBar.AbsolutePosition.X)/volumeBar.AbsoluteSize.X,0,1)
-        emitSettingsChanged(); refresh()
+        emitSettingsChanged()
     end
-    volumeHit.MouseButton1Down:Connect(function(x) setVolume(x) end)
-    enabled.MouseButton1Click:Connect(function() lib.Sounds.enabled=not lib.Sounds.enabled; if not lib.Sounds.enabled then lib:StopSound(.15) end; emitSettingsChanged(); refresh() end)
-    silent.MouseButton1Click:Connect(function() lib:SetSoundSilent(not lib.Sounds.silent); refresh() end)
+    enabled.MouseButton1Click:Connect(function() lib.Sounds.enabled=not lib.Sounds.enabled; if not lib.Sounds.enabled then lib:StopSound(.15) end; emitSettingsChanged() end)
+    silent.MouseButton1Click:Connect(function() lib:SetSoundSilent(not lib.Sounds.silent) end)
     channel.MouseButton1Click:Connect(function() channelIndex=channelIndex%#channels+1; refresh() end)
     mixLabel.MouseButton1Click:Connect(function()
         local current=ClampNumber((lib.Sounds.channels or {})[channels[channelIndex]],1,0,1)
         local levels={0,.25,.5,.75,1}; local nextLevel=levels[1]
         for index,value in ipairs(levels) do if math.abs(value-current)<.01 then nextLevel=levels[index%#levels+1]; break end end
-        lib:SetSoundChannelVolume(channels[channelIndex],nextLevel); refresh()
+        lib:SetSoundChannelVolume(channels[channelIndex],nextLevel)
     end)
     local dragging=false; local connections={}
     table.insert(connections,lib:On("SoundSettingsChanged",function() if root.Parent then refresh() end end))
@@ -6853,7 +7110,7 @@ function L:CreateSoundSettings(cfg)
     table.insert(connections,win:_Connect(UIS.InputChanged,function(input) if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then setVolume(input.Position.X) end end))
     table.insert(connections,win:_Connect(UIS.InputEnded,function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=false end end))
     section:_AddElement(root); refresh()
-    local handle={Instance=root,Refresh=refresh,SetVolume=function(_,value) lib.Sounds.volume=ClampNumber(value,0,0,1); emitSettingsChanged(); refresh() end}
+    local handle={Instance=root,Refresh=refresh,SetVolume=function(_,value) lib.Sounds.volume=ClampNumber(value,0,0,1); emitSettingsChanged() end}
     root.Destroying:Connect(function() for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end end)
     function handle:Destroy() for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end; if root.Parent then root:Destroy() end end
     return handle
@@ -6888,6 +7145,27 @@ end
 function L:SetAutoConfetti(enabled) self.Config.AutoConfetti=enabled==true; return self.Config.AutoConfetti end
 function L:CreateSandbox()
     return nil,"Roblox/Luau does not provide process isolation here; this library will not expose an API that labels arbitrary loadstring execution as sandboxed."
+end
+
+local sectionOnlyCreators={
+    "CreateButton","CreateToggle","CreateSlider","CreateStepSlider","CreateRangeSlider",
+    "CreateInput","CreateLabel","CreateParagraph","CreateDivider","CreateDropdown",
+    "CreateMultiSelect","CreateColorPicker","CreateKeybind","CreateHotkeyCombo",
+    "CreateBind","CreateProgress","CreateImage","CreateMiniTabs"
+}
+for _,methodName in ipairs(sectionOnlyCreators) do
+    local implementation=L[methodName]
+    if type(implementation)=="function" then
+        local currentMethodName,methodImplementation=methodName,implementation
+        L[currentMethodName]=function(self,...)
+            if type(self)~="table" or not (self._inner or self._holder) then
+                return nil,"section required (call this method on a Section)"
+            end
+            local arguments=table.pack(...)
+            if currentMethodName~="CreateLabel" and currentMethodName~="CreateDivider" and arguments.n>0 and arguments[1]~=nil and type(arguments[1])~="table" then arguments[1]={} end
+            return methodImplementation(self,table.unpack(arguments,1,arguments.n))
+        end
+    end
 end
 
 L.SetReadingMode=L.SetReadingModeAdvanced
