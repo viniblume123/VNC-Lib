@@ -11,14 +11,32 @@ local ActiveCallbacksByThread=setmetatable({}, {__mode="k"})
 local MainCallbackThread={}
 local InternalTimeThemeUpdate={}
 
+local function SafeInstanceMember(instance,member)
+    if instance==nil then return nil end
+    local ok,value=pcall(function() return instance[member] end)
+    if ok then return value end
+    return nil
+end
+
 local function SetThemeColor(object,property,palette,role)
     local color=type(palette)=="table" and palette[role] or nil
+    if typeof(color)~="Color3" then
+        local fallback=type(L.C)=="table" and L.C[role] or nil
+        if typeof(fallback)=="Color3" then color=fallback else return nil,"palette is missing Color3 role "..tostring(role) end
+    end
     object[property]=color
-    if typeof(object)=="Instance" and typeof(color)=="Color3" then
+    if typeof(object)=="Instance" then
         local attribute="__VNCColorRole_"..property
-        if object:GetAttribute(attribute)~=role then object:SetAttribute(attribute,role) end
+        pcall(function() if object:GetAttribute(attribute)~=role then object:SetAttribute(attribute,role) end end)
     end
     return color
+end
+
+local function SetCustomThemeColor(object,property,color)
+    if typeof(color)~="Color3" then return false end
+    object[property]=color
+    if typeof(object)=="Instance" then pcall(function() object:SetAttribute("__VNCColorRole_"..property,"Custom") end) end
+    return true
 end
 
 local function IsInsideThemePreview(object,root)
@@ -258,7 +276,7 @@ local function HttpRequest(method,url,body,headers)
         elseif type(REQ)=="function" then
             backend="Executor"
             invoke=function() return REQ({Url=url,Method=method,Body=body,Headers=headers}) end
-        elseif method=="GET" and type(game.HttpGet)=="function" then
+        elseif method=="GET" and type(SafeInstanceMember(game,"HttpGet"))=="function" then
             backend="GameHttpGet"
             invoke=function() return game:HttpGet(url) end
         else
@@ -891,8 +909,8 @@ function L:GetCapabilities()
     local provider=self.HttpProvider
     local providerAvailable=type(provider)=="table" and (type(provider.Get)=="function" or type(provider.Post)=="function" or type(provider.Request)=="function")
     local executorAvailable=type(REQ)=="function"
-    local gameHttpAvailable=type(game.HttpGet)=="function"
-    local robloxHttpAvailable=type(HS.RequestAsync)=="function"
+    local gameHttpAvailable=type(SafeInstanceMember(game,"HttpGet"))=="function"
+    local robloxHttpAvailable=type(SafeInstanceMember(HS,"RequestAsync"))=="function"
     local mode=type(self.HttpMode)=="string" and self.HttpMode:lower() or "auto"
     local httpBackend
     if mode=="provider" then httpBackend=providerAvailable and "Provider" or "Unavailable"
@@ -900,13 +918,15 @@ function L:GetCapabilities()
     elseif mode=="roblox" then httpBackend=robloxHttpAvailable and "Roblox" or "Unavailable"
     else httpBackend=providerAvailable and "Provider" or executorAvailable and "Executor" or gameHttpAvailable and "GameHttpGet" or robloxHttpAvailable and "Roblox" or "Unavailable" end
     local httpAvailable=httpBackend~="Unavailable"
+    local touchEnabled=SafeInstanceMember(UIS,"TouchEnabled")==true
+    local mouseEnabled=SafeInstanceMember(UIS,"MouseEnabled")==true
     return {
         Client=LP~=nil,LocalPlayer=LP~=nil,HTTP=httpAvailable,HttpBackend=httpBackend,HttpMode=self.HttpMode or "Auto",
         HttpProvider=type(self.HttpProvider)=="table",FileSystem=type(RF)=="function" and type(WF)=="function",Storage=storage,
         StorageProvider=type(self.StorageProvider)=="table",Delete=type(self.StorageProvider)=="table" and type(self.StorageProvider.Delete)=="function" or type(DF)=="function",
         ListFiles=type(self.StorageProvider)=="table" and type(self.StorageProvider.List)=="function" or type(listfiles)=="function",
-        Clipboard=type(CLIP)=="function",ProtectedGui=type(PROT)=="function",Mobile=UIS.TouchEnabled and not UIS.MouseEnabled,VR=VR.VREnabled,
-        FriendPresence=LP~=nil and type(LP.GetFriendsOnlineAsync)=="function",
+        Clipboard=type(CLIP)=="function",ProtectedGui=type(PROT)=="function",Mobile=touchEnabled and not mouseEnabled,VR=SafeInstanceMember(VR,"VREnabled")==true,
+        FriendPresence=LP~=nil and type(SafeInstanceMember(LP,"GetFriendsOnlineAsync"))=="function",
     }
 end
 function L:RefreshCapabilities()
@@ -1890,20 +1910,20 @@ function L:CreateSoundBox(cfg)
     end
     local corner = Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,12); corner.Parent=panel
     local stroke = Instance.new("UIStroke"); SetThemeColor(stroke,"Color",theme,"Stroke"); stroke.Parent=panel
-    local function makeText(className, parent, size, pos, text, bg)
-        local obj=Instance.new(className); obj.Size=size; obj.Position=pos; obj.Text=text or ""; obj.BackgroundColor3=bg or theme.Card; SetThemeColor(obj,"TextColor3",theme,"Text"); obj.Font=Enum.Font[self.CurrentFont]; obj.TextSize=12; obj.BorderSizePixel=0; obj.Parent=parent
+    local function makeText(className, parent, size, pos, text, bg, bgRole)
+        local obj=Instance.new(className); obj.Size=size; obj.Position=pos; obj.Text=text or ""; if bgRole then SetThemeColor(obj,"BackgroundColor3",theme,bgRole) else obj.BackgroundColor3=bg or theme.Card end; SetThemeColor(obj,"TextColor3",theme,"Text"); obj.Font=Enum.Font[self.CurrentFont]; obj.TextSize=12; obj.BorderSizePixel=0; obj.Parent=parent
         local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,7); c.Parent=obj
         return obj
     end
-    local title=makeText("TextLabel",panel,UDim2.new(1,-24,0,26),UDim2.new(0,12,0,8),cfg.Title or "Sound Box",theme.Surface)
+    local title=makeText("TextLabel",panel,UDim2.new(1,-24,0,26),UDim2.new(0,12,0,8),cfg.Title or "Sound Box",theme.Surface,"Surface")
     title.TextXAlignment=Enum.TextXAlignment.Left; title.Font=Enum.Font[self.CurrentFontBold]
-    local asset=makeText("TextBox",panel,UDim2.new(1,-24,0,34),UDim2.new(0,12,0,42),"",theme.Card)
+    local asset=makeText("TextBox",panel,UDim2.new(1,-24,0,34),UDim2.new(0,12,0,42),"",theme.Card,"Card")
     asset.PlaceholderText="Asset ID or rbxassetid://..."; asset.ClearTextOnFocus=false
-    local pitch=makeText("TextBox",panel,UDim2.new(0,52,0,32),UDim2.new(0,12,0,84),"1",theme.Card); pitch.PlaceholderText="Pitch"
-    local play=makeText("TextButton",panel,UDim2.new(0,58,0,32),UDim2.new(0,70,0,84),"Play",theme.AccentSoft)
-    local pause=makeText("TextButton",panel,UDim2.new(0,58,0,32),UDim2.new(0,134,0,84),"Pause",theme.Card)
-    local stop=makeText("TextButton",panel,UDim2.new(0,58,0,32),UDim2.new(0,198,0,84),"Stop",theme.Card)
-    local silent=makeText("TextButton",panel,UDim2.new(0,82,0,32),UDim2.new(0,264,0,84),"Mute: "..(self.Sounds.silent and "on" or "off"),theme.Card)
+    local pitch=makeText("TextBox",panel,UDim2.new(0,52,0,32),UDim2.new(0,12,0,84),"1",theme.Card,"Card"); pitch.PlaceholderText="Pitch"
+    local play=makeText("TextButton",panel,UDim2.new(0,58,0,32),UDim2.new(0,70,0,84),"Play",theme.AccentSoft,"AccentSoft")
+    local pause=makeText("TextButton",panel,UDim2.new(0,58,0,32),UDim2.new(0,134,0,84),"Pause",theme.Card,"Card")
+    local stop=makeText("TextButton",panel,UDim2.new(0,58,0,32),UDim2.new(0,198,0,84),"Stop",theme.Card,"Card")
+    local silent=makeText("TextButton",panel,UDim2.new(0,82,0,32),UDim2.new(0,264,0,84),"Mute: "..(self.Sounds.silent and "on" or "off"),theme.Card,"Card")
     local refreshChannelOptions,channelSubscription
     local silentSubscription=self:On("SoundSettingsChanged",function(state)
         if gui.Parent then silent.Text="Mute: "..(state and state.Silent and "on" or "off") end
@@ -1919,10 +1939,10 @@ function L:CreateSoundBox(cfg)
         if channelSubscription then channelSubscription:Disconnect() end
         if playbackSubscription then playbackSubscription:Disconnect() end
     end)
-    local channel=makeText("TextButton",panel,UDim2.new(0,180,0,30),UDim2.new(0,12,0,124),"Channel: Music",theme.Card)
+    local channel=makeText("TextButton",panel,UDim2.new(0,180,0,30),UDim2.new(0,12,0,124),"Channel: Music",theme.Card,"Card")
     local looped=false
-    local loop=makeText("TextButton",panel,UDim2.new(0,68,0,30),UDim2.new(0,198,0,124),"Loop: Off",theme.Card)
-    local channelVolume=makeText("TextBox",panel,UDim2.new(0,72,0,30),UDim2.new(1,-84,0,124),tostring((self.Sounds.channels or {}).Music or 1),theme.Card)
+    local loop=makeText("TextButton",panel,UDim2.new(0,68,0,30),UDim2.new(0,198,0,124),"Loop: Off",theme.Card,"Card")
+    local channelVolume=makeText("TextBox",panel,UDim2.new(0,72,0,30),UDim2.new(1,-84,0,124),tostring((self.Sounds.channels or {}).Music or 1),theme.Card,"Card")
     channelVolume.PlaceholderText="Mix"; channelVolume.ClearTextOnFocus=false
     local channels=GetSoundChannelNames(self.Sounds); local channelIndex=table.find(channels,"Music") or 1
     refreshChannelOptions=function()
@@ -1948,7 +1968,7 @@ function L:CreateSoundBox(cfg)
     loop.MouseButton1Click:Connect(function() looped=not looped; loop.Text=looped and "Loop: On" or "Loop: Off" end)
     stop.MouseButton1Click:Connect(function() self:StopSound(cfg.FadeOut or 0.35) end)
     silent.MouseButton1Click:Connect(function() self:SetSoundSilent(not self.Sounds.silent) end)
-    local close=makeText("TextButton",panel,UDim2.new(0,28,0,26),UDim2.new(1,-38,0,8),"×",theme.Card)
+    local close=makeText("TextButton",panel,UDim2.new(0,28,0,26),UDim2.new(1,-38,0,8),"×",theme.Card,"Card")
     local function closeGui()
         DestroyAuxGui(self,ownerWindow,gui)
     end
@@ -1960,19 +1980,19 @@ function L:CreateSoundBox(cfg)
             self:RegisterSound(name,soundId,category)
         end
     end
-    local query=makeText("TextBox",panel,UDim2.new(1,-112,0,30),UDim2.new(0,12,0,164),"",theme.Card)
+    local query=makeText("TextBox",panel,UDim2.new(1,-112,0,30),UDim2.new(0,12,0,164),"",theme.Card,"Card")
     query.PlaceholderText="Search sound library..."; query.ClearTextOnFocus=false
     local views={"Library","Favorites","History","Playlists"}; local viewIndex=1
-    local viewButton=makeText("TextButton",panel,UDim2.new(0,84,0,30),UDim2.new(1,-96,0,164),views[viewIndex],theme.Card)
+    local viewButton=makeText("TextButton",panel,UDim2.new(0,84,0,30),UDim2.new(1,-96,0,164),views[viewIndex],theme.Card,"Card")
     local results=Instance.new("ScrollingFrame")
     results.Size=UDim2.new(1,-24,0,134); results.Position=UDim2.new(0,12,0,202); results.BackgroundTransparency=1; results.BorderSizePixel=0
     results.ScrollBarThickness=4; results.ScrollBarImageColor3=theme.Accent; results.CanvasSize=UDim2.new(0,0,0,0); results.AutomaticCanvasSize=Enum.AutomaticSize.Y; results.Parent=panel
     local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,4); layout.Parent=results
-    local playlistName=makeText("TextBox",panel,UDim2.new(0,76,0,30),UDim2.new(0,12,0,342),"",theme.Card)
+    local playlistName=makeText("TextBox",panel,UDim2.new(0,76,0,30),UDim2.new(0,12,0,342),"",theme.Card,"Card")
     playlistName.PlaceholderText="Playlist"; playlistName.ClearTextOnFocus=false
-    local playlistIds=makeText("TextBox",panel,UDim2.new(1,-184,0,30),UDim2.new(0,96,0,342),"",theme.Card)
+    local playlistIds=makeText("TextBox",panel,UDim2.new(1,-184,0,30),UDim2.new(0,96,0,342),"",theme.Card,"Card")
     playlistIds.PlaceholderText="IDs separated by spaces or commas"; playlistIds.ClearTextOnFocus=false
-    local importPlaylist=makeText("TextButton",panel,UDim2.new(0,68,0,30),UDim2.new(1,-80,0,342),"Add",theme.AccentSoft)
+    local importPlaylist=makeText("TextButton",panel,UDim2.new(0,68,0,30),UDim2.new(1,-80,0,342),"Add",theme.AccentSoft,"AccentSoft")
     local function refresh()
         for _,child in ipairs(results:GetChildren()) do if child:IsA("GuiObject") and child~=layout then child:Destroy() end end
         local visibleSounds={}
@@ -2002,15 +2022,15 @@ function L:CreateSoundBox(cfg)
         for _,sound in ipairs(visibleSounds) do
             local selectedSound=sound
             local row=Instance.new("Frame"); row.Size=UDim2.new(1,-4,0,30); SetThemeColor(row,"BackgroundColor3",theme,"Card"); row.BorderSizePixel=0; row.Parent=results
-            local name=makeText("TextButton",row,UDim2.new(1,-38,1,0),UDim2.new(0,0,0,0),selectedSound.Name.."  ·  "..selectedSound.Category,theme.Card)
+            local name=makeText("TextButton",row,UDim2.new(1,-38,1,0),UDim2.new(0,0,0,0),selectedSound.Name.."  ·  "..selectedSound.Category,theme.Card,"Card")
             name.TextXAlignment=Enum.TextXAlignment.Left
             if selectedSound.Playlist then
                 name.MouseButton1Click:Connect(function() self:PlaySoundPlaylist(selectedSound.Playlist,1) end)
-                local playList=makeText("TextButton",row,UDim2.new(0,32,1,0),UDim2.new(1,-32,0,0),"▶",theme.Card)
+                local playList=makeText("TextButton",row,UDim2.new(0,32,1,0),UDim2.new(1,-32,0,0),"▶",theme.Card,"Card")
                 playList.MouseButton1Click:Connect(function() self:PlaySoundPlaylist(selectedSound.Playlist,1) end)
             else
                 name.MouseButton1Click:Connect(function() asset.Text=tostring(selectedSound.Id or "") end)
-                local star=makeText("TextButton",row,UDim2.new(0,32,1,0),UDim2.new(1,-32,0,0),self:IsSoundFavorite(selectedSound.Id) and "★" or "☆",theme.Card)
+                local star=makeText("TextButton",row,UDim2.new(0,32,1,0),UDim2.new(1,-32,0,0),self:IsSoundFavorite(selectedSound.Id) and "★" or "☆",theme.Card,"Card")
                 star.MouseButton1Click:Connect(function() self:SetSoundFavorite(selectedSound.Id,not self:IsSoundFavorite(selectedSound.Id)); star.Text=self:IsSoundFavorite(selectedSound.Id) and "★" or "☆" end)
             end
         end
@@ -2019,7 +2039,7 @@ function L:CreateSoundBox(cfg)
     local seekTrack=Instance.new("Frame"); seekTrack.Name="PlaybackSeekTrack"; seekTrack.Size=UDim2.new(1,-24,0,6); seekTrack.Position=UDim2.new(0,12,0,386); SetThemeColor(seekTrack,"BackgroundColor3",theme,"Card"); seekTrack.BorderSizePixel=0; seekTrack.Parent=panel
     local seekFill=Instance.new("Frame"); seekFill.Size=UDim2.new(0,0,1,0); SetThemeColor(seekFill,"BackgroundColor3",theme,"Accent"); seekFill.BorderSizePixel=0; seekFill.Parent=seekTrack
     local seekHit=Instance.new("TextButton"); seekHit.Size=UDim2.new(1,0,0,18); seekHit.Position=UDim2.new(0,0,0.5,-9); seekHit.BackgroundTransparency=1; seekHit.Text=""; seekHit.Parent=seekTrack
-    local playbackLabel=makeText("TextLabel",panel,UDim2.new(1,-24,0,14),UDim2.new(0,12,0,398),"00:00 / 00:00",theme.Surface); playbackLabel.TextXAlignment=Enum.TextXAlignment.Left
+    local playbackLabel=makeText("TextLabel",panel,UDim2.new(1,-24,0,14),UDim2.new(0,12,0,398),"00:00 / 00:00",theme.Surface,"Surface"); playbackLabel.TextXAlignment=Enum.TextXAlignment.Left
     local function seekAt(x)
         local sound=self._activeSound
         if sound and sound.Parent and sound.TimeLength>0 then sound.TimePosition=math.clamp((x-seekTrack.AbsolutePosition.X)/math.max(seekTrack.AbsoluteSize.X,1),0,1)*sound.TimeLength end
@@ -2228,8 +2248,9 @@ end
 
 function L:SetTheme(name, internalSource)
     if self._destroyed then return false,"library is destroyed" end
+    if type(name)~="string" then return false,"theme name must be a string" end
     local palette = self.Palettes[name]
-    if not palette then return false end
+    if not palette then return false,"unknown theme: "..name end
     if internalSource~=InternalTimeThemeUpdate then self._timeTheme=nil end
     local old = ClonePalette(self.C)
     self.Theme = name
@@ -2271,10 +2292,11 @@ function L:SetFocusMode(enabled,window)
 end
 function L:SetCustomTheme(t)
     if self._destroyed then return false,"library is destroyed" end
-    if type(t) ~= "table" then return false end
+    if type(t) ~= "table" then return false,"palette must be a table" end
     local merged = ClonePalette(self.Palettes.Dark)
     for k, v in pairs(t) do
-        if merged[k]==nil or typeof(v)~="Color3" then return false,"palette entries must use known Color3 keys" end
+        if type(k)~="string" or merged[k]==nil then return false,"unknown palette color key: "..tostring(k) end
+        if typeof(v)~="Color3" then return false,"palette color "..k.." must be a Color3" end
         merged[k] = v
     end
     self._customPalette=ClonePalette(merged)
@@ -2744,6 +2766,9 @@ function L:ClearNotificationHistory()
 end
 function L:ShowNotificationHistory()
     local lib=self._lib or self
+    local old=lib._notificationHistoryGui
+    lib._notificationHistoryGui=nil
+    if old and old.Parent then old:Destroy() end
     local items={}
     for _,entry in ipairs(lib.NotificationHistory or {}) do
         table.insert(items,{Name=entry.Title.." — "..entry.Text,Tab=os.date("%H:%M:%S",entry.Time),Callback=function() lib:Notify({Title=entry.Title,Text=entry.Text,Type=entry.Type,Duration=3}) end})
@@ -3922,11 +3947,13 @@ function L:CreateWindow(cfg)
                 if IsInsideThemePreview(obj,tree) then return end
                 local current=obj[property]
                 local role=obj:GetAttribute("__VNCColorRole_"..property)
-                if type(role)=="string" and table.find(keys,role) then
-                    local accentRole=role=="Accent" or role=="AccentSoft" or role=="StrokeHot"
-                    if not (preserveAccent and accentRole) and typeof(c[role])=="Color3" then
-                        local ok,tween=pcall(function() return TweenService:Create(obj,TweenInfo.new(0),{[property]=c[role]}) end)
-                        if ok and tween then pcall(function() tween:Play() end) else pcall(function() obj[property]=c[role] end) end
+                if type(role)=="string" then
+                    if table.find(keys,role) then
+                        local accentRole=role=="Accent" or role=="AccentSoft" or role=="StrokeHot"
+                        if not (preserveAccent and accentRole) and typeof(c[role])=="Color3" then
+                            local ok,tween=pcall(function() return TweenService:Create(obj,TweenInfo.new(0),{[property]=c[role]}) end)
+                            if ok and tween then pcall(function() tween:Play() end) else pcall(function() obj[property]=c[role] end) end
+                        end
                     end
                     return
                 end
@@ -4682,8 +4709,8 @@ function L:CreateTab(name, icon)
         local function apply(obj,property,keys)
                 if IsInsideThemePreview(obj,root) then return end
                 local role=obj:GetAttribute("__VNCColorRole_"..property)
-                if type(role)=="string" and table.find(keys,role) then
-                    if typeof(new[role])=="Color3" then
+                if type(role)=="string" then
+                    if table.find(keys,role) and typeof(new[role])=="Color3" then
                         local ok,tween=pcall(function() return TweenService:Create(obj,TweenInfo.new(0),{[property]=new[role]}) end)
                         if ok and tween then pcall(function() tween:Play() end) else pcall(function() obj[property]=new[role] end) end
                     end
@@ -5204,8 +5231,8 @@ local function CreateChoiceControl(Sec,cfg,segmented)
     local function refresh()
         for option,button in pairs(buttons) do
             local active=option==selected
-            button.BackgroundColor3=active and C.AccentSoft or C.Surface
-            button.TextColor3=active and C.White or C.TextDim
+            SetThemeColor(button,"BackgroundColor3",C,active and "AccentSoft" or "Surface")
+            SetThemeColor(button,"TextColor3",C,active and "White" or "TextDim")
         end
     end
     for index,option in ipairs(options) do
@@ -5323,7 +5350,7 @@ function L:CreateTerminal(cfg)
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,10); corner.Parent=root
     local showHeader=cfg.Copyable==true or cfg.Title~=nil
     local headerHeight=showHeader and 30 or 0
-    local scroll=Instance.new("ScrollingFrame"); scroll.Size=UDim2.new(1,-12,1,-(12+headerHeight)); scroll.Position=UDim2.new(0,6,0,6+headerHeight); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4; scroll.ScrollBarImageColor3=C.Accent; scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.Parent=root
+    local scroll=Instance.new("ScrollingFrame"); scroll.Size=UDim2.new(1,-12,1,-(12+headerHeight)); scroll.Position=UDim2.new(0,6,0,6+headerHeight); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4; SetThemeColor(scroll,"ScrollBarImageColor3",C,"Accent"); scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.Parent=root
     if showHeader then
         local title=Instance.new("TextLabel"); title.Size=UDim2.new(1,cfg.Copyable==true and -92 or -16,0,24); title.Position=UDim2.fromOffset(8,3); title.BackgroundTransparency=1; title.Text=tostring(cfg.Title or "Code"); SetThemeColor(title,"TextColor3",C,"TextDim"); title.Font=Enum.Font[Sec._lib.CurrentFontMedium]; title.TextSize=11; title.TextXAlignment=Enum.TextXAlignment.Left; title.Parent=root
     end
@@ -5665,6 +5692,7 @@ function L:CreateSlider(cfg)
     local min, max = ClampNumber(cfg.Min,0,-1000000000,1000000000), ClampNumber(cfg.Max,100,-1000000000,1000000000)
     if max<=min then max=min<1000000000 and math.min(1000000000,min+1) or 1000000000; if max<=min then min=max-1 end end
     local val = ClampNumber(cfg.Default,min,min,max)
+    local customFillColor=typeof(cfg.FillColor)=="Color3"
     local fillColor = SafeColor(cfg.FillColor,C.Accent)
     local barColor = SafeColor(cfg.BarColor,C.Surface)
     local Wrapped = Instance.new("Frame")
@@ -5691,7 +5719,7 @@ function L:CreateSlider(cfg)
     ValL.Text = FormatControlNumber(val)..(cfg.Suffix or "")
     ValL.Font = Enum.Font[Sec._lib.CurrentFontBold]
     ValL.TextSize = 12
-    ValL.TextColor3 = fillColor
+        if customFillColor then SetCustomThemeColor(ValL,"TextColor3",fillColor) else SetThemeColor(ValL,"TextColor3",C,"Accent") end
     ValL.TextXAlignment = Enum.TextXAlignment.Right
     ValL.Parent = Wrapped
     local Bar = Instance.new("Frame")
@@ -5712,7 +5740,7 @@ function L:CreateSlider(cfg)
     end
     local Fill = Instance.new("Frame")
     Fill.Size = UDim2.new((val-min)/(max-min),0,1,0)
-    Fill.BackgroundColor3 = fillColor
+    if customFillColor then SetCustomThemeColor(Fill,"BackgroundColor3",fillColor) else SetThemeColor(Fill,"BackgroundColor3",C,"Accent") end
     Fill.BorderSizePixel = 0
     Fill.Parent = Bar
     local Fc = Instance.new("UICorner"); Fc.CornerRadius = UDim.new(1,0); Fc.Parent = Fill
@@ -5723,7 +5751,7 @@ function L:CreateSlider(cfg)
     Thumb.BorderSizePixel = 0
     Thumb.Parent = Bar
     local Tc = Instance.new("UICorner"); Tc.CornerRadius = UDim.new(1,0); Tc.Parent = Thumb
-    local Ts = Instance.new("UIStroke"); Ts.Color = fillColor; Ts.Thickness = 2; Ts.Parent = Thumb
+    local Ts = Instance.new("UIStroke"); if customFillColor then SetCustomThemeColor(Ts,"Color",fillColor) else SetThemeColor(Ts,"Color",C,"Accent") end; Ts.Thickness = 2; Ts.Parent = Thumb
     local Btn = Instance.new("TextButton")
     Btn.Size = UDim2.new(1,0,1,0)
     Btn.BackgroundTransparency = 1
@@ -5809,9 +5837,10 @@ function L:CreateSlider(cfg)
     function Element:SetColor(c)
         if typeof(c)~="Color3" then return false end
         fillColor = c
-        ValL.TextColor3 = c
-        Fill.BackgroundColor3 = c
-        Ts.Color = c
+        SetCustomThemeColor(ValL,"TextColor3",c)
+        SetCustomThemeColor(Fill,"BackgroundColor3",c)
+        SetCustomThemeColor(Ts,"Color",c)
+        return true
     end
     function Element:Get() return val end
     function Element:Destroy() disconnectPointer(); Wrapped:Destroy() end
@@ -5832,7 +5861,8 @@ function L:CreateRangeSlider(cfg)
     local v2 = ClampNumber(cfg.DefaultMax or rangeDefault.Max or rangeDefault[2],max,min,max)
     if v2 < v1 then v1,v2=v2,v1 end
     if v2-v1<minimumGap then v2=math.min(max,v1+minimumGap); v1=math.max(min,v2-minimumGap) end
-    local fillColor = cfg.FillColor or C.Accent
+    local customFillColor=typeof(cfg.FillColor)=="Color3"
+    local fillColor = SafeColor(cfg.FillColor,C.Accent)
     local Wrapped = Instance.new("Frame")
     Wrapped.Size = UDim2.new(1,0,0,64)
     SetThemeColor(Wrapped,"BackgroundColor3",C,"Card")
@@ -5857,7 +5887,7 @@ function L:CreateRangeSlider(cfg)
     ValL.Text = FormatControlNumber(v1).." - "..FormatControlNumber(v2)
     ValL.Font = Enum.Font[Sec._lib.CurrentFontBold]
     ValL.TextSize = 12
-    ValL.TextColor3 = fillColor
+    if customFillColor then SetCustomThemeColor(ValL,"TextColor3",fillColor) else SetThemeColor(ValL,"TextColor3",C,"Accent") end
     ValL.TextXAlignment = Enum.TextXAlignment.Right
     ValL.Parent = Wrapped
     local Bar = Instance.new("Frame")
@@ -5870,7 +5900,7 @@ function L:CreateRangeSlider(cfg)
     local Fill = Instance.new("Frame")
     Fill.Position = UDim2.new((v1-min)/(max-min), 0, 0, 0)
     Fill.Size = UDim2.new((v2-v1)/(max-min), 0, 1, 0)
-    Fill.BackgroundColor3 = fillColor
+    if customFillColor then SetCustomThemeColor(Fill,"BackgroundColor3",fillColor) else SetThemeColor(Fill,"BackgroundColor3",C,"Accent") end
     Fill.BorderSizePixel = 0
     Fill.Parent = Bar
     local Fc = Instance.new("UICorner"); Fc.CornerRadius = UDim.new(1,0); Fc.Parent = Fill
@@ -5882,7 +5912,7 @@ function L:CreateRangeSlider(cfg)
     Thumb1.ZIndex = 5
     Thumb1.Parent = Bar
     local Tc1 = Instance.new("UICorner"); Tc1.CornerRadius = UDim.new(1,0); Tc1.Parent = Thumb1
-    local Ts1 = Instance.new("UIStroke"); Ts1.Color = fillColor; Ts1.Thickness = 2; Ts1.Parent = Thumb1
+    local Ts1 = Instance.new("UIStroke"); if customFillColor then SetCustomThemeColor(Ts1,"Color",fillColor) else SetThemeColor(Ts1,"Color",C,"Accent") end; Ts1.Thickness = 2; Ts1.Parent = Thumb1
     local Thumb2 = Instance.new("Frame")
     Thumb2.Size = UDim2.new(0, 14, 0, 14)
     Thumb2.Position = UDim2.new((v2-min)/(max-min), -7, 0.5, -7)
@@ -5891,7 +5921,7 @@ function L:CreateRangeSlider(cfg)
     Thumb2.ZIndex = 5
     Thumb2.Parent = Bar
     local Tc2 = Instance.new("UICorner"); Tc2.CornerRadius = UDim.new(1,0); Tc2.Parent = Thumb2
-    local Ts2 = Instance.new("UIStroke"); Ts2.Color = fillColor; Ts2.Thickness = 2; Ts2.Parent = Thumb2
+    local Ts2 = Instance.new("UIStroke"); if customFillColor then SetCustomThemeColor(Ts2,"Color",fillColor) else SetThemeColor(Ts2,"Color",C,"Accent") end; Ts2.Thickness = 2; Ts2.Parent = Thumb2
     local Btn = Instance.new("TextButton")
     Btn.Size = UDim2.new(1,0,1,0)
     Btn.BackgroundTransparency = 1
@@ -6255,7 +6285,7 @@ function L:CreateDropdown(cfg)
     List.ZIndex = 500
     List.ClipsDescendants = true
     List.ScrollBarThickness = 4
-    List.ScrollBarImageColor3 = C.Accent
+    SetThemeColor(List,"ScrollBarImageColor3",C,"Accent")
     List.ScrollBarImageTransparency = 0.2
     List.Parent = Sec._window._overlay
     local Lc = Instance.new("UICorner"); Lc.CornerRadius = UDim.new(0,10); Lc.Parent = List
@@ -6302,9 +6332,9 @@ function L:CreateDropdown(cfg)
             shown+=1
             local OB = Instance.new("TextButton")
             OB.Size = UDim2.new(1,0,0,28)
-            OB.BackgroundColor3 = IsSelected(o) and C.AccentSoft or C.Card
+            SetThemeColor(OB,"BackgroundColor3",C,IsSelected(o) and "AccentSoft" or "Card")
             OB.Text = tostring(o)
-            OB.TextColor3 = IsSelected(o) and C.White or C.Text
+            SetThemeColor(OB,"TextColor3",C,IsSelected(o) and "White" or "Text")
             OB.Font = Enum.Font[Sec._lib.CurrentFont]
             OB.TextSize = 12
             OB.BorderSizePixel = 0
@@ -6315,8 +6345,8 @@ function L:CreateDropdown(cfg)
             OB.Parent = List
             local Oc = Instance.new("UICorner"); Oc.CornerRadius = UDim.new(0,6); Oc.Parent = OB
             local Op = Instance.new("UIPadding"); Op.PaddingLeft = UDim.new(0,10); Op.Parent = OB
-            OB.MouseEnter:Connect(function() if not IsSelected(o) then TweenService:Create(OB, T_OUT, {BackgroundColor3=C.CardHover}):Play() end end)
-            OB.MouseLeave:Connect(function() if not IsSelected(o) then TweenService:Create(OB, T_OUT, {BackgroundColor3=C.Card}):Play() end end)
+            OB.MouseEnter:Connect(function() if not IsSelected(o) then SetThemeColor(OB,"BackgroundColor3",C,"CardHover"); TweenService:Create(OB, T_OUT, {BackgroundColor3=C.CardHover}):Play() end end)
+            OB.MouseLeave:Connect(function() if not IsSelected(o) then SetThemeColor(OB,"BackgroundColor3",C,"Card"); TweenService:Create(OB, T_OUT, {BackgroundColor3=C.Card}):Play() end end)
             OB.MouseButton1Click:Connect(function()
                 if multi then
                     local found = false
@@ -6726,7 +6756,7 @@ function L:CreateProgress(cfg)
     local Bc = Instance.new("UICorner"); Bc.CornerRadius = UDim.new(1,0); Bc.Parent = Bar
     local Fill = Instance.new("Frame")
     Fill.Size = UDim2.new(0,0,1,0)
-    Fill.BackgroundColor3 = SafeColor(cfg.Color,C.Accent)
+    if typeof(cfg.Color)=="Color3" then SetCustomThemeColor(Fill,"BackgroundColor3",cfg.Color) else SetThemeColor(Fill,"BackgroundColor3",C,"Accent") end
     Fill.BorderSizePixel = 0
     Fill.Parent = Bar
     local Fc = Instance.new("UICorner"); Fc.CornerRadius = UDim.new(1,0); Fc.Parent = Fill
@@ -7537,6 +7567,8 @@ function L:CreateMiniTabs(cfg)
     local function Refresh()
         for i, b in ipairs(Buttons) do
             local sel = i == activeIdx
+            SetThemeColor(b,"BackgroundColor3",C,sel and "AccentSoft" or "Card")
+            SetThemeColor(b,"TextColor3",C,sel and "White" or "TextDim")
             TweenService:Create(b, T_OUT, {
                 BackgroundColor3 = sel and C.AccentSoft or C.Card,
                 TextColor3 = sel and C.White or C.TextDim
@@ -7547,9 +7579,9 @@ function L:CreateMiniTabs(cfg)
         local B = Instance.new("TextButton")
         B.Size = UDim2.new(0,0,1,0)
         B.AutomaticSize = Enum.AutomaticSize.X
-        B.BackgroundColor3 = i == 1 and C.AccentSoft or C.Card
+        SetThemeColor(B,"BackgroundColor3",C,i==1 and "AccentSoft" or "Card")
         B.Text = "  "..tName.."  "
-        B.TextColor3 = i == 1 and C.White or C.TextDim
+        SetThemeColor(B,"TextColor3",C,i==1 and "White" or "TextDim")
         B.Font = Enum.Font[Sec._lib.CurrentFontMedium]
         B.TextSize = 11
         B.BorderSizePixel = 0
@@ -8452,7 +8484,8 @@ end)
 
 function L:ShowUpdateNotice(manifest)
     if type(manifest)~="table" or not manifest.updateAvailable then return false end
-    local card=self:Notify({Title="Atualização disponível",Text="v"..tostring(manifest.latest).." (atual: v"..tostring(manifest.current)..")\n"..tostring(manifest.notes or ""),Type="info",Duration=12})
+    local notification=self:Notify({Title="Atualização disponível",Text="v"..tostring(manifest.latest).." (atual: v"..tostring(manifest.current)..")\n"..tostring(manifest.notes or ""),Type="info",Duration=12,ReturnHandle=true})
+    local card=notification and notification.Instance
     if not card or not manifest.downloadUrl then return false end
     local action=Instance.new("TextButton"); action.Size=UDim2.fromOffset(90,26); action.Position=UDim2.new(1,-102,1,-34); SetThemeColor(action,"BackgroundColor3",self.C,"Accent"); action.Text="Copiar link"; action.Font=Enum.Font[self.CurrentFontBold]; action.TextSize=10; SetThemeColor(action,"TextColor3",self.C,"White"); action.BorderSizePixel=0; action.Parent=card
     action.MouseButton1Click:Connect(function()
@@ -8611,10 +8644,10 @@ function L:CreateNestedTabs(parentSection,cfg)
     local contents=Instance.new("Frame"); contents.Size=UDim2.new(1,0,0,0); contents.Position=UDim2.fromOffset(0,38); contents.AutomaticSize=Enum.AutomaticSize.Y; contents.BackgroundTransparency=1; contents.Parent=root
     local contentLayout=Instance.new("UIListLayout"); contentLayout.Parent=contents
     local buttons,panels,sections={}, {}, {}; local active=math.floor(ClampNumber(cfg.Default,1,1,#names))
-    local function select(index,fireCallback) if not panels[index] then return false end; active=index; for i,panel in ipairs(panels) do panel.Visible=i==active end; for i,button in ipairs(buttons) do button.BackgroundColor3=i==active and C.AccentSoft or C.Card; button.TextColor3=i==active and C.White or C.TextDim end; if fireCallback and cfg.Callback then InvokeUserCallback(cfg.Callback,names[index],index) end; return true end
+    local function select(index,fireCallback) if not panels[index] then return false end; active=index; for i,panel in ipairs(panels) do panel.Visible=i==active end; for i,button in ipairs(buttons) do SetThemeColor(button,"BackgroundColor3",C,i==active and "AccentSoft" or "Card"); SetThemeColor(button,"TextColor3",C,i==active and "White" or "TextDim") end; if fireCallback and cfg.Callback then InvokeUserCallback(cfg.Callback,names[index],index) end; return true end
     for i,name in ipairs(names) do
         names[i]=tostring(name):sub(1,64)
-        local button=Instance.new("TextButton"); button.Size=UDim2.new(0,0,1,0); button.AutomaticSize=Enum.AutomaticSize.X; button.Text=" "..names[i].." "; button.BackgroundColor3=i==active and C.AccentSoft or C.Card; button.TextColor3=i==active and C.White or C.TextDim; button.Font=Enum.Font[Sec._lib.CurrentFont]; button.TextSize=11; button.BorderSizePixel=0; button.Parent=bar; buttons[i]=button
+        local button=Instance.new("TextButton"); button.Size=UDim2.new(0,0,1,0); button.AutomaticSize=Enum.AutomaticSize.X; button.Text=" "..names[i].." "; SetThemeColor(button,"BackgroundColor3",C,i==active and "AccentSoft" or "Card"); SetThemeColor(button,"TextColor3",C,i==active and "White" or "TextDim"); button.Font=Enum.Font[Sec._lib.CurrentFont]; button.TextSize=11; button.BorderSizePixel=0; button.Parent=bar; buttons[i]=button
         local panel=Instance.new("Frame"); panel.Size=UDim2.new(1,0,0,0); panel.AutomaticSize=Enum.AutomaticSize.Y; panel.BackgroundTransparency=1; panel.Visible=i==active; panel.Parent=contents; panels[i]=panel
         local list=Instance.new("UIListLayout"); list.Padding=UDim.new(0,8); list.Parent=panel
         sections[i]=setmetatable({_inner=panel,_holder=panel,_elements={},_lib=Sec._lib,_window=Sec._window,_tab=Sec._tab,C=C},{__index=L})
@@ -8676,7 +8709,7 @@ function L:CreateTable(cfg)
     local function render()
         for _,child in ipairs(body:GetChildren()) do if child~=bodyLayout then child:Destroy() end end
         for i,rowData in ipairs(rows) do
-            local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,28); row.BackgroundColor3=i%2==0 and C.Card or C.Surface; row.BorderSizePixel=0; row.Parent=body
+            local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,28); SetThemeColor(row,"BackgroundColor3",C,i%2==0 and "Card" or "Surface"); row.BorderSizePixel=0; row.Parent=body
             for j=1,#columns do local cell=Instance.new("TextLabel"); cell.Size=UDim2.new(1/#columns,0,1,0); cell.Position=UDim2.new((j-1)/#columns,0,0,0); cell.BackgroundTransparency=1; local value=rowData; if type(rowData)=="table" then value=rowData[j]; if value==nil and type(columns[j])=="string" then value=rowData[columns[j]] end end; cell.Text=tostring(value or ""):sub(1,512); SetThemeColor(cell,"TextColor3",C,"TextDim"); cell.Font=Enum.Font[Sec._lib.CurrentFont]; cell.TextSize=11; cell.TextXAlignment=Enum.TextXAlignment.Left; cell.Parent=row end
         end
         if truncatedRowCount>0 then
@@ -8887,9 +8920,19 @@ function L:ShowBiosSplash(cfg)
     local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,4); layout.Parent=scroll
     local sourceLines=type(cfg.Lines)=="table" and cfg.Lines or {"VNC-Lib v"..self.Version,"Initializing interface...","Ready."}; local lines={}
     for _,message in ipairs(sourceLines) do if #lines>=200 then break end; table.insert(lines,tostring(message):sub(1,500)) end
-    local lineDelay=ClampNumber(cfg.LineDelay,.1,0,.5); local endDelay=ClampNumber(cfg.EndDelay,.5,0,5); local closed=false
-    local function cleanup() if closed then return end; closed=true; DestroyAuxGui(lib,win,gui); if cfg.OnFinish then InvokeUserCallback(cfg.OnFinish) end end
-    gui.Destroying:Connect(function() closed=true end)
+    local lineDelay=ClampNumber(cfg.LineDelay,.1,0,.5); local endDelay=ClampNumber(cfg.EndDelay,.5,0,5); local closed=false; local finishCalled=false
+    local function notifyFinish()
+        if finishCalled then return end
+        finishCalled=true
+        if cfg.OnFinish then InvokeUserCallback(cfg.OnFinish) end
+    end
+    local function cleanup()
+        if closed then return end
+        closed=true
+        DestroyAuxGui(lib,win,gui)
+        notifyFinish()
+    end
+    gui.Destroying:Connect(function() closed=true; notifyFinish() end)
     task.spawn(function()
         for _,message in ipairs(lines) do if closed or not gui.Parent then break end; local line=Instance.new("TextLabel"); line.Size=UDim2.new(1,0,0,18); line.BackgroundTransparency=1; line.Text=message; line.Font=Enum.Font.Code; line.TextSize=13; line.TextColor3=Color3.fromRGB(0,235,90); line.TextXAlignment=Enum.TextXAlignment.Left; line.Parent=scroll; task.wait(lineDelay) end
         if not closed then task.wait(endDelay); TweenService:Create(group,T_OUT,{GroupTransparency=1}):Play(); task.wait(.25); cleanup() end
@@ -9355,7 +9398,7 @@ local function MakeSectionScroll(section,name,height)
     local C=section.C or (win and win.C) or L.C
     local root=Instance.new("Frame"); root.Name=name; root.Size=UDim2.new(1,0,0,ClampNumber(height,250,80,900)); SetThemeColor(root,"BackgroundColor3",C,"Surface"); root.BorderSizePixel=0
     local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,9); corner.Parent=root
-    local scroll=Instance.new("ScrollingFrame"); scroll.Size=UDim2.new(1,-12,1,-12); scroll.Position=UDim2.fromOffset(6,6); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4; scroll.ScrollBarImageColor3=C.Accent; scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(); scroll.Parent=root
+    local scroll=Instance.new("ScrollingFrame"); scroll.Size=UDim2.new(1,-12,1,-12); scroll.Position=UDim2.fromOffset(6,6); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4; SetThemeColor(scroll,"ScrollBarImageColor3",C,"Accent"); scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(); scroll.Parent=root
     local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,5); layout.SortOrder=Enum.SortOrder.LayoutOrder; layout.Parent=scroll
     section:_AddElement(root)
     return root,scroll,layout,C
@@ -9622,7 +9665,7 @@ function L:CreateServerList(cfg)
     local refreshButton=Instance.new("TextButton"); refreshButton.Size=UDim2.fromOffset(62,26); refreshButton.Position=UDim2.new(1,-128,0,5); SetThemeColor(refreshButton,"BackgroundColor3",C,"AccentSoft"); SetThemeColor(refreshButton,"TextColor3",C,"White"); refreshButton.Text="Refresh"; refreshButton.Font=Enum.Font[lib.CurrentFontBold]; refreshButton.TextSize=10; refreshButton.Parent=root
     local moreButton=Instance.new("TextButton"); moreButton.Size=UDim2.fromOffset(56,26); moreButton.Position=UDim2.new(1,-62,0,5); SetThemeColor(moreButton,"BackgroundColor3",C,"Card"); SetThemeColor(moreButton,"TextColor3",C,"Text"); moreButton.Text="More"; moreButton.Font=Enum.Font[lib.CurrentFontBold]; moreButton.TextSize=10; moreButton.Parent=root
     moreButton.Active=false; moreButton.AutoButtonColor=false
-    local scroll=Instance.new("ScrollingFrame"); scroll.Size=UDim2.new(1,-12,1,-42); scroll.Position=UDim2.fromOffset(6,36); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4; scroll.ScrollBarImageColor3=C.Accent; scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(); scroll.Parent=root
+    local scroll=Instance.new("ScrollingFrame"); scroll.Size=UDim2.new(1,-12,1,-42); scroll.Position=UDim2.fromOffset(6,36); scroll.BackgroundTransparency=1; scroll.BorderSizePixel=0; scroll.ScrollBarThickness=4; SetThemeColor(scroll,"ScrollBarImageColor3",C,"Accent"); scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; scroll.CanvasSize=UDim2.new(); scroll.Parent=root
     local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,5); layout.Parent=scroll
     local connections={}; local nextCursor=nil; local requestToken=0; local destroyed=false
     root.Destroying:Connect(function() destroyed=true; requestToken+=1; for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end end)
@@ -9771,7 +9814,7 @@ function L:CreateSoundSettings(cfg)
     local slotTest=Instance.new("TextButton"); slotTest.Size=UDim2.fromOffset(50,24); slotTest.Position=UDim2.new(1,-60,0,180); SetThemeColor(slotTest,"BackgroundColor3",C,"Surface"); SetThemeColor(slotTest,"TextColor3",C,"TextDim"); slotTest.Text="Test"; slotTest.Font=Enum.Font[lib.CurrentFont]; slotTest.TextSize=9; slotTest.Parent=root
     local slotStatus=Instance.new("TextLabel"); slotStatus.Size=UDim2.new(1,-72,0,24); slotStatus.Position=UDim2.fromOffset(8,180); slotStatus.BackgroundTransparency=1; SetThemeColor(slotStatus,"TextColor3",C,"TextFaint"); slotStatus.Text=""; slotStatus.Font=Enum.Font[lib.CurrentFont]; slotStatus.TextSize=9; slotStatus.TextXAlignment=Enum.TextXAlignment.Left; slotStatus.Parent=root
     local historyTitle=Instance.new("TextLabel"); historyTitle.Size=UDim2.new(1,-16,0,18); historyTitle.Position=UDim2.fromOffset(8,206); historyTitle.BackgroundTransparency=1; historyTitle.Text="Recent playback"; SetThemeColor(historyTitle,"TextColor3",C,"Text"); historyTitle.Font=Enum.Font[lib.CurrentFontMedium]; historyTitle.TextSize=10; historyTitle.TextXAlignment=Enum.TextXAlignment.Left; historyTitle.Parent=root
-    local history=Instance.new("ScrollingFrame"); history.Size=UDim2.new(1,-16,0,50); history.Position=UDim2.fromOffset(8,226); SetThemeColor(history,"BackgroundColor3",C,"Surface"); history.BorderSizePixel=0; history.ScrollBarThickness=3; history.ScrollBarImageColor3=C.Accent; history.AutomaticCanvasSize=Enum.AutomaticSize.Y; history.CanvasSize=UDim2.new(); history.Parent=root
+    local history=Instance.new("ScrollingFrame"); history.Size=UDim2.new(1,-16,0,50); history.Position=UDim2.fromOffset(8,226); SetThemeColor(history,"BackgroundColor3",C,"Surface"); history.BorderSizePixel=0; history.ScrollBarThickness=3; SetThemeColor(history,"ScrollBarImageColor3",C,"Accent"); history.AutomaticCanvasSize=Enum.AutomaticSize.Y; history.CanvasSize=UDim2.new(); history.Parent=root
     local historyLayout=Instance.new("UIListLayout"); historyLayout.Padding=UDim.new(0,2); historyLayout.Parent=history
     local playlistName=Instance.new("TextBox"); playlistName.Size=UDim2.new(.24,-8,0,26); playlistName.Position=UDim2.fromOffset(8,282); SetThemeColor(playlistName,"BackgroundColor3",C,"Surface"); SetThemeColor(playlistName,"TextColor3",C,"Text"); playlistName.PlaceholderColor3=C.TextFaint; playlistName.PlaceholderText="Playlist"; playlistName.Font=Enum.Font[lib.CurrentFont]; playlistName.TextSize=9; playlistName.ClearTextOnFocus=false; playlistName.Parent=root
     local playlistIds=Instance.new("TextBox"); playlistIds.Size=UDim2.new(.56,-8,0,26); playlistIds.Position=UDim2.new(.24,2,0,282); SetThemeColor(playlistIds,"BackgroundColor3",C,"Surface"); SetThemeColor(playlistIds,"TextColor3",C,"Text"); playlistIds.PlaceholderColor3=C.TextFaint; playlistIds.PlaceholderText="Paste sound IDs"; playlistIds.Font=Enum.Font[lib.CurrentFont]; playlistIds.TextSize=9; playlistIds.ClearTextOnFocus=false; playlistIds.Parent=root
@@ -10053,6 +10096,7 @@ L.SetReadingMode=L.SetReadingModeAdvanced
 local SetStorageProviderBase=L.SetStorageProvider
 function L:SetStorageProvider(provider,forceReload)
     if self._destroyed then return false,"library is destroyed" end
+    if forceReload~=nil and type(forceReload)~="boolean" then return false,"forceReload must be a boolean" end
     if provider==self.StorageProvider and forceReload~=true then return true end
     local configured,configError=SetStorageProviderBase(self,provider)
     if not configured then return false,configError end
