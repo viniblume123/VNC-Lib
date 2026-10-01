@@ -199,6 +199,48 @@ local PROT = syn and syn.protect_gui
 local CLIP = setclipboard or toclipboard or (syn and syn.setclipboard) or (Clipboard and Clipboard.set)
 local IS_MOBILE = UIS.TouchEnabled and not UIS.MouseEnabled
 
+local function DetectExecutorName()
+    local environments,seen={},{}
+    local function addEnvironment(environment)
+        if type(environment)=="table" and not seen[environment] then seen[environment]=true; table.insert(environments,environment) end
+    end
+    addEnvironment(_G)
+    pcall(function() if type(getgenv)=="function" then addEnvironment(getgenv()) end end)
+    pcall(function() if type(getfenv)=="function" then addEnvironment(getfenv(0)) end end)
+    for _,environment in ipairs(environments) do
+        for _,functionName in ipairs({"identifyexecutor","getexecutorname"}) do
+            local identify=rawget(environment,functionName)
+            if type(identify)=="function" then
+                local ok,result=pcall(identify)
+                if ok and type(result)=="string" then
+                    result=result:gsub("[%c]"," "):gsub("^%s+",""):gsub("%s+$",""):sub(1,40)
+                    if result~="" then return result end
+                end
+            end
+        end
+    end
+    for _,environment in ipairs(environments) do
+        if rawget(environment,"KRNL_LOADED")==true then return "KRNL" end
+        if type(rawget(environment,"is_sirhurt_closure"))=="function" then return "SirHurt" end
+        if type(rawget(environment,"is_fluxus_closure"))=="function" then return "Fluxus" end
+        local synApi=rawget(environment,"syn")
+        if type(synApi)=="table" and type(synApi.request)=="function" then return "Synapse API (executor name unavailable)" end
+    end
+    if type(REQ)=="function" or type(ISF)=="function" or type(RF)=="function" then return "Executor (name unavailable)" end
+    local studioOk,isStudio=pcall(function() return RS:IsStudio() end)
+    return studioOk and isStudio and "Roblox Studio" or "Roblox"
+end
+L.ExecutorName=DetectExecutorName()
+L.Executor=L.ExecutorName
+local function FormatExecutorStatus(text,enabled)
+    text=tostring(text or "")
+    if enabled==false then return text end
+    local executor=tostring(L.ExecutorName or "Unknown")
+    if text=="" then return "Executor: "..executor end
+    return "Executor: "..executor.." · "..text
+end
+function L:GetExecutorName() return self.ExecutorName or self.Executor or "Unknown" end
+
 local S = Enum.EasingStyle
 local D = Enum.EasingDirection
 local T_OUT = TweenInfo.new(0.22, S.Quart, D.Out)
@@ -921,7 +963,7 @@ function L:GetCapabilities()
     local touchEnabled=SafeInstanceMember(UIS,"TouchEnabled")==true
     local mouseEnabled=SafeInstanceMember(UIS,"MouseEnabled")==true
     return {
-        Client=LP~=nil,LocalPlayer=LP~=nil,HTTP=httpAvailable,HttpBackend=httpBackend,HttpMode=self.HttpMode or "Auto",
+        Client=LP~=nil,LocalPlayer=LP~=nil,HTTP=httpAvailable,HttpBackend=httpBackend,HttpMode=self.HttpMode or "Auto",ExecutorName=self:GetExecutorName(),
         HttpProvider=type(self.HttpProvider)=="table",FileSystem=type(RF)=="function" and type(WF)=="function",Storage=storage,
         StorageProvider=type(self.StorageProvider)=="table",Delete=type(self.StorageProvider)=="table" and type(self.StorageProvider.Delete)=="function" or type(DF)=="function",
         ListFiles=type(self.StorageProvider)=="table" and type(self.StorageProvider.List)=="function" or type(listfiles)=="function",
@@ -3392,10 +3434,10 @@ function L:SetStreamerMode(on)
         if win and not win._destroyed then
             if on then
                 if not win._streamerSavedSize and win._main and win._main.Parent then win._streamerSavedSize=win._main.Size end
-                if win._statusL then win._statusL.Text=tostring(win._streamerStatusText or "Streamer Mode") end
+                if win._statusL then win._statusL.Text=FormatExecutorStatus(win._streamerStatusText or "Streamer Mode",win._showExecutor) end
                 if win._main and win._main.Parent then win._main.Size=UDim2.new(0,820,0,500) end
             else
-                if win._statusL then win._statusL.Text=tostring(win._statusBaseText) end
+                if win._statusL then win._statusL.Text=FormatExecutorStatus(win._statusBaseText,win._showExecutor) end
                 if win._main and win._main.Parent and win._streamerSavedSize then win._main.Size=win._streamerSavedSize end
                 win._streamerSavedSize=nil
             end
@@ -3692,10 +3734,12 @@ function L:CreateWindow(cfg)
     local StatusL = Instance.new("TextLabel")
     StatusL.Size = UDim2.new(0.6,0,1,0)
     StatusL.BackgroundTransparency = 1
-    local initialStatusText=cfg.StatusText~=nil and tostring(cfg.StatusText) or ("User: "..LP.Name)
-    StatusL.Text = initialStatusText
+    local initialStatusBase=cfg.StatusText~=nil and tostring(cfg.StatusText) or ("User: "..LP.Name)
+    local showExecutor=cfg.ShowExecutor~=false
+    StatusL.Text = FormatExecutorStatus(initialStatusBase,showExecutor)
     StatusL.Font = Enum.Font.Gotham
     StatusL.TextSize = 10
+    StatusL.TextTruncate=Enum.TextTruncate.AtEnd
     SetThemeColor(StatusL,"TextColor3",C,"TextFaint")
     StatusL.TextXAlignment = Enum.TextXAlignment.Left
     StatusL.Parent = StatusBar
@@ -3730,7 +3774,7 @@ function L:CreateWindow(cfg)
         _sizes=sizes, _uiscale=UIScaleObj, _gradient=Grad,
         _header=Header, _logo=Logo, _title=Title, _sub=Sub, _tagHolder=TagHolder, _mainStroke=Ms, _shadow=Shadow,
         _statusBar=StatusBar, _statusL=StatusL, _statusR=StatusR,
-        _statusBaseText=initialStatusText, _streamerStatusText=cfg.StreamerStatusText,
+        _statusBaseText=initialStatusBase, _streamerStatusText=cfg.StreamerStatusText, _showExecutor=showExecutor,
         _accentStrip=AccentStrip, _winFile=WinFile, _modeFile=modeFile,
         _allElements={}, _connections={}, _auxGuis={}, _maid=NewResourceBag(), _destroyed=false,
         _minSize={Width=ClampNumber(cfg.MinWidth,420,320,1800),Height=ClampNumber(cfg.MinHeight,300,240,1200)}
@@ -3821,7 +3865,8 @@ function L:CreateWindow(cfg)
     function Win:SetStatusText(text)
         self._statusBaseText=tostring(text or "")
         if self._statusL then
-            self._statusL.Text=self._lib.StreamerMode and tostring(self._streamerStatusText or "Streamer Mode") or self._statusBaseText
+            local statusText=self._lib.StreamerMode and (self._streamerStatusText or "Streamer Mode") or self._statusBaseText
+            self._statusL.Text=FormatExecutorStatus(statusText,self._showExecutor)
         end
         return self._statusBaseText
     end
@@ -4238,11 +4283,15 @@ function L:CreateWindow(cfg)
         if not self._hidden then self._lib:PlaySound("open") end
     end
     function Win:SelectTab(t)
-        if not t or t._window ~= self or t._destroyed then return false end
+        if not t or t._window ~= self or t._destroyed or not t._frame or not t._btn then return false end
         if t._btn and not t._btn.Visible and not self._updatingTabFilter and self._tabSearchBox and self._tabSearchBox.Text~="" then
             self._tabSearchBox.Text=""
             self:_RefreshTabSearch()
         end
+        -- A selected tab must remain reachable even if a stale search filter or
+        -- a previous interrupted transition left its button/frame hidden.
+        t._btn.Visible=true
+        t._frame.Visible=true
         local function keepSelectedTabVisible()
             local holder,button=self._tabsHolder,t._btn
             if not holder or not button or not holder.Parent then return end
@@ -4257,15 +4306,21 @@ function L:CreateWindow(cfg)
             local maxY=math.max(0,holder.AbsoluteCanvasSize.Y/scale-holder.AbsoluteSize.Y/scale)
             holder.CanvasPosition=Vector2.new(0,math.clamp(nextY,0,maxY))
         end
-        if self._active == t then keepSelectedTabVisible(); return true end
+        if self._active == t then
+            for _,tab in ipairs(self._tabs) do
+                if tab._frame then tab._frame.Visible=(tab==t) end
+            end
+            keepSelectedTabVisible()
+            return true
+        end
         for _, tab in ipairs(self._tabs) do
             local sel = tab == t
             local C = tab.C or self.C
-            tab._frame.Visible = sel
-            TweenService:Create(tab._btn, T_OUT, {
+            if tab._frame then tab._frame.Visible = sel end
+            if tab._btn then TweenService:Create(tab._btn, T_OUT, {
                 BackgroundColor3 = sel and C.CardActive or C.Card,
                 TextColor3 = sel and C.White or C.TextDim
-            }):Play()
+            }):Play() end
             if tab._activeGlow then TweenService:Create(tab._activeGlow, T_OUT, {BackgroundTransparency=sel and 0 or 1}):Play() end
             if tab._stroke then TweenService:Create(tab._stroke, T_OUT, {Color=sel and C.StrokeHot or C.Stroke, Transparency=sel and 0.05 or 0.45}):Play() end
             if tab._icon then
@@ -9409,6 +9464,9 @@ function L:CreatePlayerList(cfg)
     if not IsElementContainer(section) then return nil,"section or tab required" end
     if not win then return nil,"window required" end
     local root,scroll,layout,C=MakeSectionScroll(section,"PlayerList",cfg.Height or 280)
+    local status=Instance.new("TextLabel"); status.Name="PlayerCount"; status.Size=UDim2.new(1,-76,0,22); status.Position=UDim2.fromOffset(8,3); status.BackgroundTransparency=1; SetThemeColor(status,"TextColor3",C,"TextDim"); status.Font=Enum.Font[lib.CurrentFontMedium]; status.TextSize=11; status.TextXAlignment=Enum.TextXAlignment.Left; status.Parent=root
+    local refreshButton=Instance.new("TextButton"); refreshButton.Name="RefreshPlayers"; refreshButton.Size=UDim2.fromOffset(58,24); refreshButton.Position=UDim2.new(1,-66,0,2); SetThemeColor(refreshButton,"BackgroundColor3",C,"AccentSoft"); SetThemeColor(refreshButton,"TextColor3",C,"White"); refreshButton.Text="Refresh"; refreshButton.Font=Enum.Font[lib.CurrentFontBold]; refreshButton.TextSize=9; refreshButton.BorderSizePixel=0; refreshButton.Parent=root
+    scroll.Position=UDim2.fromOffset(6,30); scroll.Size=UDim2.new(1,-12,1,-36)
     local rows={}; local connections={}; local destroyed=false; local thumbnailQueue={}; local thumbnailWorkers=0
     local thumbnailConcurrency=math.floor(ClampNumber(cfg.ThumbnailConcurrency,3,1,6))
     root.Destroying:Connect(function() destroyed=true; table.clear(thumbnailQueue); for _,connection in ipairs(connections) do if connection then connection:Disconnect() end end; table.clear(rows) end)
@@ -9509,14 +9567,24 @@ function L:CreatePlayerList(cfg)
         sortQueued=true
         task.delay(0.05,function() sortQueued=false; if not destroyed then sortRows() end end)
     end
-    local function refresh()
-        for _,player in ipairs(Players:GetPlayers()) do addPlayer(player) end
-        for player in pairs(rows) do if player.Parent~=Players then removePlayer(player) end end
-        scheduleSort()
-        return #Players:GetPlayers()
+    local function updateCount()
+        local visibleCount=0
+        for _ in pairs(rows) do visibleCount+=1 end
+        status.Text=string.format("%d player%s in this server",visibleCount,visibleCount==1 and "" or "s")
+        return visibleCount
     end
-    table.insert(connections,win:_Connect(Players.PlayerAdded,function(player) addPlayer(player); scheduleSort() end))
-    table.insert(connections,win:_Connect(Players.PlayerRemoving,function(player) removePlayer(player); scheduleSort() end))
+    local function refresh(excludedPlayer)
+        for _,player in ipairs(Players:GetPlayers()) do
+            if player~=excludedPlayer then addPlayer(player) end
+        end
+        for player in pairs(rows) do if player==excludedPlayer or player.Parent~=Players then removePlayer(player) end end
+        local visibleCount=updateCount()
+        scheduleSort()
+        return visibleCount
+    end
+    table.insert(connections,win:_Connect(Players.PlayerAdded,function(player) addPlayer(player); updateCount(); scheduleSort() end))
+    table.insert(connections,win:_Connect(Players.PlayerRemoving,function(player) removePlayer(player); updateCount() end))
+    table.insert(connections,win:_Connect(refreshButton.MouseButton1Click,refresh))
     refresh()
     local handle={Instance=root,Rows=rows,Refresh=refresh}
     function handle:Destroy()
@@ -10197,7 +10265,7 @@ L._Services={
     Search={Global=function(...) return L:CreateGlobalSearch(...) end},
     Effects={Play=function(...) return L:PlayEffect(...) end,Transition=function(...) return L:PlayTransition(...) end,Combo=function(...) return L:PlayTransitionCombo(...) end},
     Integration={Register=function(...) return L:RegisterIntegration(...) end,Get=function(...) return L:GetIntegration(...) end,Remove=function(...) return L:RemoveIntegration(...) end},
-    Runtime={Capabilities=function(...) return L:GetCapabilities(...) end,RefreshCapabilities=function(...) return L:RefreshCapabilities(...) end,IsDestroyed=function(...) return L:IsDestroyed(...) end,SafeCall=function(...) return L:SafeCall(...) end},
+    Runtime={Capabilities=function(...) return L:GetCapabilities(...) end,RefreshCapabilities=function(...) return L:RefreshCapabilities(...) end,GetExecutorName=function(...) return L:GetExecutorName(...) end,IsDestroyed=function(...) return L:IsDestroyed(...) end,SafeCall=function(...) return L:SafeCall(...) end},
     Localization={Translate=function(...) return L:Translate(...) end,SetLocale=function(...) return L:SetLocale(...) end},
 }
 
@@ -10325,7 +10393,7 @@ L.API={
     Lifecycle={"CreateResourceBag","Give","IsDestroyed","Destroy"},
     Events={"On","Once","Emit"},
     Validation={"ValidateWindowConfig","ValidateElementConfig","ValidateHttpProvider","ValidateStorageProvider","ValidateTheme","ValidateSound","ValidateNotification","ValidateMacro"},
-    Runtime={"GetCapabilities","RefreshCapabilities","IsDestroyed","SetDebug","DebugLog","SafeCall"},
+    Runtime={"GetCapabilities","RefreshCapabilities","GetExecutorName","IsDestroyed","SetDebug","DebugLog","SafeCall"},
     Features={"PlayerList","PlayerTracker","FriendTracker","ServerList","ServerInfo","RejoinLastServer","AntiIdle","HubIdleLock","SoundSettings","CreateSearch","CreateCollapsibleGroup","TerminalSyntaxHighlighting","SplashOnProgress"},
 }
 function L:GetAPIReference()
