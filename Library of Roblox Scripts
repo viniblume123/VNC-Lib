@@ -3453,8 +3453,8 @@ function L:CreateWindow(cfg)
     if self._destroyed then return nil,"library is destroyed" end
     if not LP then return nil,"CreateWindow requires a client context (LocalScript or client-side ModuleScript)" end
     cfg=table.clone(cfg)
-    cfg.Name=tostring(cfg.Name or cfg.name or cfg.Title or cfg.title or "Library")
-    if cfg.Subtitle==nil then cfg.Subtitle=cfg.subtitle end
+    cfg.Name=tostring(cfg.Name or cfg.name or cfg.Title or cfg.title or cfg.LoadingTitle or cfg.loadingTitle or "Library")
+    if cfg.Subtitle==nil then cfg.Subtitle=cfg.subtitle or cfg.LoadingSubtitle or cfg.loadingSubtitle end
     if cfg.Theme==nil then cfg.Theme=cfg.theme end
     if cfg.ContrastMode~=nil then self:SetContrastMode(cfg.ContrastMode) end
     if cfg.Sounds==nil then cfg.Sounds=cfg.sounds end
